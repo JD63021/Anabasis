@@ -1,0 +1,69 @@
+# ============================================================
+# Full case config for fastwrapped SIMPLE pipe run
+# ============================================================
+
+# Mesh / output
+polyMeshDir /tmp/meshCase/constant/polyMesh
+outPrefix runs/case_pipe_normal_inlet_mu
+device 0
+
+# Fluid properties
+rho 1.0
+mu 0.05
+
+# Patch names
+wallPatch patch_0_0
+inletPatch patch_2_0
+outletPatch patch_1_0
+
+# SIMPLE controls
+nsteps 500
+printEvery 10
+writeVtu 1
+writeEvery 0
+monitor 1
+
+nVelNonOrthCorr 0
+nNonOrthCorr 5
+nPressureCorr 0
+
+uRelax 0.7
+pRelax 0.3
+
+corrTol 1e-10
+tolMass 1e-3
+tolVel 1e-3
+
+# Velocity solver
+velMaxit 100
+velTol 1e-10
+velRelTol 0
+
+# Pressure solver / AMG
+pUseAmg 1
+pAmgSetupScope outer
+pMaxit 4000
+pTol 1e-10
+pRelTol 0
+pAmgMaxit 1
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgRelaxType 7
+pAmgPmax 4
+pAmgKeepTranspose 1
+pAmgRebuildEvery 25
+
+# Profiling
+profileSteps 0
+
+# Boundary conditions
+# fixed_normal_speed is signed along the outward mesh normal.
+# patch_1_0 outward normal is approximately -z, so -1.0 gives inflow in +z.
+velocity patch_0_0 wall_noslip
+velocity patch_1_0 fixed_normal_speed -1.0 average_patch_normal
+velocity patch_2_0 zero_gradient
+
+pressure patch_0_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0

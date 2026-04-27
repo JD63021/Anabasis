@@ -1,0 +1,7 @@
+velocity patch_0_0 wall_noslip
+velocity patch_1_0 fixed_flow_rate -1.962977932911e-03 average_patch_normal
+velocity patch_2_0 zero_gradient
+
+pressure patch_0_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0

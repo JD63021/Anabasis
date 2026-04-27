@@ -1,0 +1,279 @@
+============================================================
+HOST / GPU
+============================================================
+jd-MS-7E51
+Sat Apr 25 18:17:43 2026       
++---------------------------------------------------------------------------------------+
+| NVIDIA-SMI 535.274.02             Driver Version: 535.274.02   CUDA Version: 12.2     |
+|-----------------------------------------+----------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |         Memory-Usage | GPU-Util  Compute M. |
+|                                         |                      |               MIG M. |
+|=========================================+======================+======================|
+|   0  NVIDIA GeForce RTX 3060        Off | 00000000:01:00.0  On |                  N/A |
+|  0%   45C    P5              16W / 170W |   1173MiB / 12288MiB |     10%      Default |
+|                                         |                      |                  N/A |
++-----------------------------------------+----------------------+----------------------+
+                                                                                         
++---------------------------------------------------------------------------------------+
+| Processes:                                                                            |
+|  GPU   GI   CI        PID   Type   Process name                            GPU Memory |
+|        ID   ID                                                             Usage      |
+|=======================================================================================|
+|    0   N/A  N/A      1786      G   /usr/lib/xorg/Xorg                          660MiB |
+|    0   N/A  N/A      1974    C+G   ...libexec/gnome-remote-desktop-daemon      104MiB |
+|    0   N/A  N/A      2030      G   /usr/bin/gnome-shell                         80MiB |
+|    0   N/A  N/A      3999      G   ...irefox/8191/usr/lib/firefox/firefox      237MiB |
+|    0   N/A  N/A      4893      G   /usr/lib/huiontablet/huiontablet              8MiB |
+|    0   N/A  N/A    104747      G   ....mount_FreeCAahioGb/usr/bin/freecad       61MiB |
++---------------------------------------------------------------------------------------+
+
+============================================================
+CMake HYPRE variables
+============================================================
+CMAKE_CUDA_ARCHITECTURES:UNINITIALIZED=86
+CMAKE_CUDA_COMPILER:STRING=/usr/local/cuda/bin/nvcc
+CUDAToolkit_CUPTI_INCLUDE_DIR:PATH=/usr/local/cuda/targets/x86_64-linux/include
+CUDAToolkit_rt_LIBRARY:FILEPATH=/usr/lib/x86_64-linux-gnu/librt.a
+HYPRE_INCLUDE_DIR:PATH=/home/jd/src/petsc/arch-linux-cuda-opt/include
+HYPRE_LIBRARY:FILEPATH=/home/jd/src/petsc/arch-linux-cuda-opt/lib/libHYPRE.so
+//Root of HYPRE install that contains include/ and lib/
+HYPRE_ROOT:PATH=
+//ADVANCED property for variable: CMAKE_CUDA_COMPILER
+CMAKE_CUDA_COMPILER-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CUDAToolkit_CUPTI_INCLUDE_DIR
+CUDAToolkit_CUPTI_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CUDAToolkit_rt_LIBRARY
+CUDAToolkit_rt_LIBRARY-ADVANCED:INTERNAL=1
+//Details about finding CUDAToolkit
+FIND_PACKAGE_MESSAGE_DETAILS_CUDAToolkit:INTERNAL=[/usr/local/cuda/targets/x86_64-linux/include][/usr/local/cuda/lib64/libcudart.so][/usr/local/cuda/bin][v12.2.140()]
+
+============================================================
+Executable ldd
+============================================================
+	libmpi.so.40 => /usr/lib/x86_64-linux-gnu/libmpi.so.40 (0x00007e4b4dd50000)
+	libcudart.so.12 => /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12 (0x00007e4b4da00000)
+	libHYPRE-3.0.0.so => /home/jd/src/petsc/arch-linux-cuda-opt/lib/libHYPRE-3.0.0.so (0x00007e4b4aa00000)
+	libstdc++.so.6 => /usr/lib/x86_64-linux-gnu/libstdc++.so.6 (0x00007e4b4a600000)
+	libcublas.so.12 => /usr/local/cuda-12.2/lib64/libcublas.so.12 (0x00007e4b43a00000)
+	libcusparse.so.12 => /usr/local/cuda-12.2/lib64/libcusparse.so.12 (0x00007e4b33c00000)
+	libcurand.so.10 => /usr/local/cuda-12.2/lib64/libcurand.so.10 (0x00007e4b2d600000)
+	libcublasLt.so.12 => /usr/local/cuda-12.2/lib64/libcublasLt.so.12 (0x00007e4b0a600000)
+	libnvJitLink.so.12 => /usr/local/cuda-12.2/lib64/libnvJitLink.so.12 (0x00007e4b07400000)
+
+============================================================
+Resolved HYPRE library symbols
+============================================================
+HYPRE_SO=/home/jd/src/petsc/arch-linux-cuda-opt/lib/libHYPRE-3.0.0.so
+000000000043bb2d T hypre_CSRMatrixMigrate
+00000000001be550 T HYPRE_IJMatrixInitialize_v2
+00000000001bfd2d T HYPRE_IJMatrixMigrate
+00000000001c02c0 T HYPRE_IJVectorInitialize_v2
+00000000001c109b T HYPRE_IJVectorMigrate
+00000000003c2633 T hypre_ParCSRMatrixMigrate
+
+strings GPU/CUDA hints:
+hypre_IJMatrixSetAddValuesParCSRDevice
+hypre_IJMatrixAssembleParCSRDevice
+hypre_IJMatrixGetValuesParCSRDevice
+hypre_IJVectorSetAddValuesParDevice
+hypre_IJVectorAssembleParDevice
+hypre_IJVectorUpdateValuesDevice
+hypre_IJMatrixSetConstantValuesParCSRDevice
+_ZNK6thrust6system14error_category23default_error_conditionEi
+_ZNK6thrust6system14error_category10equivalentEiRKNS0_15error_conditionE
+_ZNK6thrust6system14error_category10equivalentERKNS0_10error_codeEi
+_ZNK6thrust6system6detail22generic_error_category4nameEv
+_ZNK6thrust6system6detail21system_error_category4nameEv
+_ZNK6thrust6system8cuda_cub6detail19cuda_error_category4nameEv
+_ZN6thrust6system8cuda_cub6detail19cuda_error_categoryD2Ev
+_ZN6thrust6system8cuda_cub6detail19cuda_error_categoryD1Ev
+_ZN6thrust6system6detail21system_error_categoryD2Ev
+_ZN6thrust6system6detail21system_error_categoryD1Ev
+_ZN6thrust6system6detail22generic_error_categoryD2Ev
+_ZN6thrust6system6detail22generic_error_categoryD1Ev
+_ZN6thrust6system6detail22generic_error_categoryD0Ev
+_ZN6thrust6system6detail21system_error_categoryD0Ev
+_ZN6thrust6system8cuda_cub6detail19cuda_error_categoryD0Ev
+__cudaPopCallConfiguration
+cudaLaunchKernel
+_ZN3cub17CUB_200200_860_NS21DeviceScanByKeyKernelINS0_21DeviceScanByKeyPolicyIN6thrust16reverse_iteratorINS3_12zip_iteratorINS3_5tupleIPiS7_NS3_9null_typeES8_S8_S8_S8_S8_S8_S8_EEEEEEccNS3_7maximumIcEEE9Policy900ESB_NS4_INS3_10device_ptrIcEEEESI_NS0_24ReduceByKeyScanTileStateIciLb1EEENS3_8equal_toINS6_IiiS8_S8_S8_S8_S8_S8_S8_S8_EEEESD_cicSM_EEvT0_PT9_T1_T2_T3_iT4_T5_T6_T7_
+_ZN3cub17CUB_200200_860_NS25DeviceScanByKeyInitKernelINS0_24ReduceByKeyScanTileStateIciLb1EEEN6thrust16reverse_iteratorINS4_12zip_iteratorINS4_5tupleIPiS8_NS4_9null_typeES9_S9_S9_S9_S9_S9_S9_EEEEEEEEvT_T0_PNSt15iterator_traitsISE_E10value_typeEji
+_ZN3cub17CUB_200200_860_NS21DeviceScanByKeyKernelINS0_21DeviceScanByKeyPolicyIN6thrust16reverse_iteratorINS3_12zip_iteratorINS3_5tupleIPiS7_NS3_9null_typeES8_S8_S8_S8_S8_S8_S8_EEEEEEccNS3_7maximumIcEEE9Policy900ESB_NS4_INS3_10device_ptrIcEEEESI_NS0_24ReduceByKeyScanTileStateIclLb1EEENS3_8equal_toINS6_IiiS8_S8_S8_S8_S8_S8_S8_S8_EEEESD_clcSM_EEvT0_PT9_T1_T2_T3_iT4_T5_T6_T7_
+_ZN3cub17CUB_200200_860_NS25DeviceScanByKeyInitKernelINS0_24ReduceByKeyScanTileStateIclLb1EEEN6thrust16reverse_iteratorINS4_12zip_iteratorINS4_5tupleIPiS8_NS4_9null_typeES9_S9_S9_S9_S9_S9_S9_EEEEEEEEvT_T0_PNSt15iterator_traitsISE_E10value_typeEji
+_ZN3cub17CUB_200200_860_NS21DeviceScanByKeyKernelINS0_21DeviceScanByKeyPolicyIN6thrust16reverse_iteratorINS3_12zip_iteratorINS3_5tupleIPiS7_NS3_9null_typeES8_S8_S8_S8_S8_S8_S8_EEEEEEccNS3_7maximumIcEEE9Policy900ESB_NS4_INS3_10device_ptrIcEEEESI_NS0_24ReduceByKeyScanTileStateIciLb1EEENS3_8equal_toINS6_IiiS8_S8_S8_S8_S8_S8_S8_S8_EEEESD_NS0_8NullTypeEicSM_EEvT0_PT9_T1_T2_T3_iT4_T5_T6_T7_
+_ZN3cub17CUB_200200_860_NS21DeviceScanByKeyKernelINS0_21DeviceScanByKeyPolicyIN6thrust16reverse_iteratorINS3_12zip_iteratorINS3_5tupleIPiS7_NS3_9null_typeES8_S8_S8_S8_S8_S8_S8_EEEEEEccNS3_7maximumIcEEE9Policy900ESB_NS4_INS3_10device_ptrIcEEEESI_NS0_24ReduceByKeyScanTileStateIclLb1EEENS3_8equal_toINS6_IiiS8_S8_S8_S8_S8_S8_S8_S8_EEEESD_NS0_8NullTypeElcSM_EEvT0_PT9_T1_T2_T3_iT4_T5_T6_T7_
+_ZN3cub17CUB_200200_860_NS28DeviceReduceSingleTileKernelINS0_18DeviceReducePolicyIljN6thrust4plusIlEEE9Policy600EPlS8_iS5_llEEvT0_T1_T2_T3_T4_
+_ZN3cub17CUB_200200_860_NS18DeviceReduceKernelINS0_18DeviceReducePolicyIljN6thrust4plusIlEEE9Policy600ENS3_8cuda_cub26transform_input_iterator_tIlPi8in_rangeIiEEEjS5_lEEvT0_PT3_T1_NS0_13GridEvenShareISH_EET2_
+_ZN3cub17CUB_200200_860_NS28DeviceReduceSingleTileKernelINS0_18DeviceReducePolicyIljN6thrust4plusIlEEE9Policy600ENS3_8cuda_cub26transform_input_iterator_tIlPi8in_rangeIiEEEPljS5_llEEvT0_T1_T2_T3_T4_
+_ZN3cub17CUB_200200_860_NS28DeviceReduceSingleTileKernelINS0_18DeviceReducePolicyIlyN6thrust4plusIlEEE9Policy600EPlS8_iS5_llEEvT0_T1_T2_T3_T4_
+_ZN3cub17CUB_200200_860_NS18DeviceReduceKernelINS0_18DeviceReducePolicyIlyN6thrust4plusIlEEE9Policy600ENS3_8cuda_cub26transform_input_iterator_tIlPi8in_rangeIiEEEyS5_lEEvT0_PT3_T1_NS0_13GridEvenShareISH_EET2_
+_ZN3cub17CUB_200200_860_NS28DeviceReduceSingleTileKernelINS0_18DeviceReducePolicyIlyN6thrust4plusIlEEE9Policy600ENS3_8cuda_cub26transform_input_iterator_tIlPi8in_rangeIiEEEPlyS5_llEEvT0_T1_T2_T3_T4_
+_ZN6thrust6system12system_errorD2Ev
+_ZTVN6thrust6system12system_errorE
+_ZN6thrust6system12system_errorD1Ev
+__cudaUnregisterFatBinary
+__cudaPushCallConfiguration
+cudaPeekAtLastError
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_15__reduce_by_key16ReduceByKeyAgentINS_12zip_iteratorINS_5tupleIPiS7_NS_9null_typeES8_S8_S8_S8_S8_S8_S8_EEEENS5_INS6_IPcPdS8_S8_S8_S8_S8_S8_S8_S8_EEEESA_SE_NS_8equal_toINS6_IiiS8_S8_S8_S8_S8_S8_S8_S8_EEEE29hypre_IJMatrixAssembleFunctorIcdES7_iEESA_SE_SA_SE_S7_N3cub17CUB_200200_860_NS24ReduceByKeyScanTileStateINS6_IcdS8_S8_S8_S8_S8_S8_S8_S8_EEiLb0EEESH_SJ_iiEEvT0_T1_T2_T3_T4_T5_T6_T7_T8_T9_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_15__reduce_by_key16ReduceByKeyAgentINS_12zip_iteratorINS_5tupleIPiS7_NS_9null_typeES8_S8_S8_S8_S8_S8_S8_EEEENS5_INS6_IPcPdS8_S8_S8_S8_S8_S8_S8_S8_EEEESA_SE_NS_8equal_toINS6_IiiS8_S8_S8_S8_S8_S8_S8_S8_EEEE29hypre_IJMatrixAssembleFunctorIcdEPllEESA_SE_SA_SE_SK_N3cub17CUB_200200_860_NS24ReduceByKeyScanTileStateINS6_IcdS8_S8_S8_S8_S8_S8_S8_S8_EElLb0EEESH_SJ_llEEvT0_T1_T2_T3_T4_T5_T6_T7_T8_T9_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_15__reduce_by_key16ReduceByKeyAgentINS_12zip_iteratorINS_5tupleIPiS7_NS_9null_typeES8_S8_S8_S8_S8_S8_S8_EEEENS5_INS6_IPcPdS8_S8_S8_S8_S8_S8_S8_S8_EEEESA_SE_NS_8equal_toINS6_IiiS8_S8_S8_S8_S8_S8_S8_S8_EEEE30hypre_IJMatrixAssembleFunctor2IcdES7_iEESA_SE_SA_SE_S7_N3cub17CUB_200200_860_NS24ReduceByKeyScanTileStateINS6_IcdS8_S8_S8_S8_S8_S8_S8_S8_EEiLb0EEESH_SJ_iiEEvT0_T1_T2_T3_T4_T5_T6_T7_T8_T9_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_15__reduce_by_key16ReduceByKeyAgentINS_12zip_iteratorINS_5tupleIPiS7_NS_9null_typeES8_S8_S8_S8_S8_S8_S8_EEEENS5_INS6_IPcPdS8_S8_S8_S8_S8_S8_S8_S8_EEEESA_SE_NS_8equal_toINS6_IiiS8_S8_S8_S8_S8_S8_S8_S8_EEEE30hypre_IJMatrixAssembleFunctor2IcdEPllEESA_SE_SA_SE_SK_N3cub17CUB_200200_860_NS24ReduceByKeyScanTileStateINS6_IcdS8_S8_S8_S8_S8_S8_S8_S8_EElLb0EEESH_SJ_llEEvT0_T1_T2_T3_T4_T5_T6_T7_T8_T9_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_15__reduce_by_key16ReduceByKeyAgentINS_12zip_iteratorINS_5tupleIPiS7_NS_9null_typeES8_S8_S8_S8_S8_S8_S8_EEEEPdSA_SB_NS_8equal_toINS6_IiiS8_S8_S8_S8_S8_S8_S8_S8_EEEENS_4plusIdEES7_iEESA_SB_SA_SB_S7_N3cub17CUB_200200_860_NS24ReduceByKeyScanTileStateIdiLb1EEESE_SG_iiEEvT0_T1_T2_T3_T4_T5_T6_T7_T8_T9_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_15__reduce_by_key16ReduceByKeyAgentINS_12zip_iteratorINS_5tupleIPiS7_NS_9null_typeES8_S8_S8_S8_S8_S8_S8_EEEEPdSA_SB_NS_8equal_toINS6_IiiS8_S8_S8_S8_S8_S8_S8_S8_EEEENS_4plusIdEEPllEESA_SB_SA_SB_SH_N3cub17CUB_200200_860_NS24ReduceByKeyScanTileStateIdlLb0EEESE_SG_llEEvT0_T1_T2_T3_T4_T5_T6_T7_T8_T9_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_9__copy_if11CopyIfAgentINS_12zip_iteratorINS_5tupleIPiS7_PdNS_9null_typeES9_S9_S9_S9_S9_S9_EEEES8_SB_NS_8identityIdEEiS7_EESB_S8_SB_SD_iS7_N3cub17CUB_200200_860_NS13ScanTileStateIiLb1EEEmEEvT0_T1_T2_T3_T4_T5_T6_T7_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_9__copy_if11CopyIfAgentINS_12zip_iteratorINS_5tupleIPiS7_PdPcNS_9null_typeESA_SA_SA_SA_SA_EEEES9_SC_NS_12unary_negateINS_8identityIcEEEEiS7_EESC_S9_SC_SG_iS7_N3cub17CUB_200200_860_NS13ScanTileStateIiLb1EEEmEEvT0_T1_T2_T3_T4_T5_T6_T7_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_9__copy_if11CopyIfAgentINS_12zip_iteratorINS_5tupleIPiS7_PdPcNS_9null_typeESA_SA_SA_SA_SA_EEEES9_SC_NS_6detail12unary_negateINS_12unary_negateINS_8identityIcEEEEEEiS7_EESC_S9_SC_SJ_iS7_N3cub17CUB_200200_860_NS13ScanTileStateIiLb1EEEmEEvT0_T1_T2_T3_T4_T5_T6_T7_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_9__copy_if11CopyIfAgentINS_12zip_iteratorINS_5tupleIPKiPKdNS_9null_typeESB_SB_SB_SB_SB_SB_SB_EEEEPiNS5_INS6_ISE_PdSB_SB_SB_SB_SB_SB_SB_SB_EEEE14is_nonnegativeIiEiSE_EESD_SE_SH_SJ_iSE_N3cub17CUB_200200_860_NS13ScanTileStateIiLb1EEEmEEvT0_T1_T2_T3_T4_T5_T6_T7_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_15__reduce_by_key9InitAgentIN3cub17CUB_200200_860_NS24ReduceByKeyScanTileStateINS_5tupleIcdNS_9null_typeES9_S9_S9_S9_S9_S9_S9_EElLb0EEElPlEESB_lSC_EEvT0_T1_T2_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_9__copy_if9InitAgentIN3cub17CUB_200200_860_NS13ScanTileStateIiLb1EEEPiiEES8_mS9_EEvT0_T1_T2_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_15__reduce_by_key9InitAgentIN3cub17CUB_200200_860_NS24ReduceByKeyScanTileStateIdlLb0EEElPlEES8_lS9_EEvT0_T1_T2_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_15__reduce_by_key9InitAgentIN3cub17CUB_200200_860_NS24ReduceByKeyScanTileStateINS_5tupleIcdNS_9null_typeES9_S9_S9_S9_S9_S9_S9_EEiLb0EEEiPiEESB_iSC_EEvT0_T1_T2_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_15__reduce_by_key9InitAgentIN3cub17CUB_200200_860_NS24ReduceByKeyScanTileStateIdiLb1EEEiPiEES8_iS9_EEvT0_T1_T2_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_14__parallel_for16ParallelForAgentINS0_11__transform17unary_transform_fIPiPcNS5_14no_stencil_tagE8in_rangeIiENS5_21always_true_predicateEEElEESD_lEEvT0_T1_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_14__parallel_for16ParallelForAgentINS0_10for_each_fINS_17counting_iteratorIiNS_11use_defaultES7_S7_EENS_6detail16wrapped_functionI30hypreFunctor_IJMatrixGetValuesvEEEElEESD_lEEvT0_T1_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_14__parallel_for16ParallelForAgentINS0_11__transform17unary_transform_fIPiS7_NS5_14no_stencil_tagENS_6detail10functional5actorINSA_9compositeINSA_27transparent_binary_operatorINS_5minusIvEEEENSB_INSA_8argumentILj0EEEEENSA_5valueIiEENS_9null_typeESM_SM_SM_SM_SM_SM_SM_EEEENS5_21always_true_predicateEEElEESQ_lEEvT0_T1_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_14__parallel_for16ParallelForAgentINS0_11__transform17unary_transform_fINS_20permutation_iteratorIPiS8_EES8_NS5_14no_stencil_tagENS0_8identityENS5_21always_true_predicateEEElEESD_lEEvT0_T1_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_14__parallel_for16ParallelForAgentINS0_10__tabulate7functorIPiNS_6system6detail7generic6detail22compute_sequence_valueIivEElEElEESE_lEEvT0_T1_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_14__parallel_for16ParallelForAgentINS0_10for_each_fINS_17counting_iteratorIiNS_11use_defaultES7_S7_EENS_6detail16wrapped_functionI17__nv_dl_wrapper_tI11__nv_dl_tagIPFiP21hypre_IJMatrix_structiPiSF_SF_SF_PdiEXadL_Z35hypre_IJMatrixGetValuesParCSRDeviceEELj1EEJSF_SF_SF_EEvEEEElEESM_lEEvT0_T1_
+_ZN6thrust8cuda_cub4core13_kernel_agentINS0_14__parallel_for16ParallelForAgentINS0_11__transform17unary_transform_fIPdS7_PcNS0_9__replace10constant_fIdEENS_8identityIcEEEElEESE_lEEvT0_T1_
+_ZNK6thrust6system8cuda_cub6detail19cuda_error_category23default_error_conditionEi
+_ZGVZN6thrust6system13cuda_categoryEvE6result
+_ZZN6thrust6system13cuda_categoryEvE6result
+_ZGVZN6thrust6system15system_categoryEvE6result
+_ZZN6thrust6system15system_categoryEvE6result
+_ZNK6thrust6system6detail21system_error_category23default_error_conditionEi
+_ZTVN6thrust6system8cuda_cub6detail19cuda_error_categoryE
+_ZTVN6thrust6system6detail21system_error_categoryE
+_ZN6thrust6system12system_errorD0Ev
+_ZNK6thrust6system8cuda_cub6detail19cuda_error_category7messageB5cxx11Ei
+cudaGetErrorString
+cudaGetErrorName
+_ZNK6thrust6system6detail22generic_error_category7messageB5cxx11Ei
+_ZGVZNK6thrust6system6detail22generic_error_category7messageB5cxx11EiE11unknown_err
+_ZZNK6thrust6system6detail22generic_error_category7messageB5cxx11EiE11unknown_err
+_ZNK6thrust6system6detail21system_error_category7messageB5cxx11Ei
+
+============================================================
+HYPRE header config hints
+============================================================
+HYPRE_INCLUDE_DIR=/home/jd/src/petsc/arch-linux-cuda-opt/include
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_onedpl.hpp:   Iter2 mask_cpy = hypre_CTAlloc(ValueType, std::distance(first, last), HYPRE_MEMORY_DEVICE);
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_onedpl.hpp:   hypre_TMemcpy(mask_cpy, mask, ValueType, std::distance(first, last), HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_DEVICE);
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_onedpl.hpp:   hypre_TFree(mask_cpy, HYPRE_MEMORY_DEVICE);
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_IJ_mv.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_IJ_mv.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_IJ_mv.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_IJ_mv.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_struct_mv.h:#if 0 //defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_utilities.h:   HYPRE_MEMORY_DEVICE
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_utilities.h: *          - cuSPARSE for CUDA (HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_utilities.h: *          - cuSPARSE for CUDA (HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_utilities.h: *          - cuSPARSE for CUDA (HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_utilities.h: *          - cuSPARSE for CUDA (HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.h:#if defined(HYPRE_USING_GPU) || defined(HYPRE_USING_DEVICE_OPENMP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.h:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.h:#if defined(HYPRE_USING_GPU) || defined(HYPRE_USING_DEVICE_OPENMP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.h:#if defined(HYPRE_USING_UNIFIED_MEMORY) && defined(HYPRE_USING_DEVICE_OPENMP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.h:   if (location == HYPRE_MEMORY_DEVICE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.h:#elif defined(HYPRE_USING_UNIFIED_MEMORY)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.h:#if defined(HYPRE_USING_GPU) || defined(HYPRE_USING_DEVICE_OPENMP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.h:#if 0 //defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.h:#if 0 //defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.h:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.h:#if !defined(HYPRE_USING_RAJA) && !defined(HYPRE_USING_KOKKOS) && !defined(HYPRE_USING_CUDA) && !defined(HYPRE_USING_HIP) && !defined(HYPRE_USING_DEVICE_OPENMP) && !defined(HYPRE_USING_SYCL)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_mv.h:#if defined(HYPRE_USING_GPU) || defined(HYPRE_USING_DEVICE_OPENMP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_mv.h:#if defined(HYPRE_USING_GPU) || defined(HYPRE_USING_DEVICE_OPENMP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_mv.h:#if defined(HYPRE_USING_GPU) || defined(HYPRE_USING_DEVICE_OPENMP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_mv.h:                      HYPRE_MEMORY_DEVICE);
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_mv.h:                    HYPRE_MEMORY_DEVICE,
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_mv.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_mv.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_struct_ls.h:#if 0 //defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_struct_ls.h:#if 0 //defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPREf.h:      integer HYPRE_MEMORY_DEVICE
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPREf.h:      parameter( HYPRE_MEMORY_DEVICE = 1 )
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif /* if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP) */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif /* if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP) */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:      return hypre_TAlloc(char, num_bytes, HYPRE_MEMORY_DEVICE);
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:      hypre_TFree(ptr, HYPRE_MEMORY_DEVICE);
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif /* #if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP) */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_SYCL)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif /* defined(HYPRE_USING_CUDA) */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#elif defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif /* defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP) */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif /* defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP) */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif /* if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP) */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif /* #if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)*/
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:   /* TODO (VPM): Change to HYPRE_USING_GPU_STREAMS*/
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA_STREAMS)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUSPARSE) && (CUSPARSE_VERSION >= CUSPARSE_SPSV_VERSION)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUSPARSE) && (CUSPARSE_VERSION >= CUSPARSE_SPSV_VERSION)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif /* if defined(HYPRE_USING_GPU) */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif // defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif // defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif // #if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif // #if defined(HYPRE_USING_CUSPARSE)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:            hypre_TAlloc(HYPRE_Real6, HYPRE_MAX_NTHREADS_BLOCK, HYPRE_MEMORY_DEVICE);
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:         hypre_TMemcpy(&val, d_buf, T, 1, HYPRE_MEMORY_HOST, HYPRE_MEMORY_DEVICE);
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif /* #if defined(HYPRE_USING_CUDA)  || defined(HYPRE_USING_HIP) */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#if defined(HYPRE_USING_CUDA) && defined(HYPRE_USING_DEVICE_POOL)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_utilities.hpp:#endif // #if defined(HYPRE_USING_CUDA) && defined(HYPRE_USING_DEVICE_POOL)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_config.h:#define HYPRE_USING_CUDA 1
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_config.h:#define HYPRE_USING_CUDA_STREAMS 1
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_config.h:#define HYPRE_USING_CUSPARSE 1
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_config.h:#define HYPRE_USING_GPU 1
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_config.h:/* #undef HYPRE_USING_GPU_AWARE_MPI */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/HYPRE_config.h:/* #undef HYPRE_USING_UNIFIED_MEMORY */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:#if defined(HYPRE_USING_CUDA) /* RAJA with CUDA, running on device */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:#endif /* #if defined(HYPRE_USING_CUDA) */
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:#if (defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)) && !defined(HYPRE_USING_RAJA) && !defined(HYPRE_USING_KOKKOS)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:   HYPRE_Real *shared_sum_var = hypre_CTAlloc(HYPRE_Real, 1, HYPRE_MEMORY_DEVICE);                    \
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:   hypre_TMemcpy(shared_sum_var, &sum_var, HYPRE_Real, 1, HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_HOST);    \
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:   hypre_TMemcpy(&sum_var, shared_sum_var, HYPRE_Real, 1, HYPRE_MEMORY_HOST, HYPRE_MEMORY_DEVICE);    \
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:   hypre_TFree(shared_sum_var, HYPRE_MEMORY_DEVICE);                                                  \
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:   HYPRE_Real *shared_sum_var = hypre_CTAlloc(HYPRE_Real, 1, HYPRE_MEMORY_DEVICE);                    \
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:   hypre_TMemcpy(shared_sum_var, &sum_var, HYPRE_Real, 1, HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_HOST);    \
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:   hypre_TMemcpy(&sum_var, shared_sum_var, HYPRE_Real, 1, HYPRE_MEMORY_HOST, HYPRE_MEMORY_DEVICE);    \
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_struct_mv.hpp:   hypre_TFree(shared_sum_var, HYPRE_MEMORY_DEVICE);                                                  \
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_ls.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_ls.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_ls.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_ls.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_parcsr_ls.h:#if defined(HYPRE_USING_GPU)
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_seq_mv.h:#if defined(HYPRE_USING_CUSPARSE)  ||\
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_seq_mv.h:#if defined(HYPRE_USING_CUSPARSE)  ||\
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_seq_mv.h:#if defined(HYPRE_USING_CUSPARSE)  ||\
+/home/jd/src/petsc/arch-linux-cuda-opt/include/_hypre_seq_mv.h:#if defined(HYPRE_USING_CUSPARSE)  ||\

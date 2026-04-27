@@ -1,0 +1,12 @@
+# Pipe test with normal-speed inlet.
+# Sign convention:
+# fixed_normal_speed is signed along the outward mesh normal.
+# patch_1_0 outward normal is about -z, so speed -1 gives inflow in +z.
+
+velocity patch_0_0 wall_noslip
+velocity patch_1_0 fixed_normal_speed -1.0 average_patch_normal
+velocity patch_2_0 zero_gradient
+
+pressure patch_0_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0

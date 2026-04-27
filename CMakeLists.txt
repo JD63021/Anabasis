@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.21)
+project(fvm_cuda LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+add_subdirectory(poisson/tet_dirichlet_mms)
+add_subdirectory(libpoisson)
+add_subdirectory(apps/poisson_mms_lib)
+add_subdirectory(apps/poisson_mms_neumann_lib)
+add_subdirectory(apps/poisson_mms_mixed_lib)
+add_subdirectory(apps/simple)
+add_subdirectory(libscalar)
+add_subdirectory(apps/scalar_mms_lib)

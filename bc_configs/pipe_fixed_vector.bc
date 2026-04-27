@@ -1,0 +1,7 @@
+velocity patch_0_0 wall_noslip
+velocity patch_1_0 fixed_uniform_vector 0.0 0.0 1.0
+velocity patch_2_0 zero_gradient
+
+pressure patch_0_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0
