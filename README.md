@@ -821,7 +821,3 @@ Open the resulting `.vtu` in ParaView and verify:
 - velocity magnitude is physically reasonable
 
 ---
-
-## License
-
-No license has been specified in this checkpoint yet. Add a `LICENSE` file before publishing if the repository is intended to be public.
