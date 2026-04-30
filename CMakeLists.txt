@@ -14,3 +14,7 @@ add_subdirectory(apps/poisson_mms_mixed_lib)
 add_subdirectory(apps/simple)
 add_subdirectory(libscalar)
 add_subdirectory(apps/scalar_mms_lib)
+add_subdirectory(apps/stokes_mms_simple)
+
+add_subdirectory(apps/cylinder_simple)
+add_subdirectory(apps/generic_simple_v1)
