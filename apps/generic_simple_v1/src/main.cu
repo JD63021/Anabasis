@@ -2845,7 +2845,6 @@ static PatchForceReport compute_patch_forces_wall_shear(
   r.requested = true;
 
   if(patchIndex < 0 || patchIndex >= (int)mesh.patchNames.size()) return r;
-  if(Uref <= 0.0 || Aref <= 0.0) return r;
 
   r.valid = true;
   r.patchIndex = patchIndex;
@@ -2859,7 +2858,10 @@ static PatchForceReport compute_patch_forces_wall_shear(
   r.mu = mu;
   r.Uref = Uref;
   r.Aref = Aref;
-  r.coeffDenom = rho * Uref * Uref * Aref;
+  r.coeffDenom =
+      (rho > 0.0 && Uref > 0.0 && Aref > 0.0)
+      ? (rho * Uref * Uref * Aref)
+      : 0.0;
 
   const int f0 = mesh.patchStartFace[patchIndex];
   const int f1 = f0 + mesh.patchNFaces[patchIndex];
@@ -3729,40 +3731,34 @@ int main(int argc, char **argv){
     if(par.forceEnable){
       std::printf("------------------------------------------------------------\n");
       if(patchForce.valid){
-        std::printf("Patch force postprocess, generic wall-shear traction\n");
-        std::printf("force patch      = %s\n", patchForce.patchName.c_str());
-        std::printf("force faces      = %d\n", patchForce.nFaces);
-        std::printf("force area       = %.12e\n", patchForce.area);
-        std::printf("normalSign       = %d\n", patchForce.normalSign);
-        std::printf("rho, mu          = %.12e  %.12e\n", patchForce.rho, patchForce.mu);
-        std::printf("Uref, Aref       = %.12e  %.12e\n", patchForce.Uref, patchForce.Aref);
-        std::printf("coeff denom      = rho*Uref^2*Aref = %.12e\n", patchForce.coeffDenom);
-        std::printf("dragDir          = [%.12e, %.12e, %.12e]\n", patchForce.dragDir[0], patchForce.dragDir[1], patchForce.dragDir[2]);
-        std::printf("liftDir          = [%.12e, %.12e, %.12e]\n", patchForce.liftDir[0], patchForce.liftDir[1], patchForce.liftDir[2]);
-        std::printf("spanDir          = [%.12e, %.12e, %.12e]\n", patchForce.spanDir[0], patchForce.spanDir[1], patchForce.spanDir[2]);
+        std::printf("Patch force postprocess, raw Cartesian wall traction\n");
+        std::printf("force patch       = %s\n", patchForce.patchName.c_str());
+        std::printf("force faces       = %d\n", patchForce.nFaces);
+        std::printf("force area        = %.12e\n", patchForce.area);
+        std::printf("normalSign        = %d\n", patchForce.normalSign);
+        std::printf("rho, mu           = %.12e  %.12e\n", patchForce.rho, patchForce.mu);
 
-        std::printf("Fp vector        = [%.12e, %.12e, %.12e]\n", patchForce.Fp[0], patchForce.Fp[1], patchForce.Fp[2]);
-        std::printf("Fv vector        = [%.12e, %.12e, %.12e]\n", patchForce.Fv[0], patchForce.Fv[1], patchForce.Fv[2]);
-        std::printf("F  vector        = [%.12e, %.12e, %.12e]\n", patchForce.F[0],  patchForce.F[1],  patchForce.F[2]);
+        std::printf("pressureForce     = [%.12e, %.12e, %.12e]\n", patchForce.Fp[0], patchForce.Fp[1], patchForce.Fp[2]);
+        std::printf("viscousForce      = [%.12e, %.12e, %.12e]\n", patchForce.Fv[0], patchForce.Fv[1], patchForce.Fv[2]);
+        std::printf("totalForce        = [%.12e, %.12e, %.12e]\n", patchForce.F[0],  patchForce.F[1],  patchForce.F[2]);
 
-        std::printf("F_drag pressure  = %.12e\n", patchForce.FpDrag);
-        std::printf("F_drag viscous   = %.12e\n", patchForce.FvDrag);
-        std::printf("F_drag total     = %.12e\n", patchForce.FDrag);
-        std::printf("F_lift pressure  = %.12e\n", patchForce.FpLift);
-        std::printf("F_lift viscous   = %.12e\n", patchForce.FvLift);
-        std::printf("F_lift total     = %.12e\n", patchForce.FLift);
-        std::printf("F_span pressure  = %.12e\n", patchForce.FpSpan);
-        std::printf("F_span viscous   = %.12e\n", patchForce.FvSpan);
-        std::printf("F_span total     = %.12e\n", patchForce.FSpan);
+        std::printf("pressureForce_x   = %.12e\n", patchForce.Fp[0]);
+        std::printf("pressureForce_y   = %.12e\n", patchForce.Fp[1]);
+        std::printf("pressureForce_z   = %.12e\n", patchForce.Fp[2]);
 
-        std::printf("C_drag           = %.12e\n", patchForce.CDrag);
-        std::printf("C_lift           = %.12e\n", patchForce.CLift);
-        std::printf("C_span           = %.12e\n", patchForce.CSpan);
-        std::printf("wall dn min/max  = %.12e / %.12e\n", patchForce.minWallDistance, patchForce.maxWallDistance);
-        std::printf("max|Ut|          = %.12e\n", patchForce.maxUt);
-        std::printf("max shear mag    = %.12e\n", patchForce.maxShearMag);
+        std::printf("viscousForce_x    = %.12e\n", patchForce.Fv[0]);
+        std::printf("viscousForce_y    = %.12e\n", patchForce.Fv[1]);
+        std::printf("viscousForce_z    = %.12e\n", patchForce.Fv[2]);
+
+        std::printf("totalForce_x      = %.12e\n", patchForce.F[0]);
+        std::printf("totalForce_y      = %.12e\n", patchForce.F[1]);
+        std::printf("totalForce_z      = %.12e\n", patchForce.F[2]);
+
+        std::printf("wall dn min/max   = %.12e / %.12e\n", patchForce.minWallDistance, patchForce.maxWallDistance);
+        std::printf("max|Ut|           = %.12e\n", patchForce.maxUt);
+        std::printf("max shear mag     = %.12e\n", patchForce.maxShearMag);
       } else {
-        std::printf("Patch force postprocess requested but skipped. Check forcePatch, forceUref, forceAreaRef.\n");
+        std::printf("Patch force postprocess requested but skipped. Check forcePatch.\n");
         std::printf("requested patch  = %s\n", par.forcePatchName.c_str());
         std::printf("forceUref        = %.12e\n", par.forceUref);
         std::printf("forceAreaRef     = %.12e\n", par.forceAreaRef);
@@ -3887,26 +3883,24 @@ int main(int argc, char **argv){
     sout << "FzTotalVector " << cylForceVec.F[2] << "\n";
   }
   if(patchForce.valid){
-    sout << "genericForcePatch " << patchForce.patchName << "\n";
-    sout << "genericForceFaces " << patchForce.nFaces << "\n";
-    sout << "genericForceArea " << patchForce.area << "\n";
-    sout << "genericForceNormalSign " << patchForce.normalSign << "\n";
-    sout << "genericForceUref " << patchForce.Uref << "\n";
-    sout << "genericForceAref " << patchForce.Aref << "\n";
-    sout << "genericForceCoeffDenom " << patchForce.coeffDenom << "\n";
-    sout << "genericFxPressure " << patchForce.Fp[0] << "\n";
-    sout << "genericFyPressure " << patchForce.Fp[1] << "\n";
-    sout << "genericFzPressure " << patchForce.Fp[2] << "\n";
-    sout << "genericFxViscous " << patchForce.Fv[0] << "\n";
-    sout << "genericFyViscous " << patchForce.Fv[1] << "\n";
-    sout << "genericFzViscous " << patchForce.Fv[2] << "\n";
-    sout << "genericFxTotal " << patchForce.F[0] << "\n";
-    sout << "genericFyTotal " << patchForce.F[1] << "\n";
-    sout << "genericFzTotal " << patchForce.F[2] << "\n";
-    sout << "genericCDrag " << patchForce.CDrag << "\n";
-    sout << "genericCLift " << patchForce.CLift << "\n";
-    sout << "genericCSpan " << patchForce.CSpan << "\n";
+    sout << "patchForcePatch " << patchForce.patchName << "\n";
+    sout << "patchForceFaces " << patchForce.nFaces << "\n";
+    sout << "patchForceArea " << patchForce.area << "\n";
+    sout << "patchForceNormalSign " << patchForce.normalSign << "\n";
+
+    sout << "pressureForce_x " << patchForce.Fp[0] << "\n";
+    sout << "pressureForce_y " << patchForce.Fp[1] << "\n";
+    sout << "pressureForce_z " << patchForce.Fp[2] << "\n";
+
+    sout << "viscousForce_x " << patchForce.Fv[0] << "\n";
+    sout << "viscousForce_y " << patchForce.Fv[1] << "\n";
+    sout << "viscousForce_z " << patchForce.Fv[2] << "\n";
+
+    sout << "totalForce_x " << patchForce.F[0] << "\n";
+    sout << "totalForce_y " << patchForce.F[1] << "\n";
+    sout << "totalForce_z " << patchForce.F[2] << "\n";
   }
+
   sout.close();
 
   destroy_momentum_system(mom);
