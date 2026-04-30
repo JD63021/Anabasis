@@ -1,0 +1,70 @@
+# Generic SIMPLE cylinder example
+# Mesh included at examples/cylinder/constant/polyMesh
+
+polyMeshDir examples/cylinder/constant/polyMesh
+outPrefix runs/cylinder
+
+device 0
+
+rho 1.0
+mu 0.001
+Umean 0.45
+
+pipeD 0.1
+pipeL 2.5
+
+wallPatch patch_0_0
+inletPatch patch_1_0
+outletPatch patch_2_0
+
+nsteps 1000
+printEvery 20
+writeVtu 1
+writeEvery 0
+monitor 1
+
+nVelNonOrthCorr 1
+nNonOrthCorr 10
+nPressureCorr 0
+
+uRelax 0.5
+pRelax 0.3
+
+corrTol 1e-10
+tolMass 1e-6
+tolVel 1e-6
+
+velMaxit 1000
+velTol 1e-10
+velRelTol 0
+
+pUseAmg 1
+pMaxit 4000
+pTol 1e-10
+pRelTol 0
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgRelaxType 7
+pAmgKeepTranspose 1
+pAmgRebuildEvery 10
+
+# Runtime boundary conditions
+# Every polyMesh boundary patch must have one velocity BC and one pressure BC.
+
+velocity patch_0_0 wall_noslip
+velocity patch_5_0 wall_noslip
+velocity patch_3_0 wall_noslip
+velocity patch_1_0 parabolic_box_inlet 0.41 0.45 y z average_patch_normal
+velocity patch_2_0 zero_gradient
+
+pressure patch_0_0 zero_gradient
+pressure patch_5_0 zero_gradient
+pressure patch_3_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0
+
+# Generic raw Cartesian patch-force integration
+forceEnable 1
+forcePatch patch_3_0
+forceNormalSign -1
