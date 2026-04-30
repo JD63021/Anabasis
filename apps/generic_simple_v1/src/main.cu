@@ -345,7 +345,15 @@ static void parse_args(int argc, char** argv, Params &par){
     else if(!std::strcmp(argv[i],"-inlet-patch") || !std::strcmp(argv[i],"-lid-patch")){need(argv[i]); par.inletPatchName=argv[++i];}
     else if(!std::strcmp(argv[i],"-outlet-patch")){need(argv[i]); par.outletPatchName=argv[++i];}
     else if(!std::strcmp(argv[i],"-bc-config")){need(argv[i]); par.bcConfigPath=argv[++i];}
-    else if(!std::strcmp(argv[i],"-cfl")){need(argv[i]); par.CFL=std::atof(argv[++i]);}
+        else if(!std::strcmp(argv[i],"-force-enable")){need(argv[i]); par.forceEnable=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-force-patch")){need(argv[i]); par.forcePatchName=argv[++i];}
+    else if(!std::strcmp(argv[i],"-force-normal-sign")){need(argv[i]); par.forceNormalSign=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-force-drag-dir")){need(argv[i]); par.forceDragDir=parse_vec3_arg(argv[++i], "-force-drag-dir");}
+    else if(!std::strcmp(argv[i],"-force-lift-dir")){need(argv[i]); par.forceLiftDir=parse_vec3_arg(argv[++i], "-force-lift-dir");}
+    else if(!std::strcmp(argv[i],"-force-span-dir")){need(argv[i]); par.forceSpanDir=parse_vec3_arg(argv[++i], "-force-span-dir");}
+    else if(!std::strcmp(argv[i],"-force-uref")){need(argv[i]); par.forceUref=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-force-area-ref")){need(argv[i]); par.forceAreaRef=std::atof(argv[++i]);}
+else if(!std::strcmp(argv[i],"-cfl")){need(argv[i]); par.CFL=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-device")){need(argv[i]); par.device=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-vel-restart")){need(argv[i]); par.velRestart=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-vel-maxit")){need(argv[i]); par.velMaxit=std::atoi(argv[++i]);}
