@@ -18,3 +18,4 @@ add_subdirectory(apps/stokes_mms_simple)
 
 add_subdirectory(apps/cylinder_simple)
 add_subdirectory(apps/generic_simple_v1)
+add_subdirectory(apps/generic_simple_v2)

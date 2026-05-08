@@ -16,3 +16,18 @@ __pycache__/
 .DS_Store
 *.pre_*
 *.pre*
+
+# Local generated binaries and run outputs
+generic_simple_v2_direct
+runs/
+*.log
+*.vtu
+*.vtp
+*.csv
+
+# Local patch/scratch bundles
+generic_simple_v2_patch_bundle/
+apps/archive/
+apps/generic_simple_pseudo_v1/
+*.bak*
+*.broken_before_clean_repatch
