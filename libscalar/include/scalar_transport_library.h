@@ -61,6 +61,9 @@ enum class ConvectionScheme {
   Upwind
 };
 
+ConvectionScheme convection_scheme_from_string(const std::string& name);
+const char* convection_scheme_name(ConvectionScheme scheme);
+
 enum class DiffusionScheme {
   Orth,
   NonOrth

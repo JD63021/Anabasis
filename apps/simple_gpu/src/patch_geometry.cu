@@ -71,10 +71,20 @@ static void validate_input(const PatchGeometryInput& in) {
     throw std::runtime_error("nInternalFaces out of range");
   }
   if (in.patchStartFace->size() != in.patchNames->size()) {
-    throw std::runtime_error("patchStartFace size mismatch");
+    throw std::runtime_error(
+      std::string("patchStartFace size mismatch: patchNames=")
+      + std::to_string(in.patchNames->size())
+      + " patchStartFace=" + std::to_string(in.patchStartFace->size())
+      + " patchNFaces=" + std::to_string(in.patchNFaces->size())
+    );
   }
   if (in.patchNFaces->size() != in.patchNames->size()) {
-    throw std::runtime_error("patchNFaces size mismatch");
+    throw std::runtime_error(
+      std::string("patchNFaces size mismatch: patchNames=")
+      + std::to_string(in.patchNames->size())
+      + " patchStartFace=" + std::to_string(in.patchStartFace->size())
+      + " patchNFaces=" + std::to_string(in.patchNFaces->size())
+    );
   }
 }
 

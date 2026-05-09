@@ -1,18 +1,17 @@
+# Build and run outputs
 build/
-build_*/
+build_mms/
 runs/
-*.vtu
-*.pvd
 *.log
-*.o
-*.so
-*.a
-*.tmp
-*.bak
-*.bak_*
-*.before_*
+*.vtu
+*.vtp
+*.csv
+
+# Direct-build executable
+/simple_gpu
+
+# Local/editor/backup files
+*.bak*
 *.generated.bc
 __pycache__/
 .DS_Store
-*.pre_*
-*.pre*

@@ -27,6 +27,19 @@ extern "C" {
 } while (0)
 
 namespace libscalar {
+
+ConvectionScheme convection_scheme_from_string(const std::string& name) {
+  std::string v = name;
+  for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (v == "central" || v == "linear" || v == "gauss-linear" || v == "gausslinear") return ConvectionScheme::Central;
+  if (v == "upwind" || v == "first-order-upwind" || v == "firstorderupwind") return ConvectionScheme::Upwind;
+  throw std::runtime_error("Unknown scalar convection scheme '" + name + "'. Use central or upwind.");
+}
+
+const char* convection_scheme_name(ConvectionScheme scheme) {
+  return scheme == ConvectionScheme::Upwind ? "upwind" : "central";
+}
+
 namespace {
 
 static inline std::array<double,3> add3(const std::array<double,3>& a, const std::array<double,3>& b) {

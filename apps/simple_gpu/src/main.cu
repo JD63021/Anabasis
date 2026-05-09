@@ -15,11 +15,14 @@
 #include <algorithm>
 #include <stdexcept>
 #include <cfloat>
+#include <cctype>
 #include <cuda_runtime.h>
 #include "patch_geometry.h"
 #include "bc_specs.h"
 #include "velocity_bc_eval.h"
 #include "bc_runtime_config.h"
+#include "mesh.h"
+#include "scalar_transport_library.h"
 extern "C" {
 #include "HYPRE.h"
 #include "HYPRE_IJ_mv.h"
@@ -57,19 +60,6 @@ __device__ __forceinline__ void hypreAtomicAdd(HYPRE_Complex *addr, HYPRE_Comple
   atomicAdd(reinterpret_cast<double*>(addr), static_cast<double>(val));
 }
 
-struct PatchInfo { std::string name; int nFaces=0; int startFace=0; std::string type; };
-struct Mesh {
-  std::vector<std::array<double,3>> P;
-  std::vector<std::vector<int>> faces;
-  std::vector<int> owner, neigh, bPatch;
-  std::vector<std::string> patchNames;
-  std::vector<int> patchStartFace, patchNFaces;
-  int nFaces=0, nInternalFaces=0, nCells=0;
-  std::vector<std::array<double,3>> cc, xf, nf, Sf;
-  std::vector<double> vol, Af;
-  std::vector<std::vector<int>> cellNbrs, cellBFace, cellFaces, cellOrient;
-  double maxNonOrthDeg=0.0;
-};
 struct Params {
   std::string polyMeshDir="/tmp/meshCase/constant/polyMesh";
   std::string outPrefix="pipe_poiseuille_gpu";
@@ -88,6 +78,28 @@ struct Params {
   int pAmgRebuildEvery=1; // rebuild AMG hierarchy on outer iter 1 and then every N outer iterations
   int pAmgSetupScope=0;    // 0 = setup once per outer iteration, 1 = setup before every pressure solve
 
+  // simple_gpu pressure-velocity coupling controls.
+  // Defaults preserve the v1-style correction solve, while command-line options
+  // can select the more OpenFOAM-like robust branch found useful on bad poly/tet meshes.
+  double momNonOrthScale=1.0;
+  int rcMode=0;              // 0=old explicit RC term, 1=OpenFOAM-like no explicit RC in phi predictor
+  int rAUMode=1;             // 0=raw V/aP_raw, 1=relaxed V/aP_relaxed
+  double rAUScale=1.0;       // diagnostic multiplier applied consistently to rAU
+  double pNonOrthScale=1.0;  // 0 corresponds to uncorrected pressure laplacian/flux
+  int pMode=0;               // 0=pressure correction, 1=absolute pressure/HbyA
+  int pSolveMode=0;          // 0=current correction-compatible path, 1=OF absolute p/HbyA assignment path
+  int pGradScheme=0;         // 0=LSQ gradient, 1=Gauss-linear gradient for final velocity correction
+  double pCoeffScale=1.0;
+  int hbyaBcMode=1;          // constrain fixed-velocity boundary fluxes in HbyA/phiHbyA
+  int pFluxMode=0;           // retained for compatibility; flux is matrix-consistent
+  int pDeltaMode=1;           // 0=v1-signed 1/(n.d), 1=OF-stabilised 1/max(|n.d|, minCos*|d|), 2=abs-projected 1/|n.d|, 3=distance 1/|d|
+  double pDeltaMinCos=0.05;   // floor for pDeltaMode=1
+  int geomMethod=1;          // 0=legacy geometry, 1=robust triangulated geometry
+  int lsqStencilMode=0;      // 0=compact; extended is accepted but not yet implemented in this app
+  double lsqWeightPower=2.0; // compact LSQ weight 1/|d|^p
+
+  int momentumConvectionScheme=0; // 0=central/linear, 1=first-order upwind for div(phi,U) momentum convection
+
   // Generic patch force postprocess.
   // C = 2F / (rho * Uref^2 * Aref)
   int forceEnable = 0;
@@ -100,14 +112,115 @@ struct Params {
 
   double forceUref = -1.0;
   double forceAreaRef = -1.0;
+
+  // Optional OpenFOAM-like potential/projection initialisation.
+  // 0 = current uniform-inlet-average initial field; 1 = solve one Laplace/projection
+  // from runtime boundary fluxes and initialise U = -rAU*grad(potential).
+  int initMode = 0;
+  double potentialInitRAU = 1.0;
+  int potentialInitMaxit = 4000;
+  double potentialInitTol = 1e-10;
+  double potentialInitRelTol = 0.0;
+  int potentialInitWrite = 0;
+
+  // v2.1 diagnostics for bad-cell / bad-face correction feedback.
+  // Off by default. Set badCellAuditEvery > 0 for periodic dumps,
+  // or badCellAuditOnGrowth=1 to dump when mass residual climbs.
+  int badCellAuditEvery = 0;
+  int badCellAuditTop = 12;
+  int badCellAuditStart = 1;
+  int badCellAuditOnGrowth = 0;
+  double badCellAuditGrowthFactor = 1.20;
+  double badCellAuditMassFloor = 0.0;
+  int badCellAuditWriteCsv = 1;
+
+  // v1 PDE-oriented case-file options. These are parsed and printed here so
+  // future Poisson/scalar physics can share one case file without disturbing
+  // the working SIMPLE path. Poisson gradient schemes are implemented in
+  // libpoisson; scalar convection scheme strings map to libscalar enums.
+  std::string poissonGradientScheme = "lsq";   // lsq or gauss
+  std::string poissonLaplacianScheme = "nonorth";
+  int poissonNonOrthCorr = 2;
+
+  int scalarEnable = 0;
+  std::string scalarSolveMode = "afterFlow";
+  std::string scalarName = "scalar";
+  std::string scalarBCConfigPath = "";
+  std::string scalarConvectionScheme = "central"; // central or upwind
+  std::string scalarDiffusionScheme = "nonorth";
+  double scalarGamma = 1.0;
+  double scalarRelax = 1.0;
+  int scalarNonOrthCorr = 2;
+  int scalarMaxit = 4000;
+  double scalarTol = 1.0e-10;
+  double scalarRelTol = 0.0;
 };
 
-static inline std::array<double,3> add3(const std::array<double,3>& a,const std::array<double,3>& b){return {a[0]+b[0],a[1]+b[1],a[2]+b[2]};}
-static inline std::array<double,3> sub3(const std::array<double,3>& a,const std::array<double,3>& b){return {a[0]-b[0],a[1]-b[1],a[2]-b[2]};}
-static inline std::array<double,3> mul3(double s,const std::array<double,3>& a){return {s*a[0],s*a[1],s*a[2]};}
-static inline double dot3(const std::array<double,3>& a,const std::array<double,3>& b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
-static inline std::array<double,3> cross3(const std::array<double,3>& a,const std::array<double,3>& b){return {a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]};}
-static inline double norm3(const std::array<double,3>& a){return std::sqrt(dot3(a,a));}
+// add3/sub3/mul3/dot3/cross3/norm3 are provided by libpoisson/common.h via mesh.h.
+
+// OpenFOAM-like stabilized normal delta coefficient used by nonOrthDeltaCoeffs:
+//   1/max(nHat.d, 0.05*|d|)
+// This avoids huge pressure/diffusion coefficients on nearly 90-degree faces.
+#define OF_STAB_DELTA_LIMIT 0.05
+static __host__ __device__ __forceinline__ double of_delta_coeff_stabilised(
+    double dx, double dy, double dz,
+    double nx, double ny, double nz)
+{
+  const double magD = sqrt(dx*dx + dy*dy + dz*dz);
+  const double nd   = nx*dx + ny*dy + nz*dz;
+  const double dEff = fmax(nd, OF_STAB_DELTA_LIMIT*magD);
+  return 1.0 / fmax(dEff, 1.0e-300);
+}
+static inline double of_delta_coeff_stabilised(const std::array<double,3>& n,
+                                               const std::array<double,3>& d)
+{
+  return of_delta_coeff_stabilised(d[0], d[1], d[2], n[0], n[1], n[2]);
+}
+
+
+// Runtime pressure delta coefficient selector.
+// pDeltaMode:
+//   0 = legacy/v1 signed-projected: delta = 1/(n.d), guarded as in legacy SIMPLE
+//   1 = OpenFOAM-like stabilised:  delta = 1/max(|n.d|, pDeltaMinCos*|d|)
+//   2 = abs projected:            delta = 1/|n.d|
+//   3 = distance:                 delta = 1/|d|  (this was the first v2 "legacy" implementation)
+// Default mode 1 preserves current simple_gpu robust behavior.
+__device__ __managed__ int g_pDeltaMode = 1;
+__device__ __managed__ double g_pDeltaMinCos = 0.05;
+
+static __host__ __device__ __forceinline__ double pressure_delta_coeff_runtime(
+    double dx, double dy, double dz,
+    double nfx, double nfy, double nfz)
+{
+  const double dmag = sqrt(dx*dx + dy*dy + dz*dz);
+  if (dmag <= 1.0e-300) return 0.0;
+
+  const double dpn = nfx*dx + nfy*dy + nfz*dz;
+
+  // Exact v1 pressure coefficient: Af*rAU/(n.d), with the same small/negative
+  // projected-distance guard used by legacy SIMPLE.
+  if (g_pDeltaMode == 0) {
+    return (dpn > 1.0e-14) ? (1.0 / dpn) : 0.0;
+  }
+
+  if (g_pDeltaMode == 2) {
+    return 1.0 / fmax(fabs(dpn), 1.0e-300);
+  }
+
+  if (g_pDeltaMode == 3) {
+    return 1.0 / fmax(dmag, 1.0e-300);
+  }
+
+  const double floorVal = fmax(g_pDeltaMinCos, 0.0) * dmag;
+  return 1.0 / fmax(fabs(dpn), fmax(floorVal, 1.0e-300));
+}
+
+static inline double pressure_delta_coeff_runtime(
+    const std::array<double,3>& n,
+    const std::array<double,3>& d)
+{
+  return pressure_delta_coeff_runtime(d[0], d[1], d[2], n[0], n[1], n[2]);
+}
 
 static std::array<double,3> parse_vec3_arg(const std::string& raw, const char* optName){
   std::string t = raw;
@@ -247,7 +360,87 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
     {"forceAreaRef", "-force-area-ref"},
 
     {"profileSteps", "-profile-steps"},
-    {"assemblyBackend", "-assembly-backend"}
+    {"assemblyBackend", "-assembly-backend"},
+
+    // simple_gpu formulation / OpenFOAM-like controls
+    {"geomMethod", "-geom-method"},
+    {"geom-method", "-geom-method"},
+    {"lsqStencil", "-lsq-stencil"},
+    {"lsq-stencil", "-lsq-stencil"},
+    {"lsqWeightPower", "-lsq-weight-power"},
+    {"momentumConvectionScheme", "-momentum-convection-scheme"},
+    {"momentumPhiScheme", "-momentum-convection-scheme"},
+    {"momentumDivScheme", "-momentum-convection-scheme"},
+    {"divPhiUScheme", "-momentum-convection-scheme"},
+    {"lsq-weight-power", "-lsq-weight-power"},
+    {"momNonOrthScale", "-mom-nonorth-scale"},
+    {"mom-nonorth-scale", "-mom-nonorth-scale"},
+    {"pNonOrthScale", "-p-nonorth-scale"},
+    {"p-nonorth-scale", "-p-nonorth-scale"},
+    {"pMode", "-p-mode"},
+    {"p-mode", "-p-mode"},
+    {"pSolveMode", "-p-solve-mode"},
+    {"p-solve-mode", "-p-solve-mode"},
+    {"pGradScheme", "-p-grad-scheme"},
+    {"p-grad-scheme", "-p-grad-scheme"},
+    {"pCoeffScale", "-p-coeff-scale"},
+    {"p-coeff-scale", "-p-coeff-scale"},
+    {"rcMode", "-rc-mode"},
+    {"rc-mode", "-rc-mode"},
+    {"rAUMode", "-rAU-mode"},
+    {"rAU-mode", "-rAU-mode"},
+    {"divdevScale", "-divdev-scale"},
+    {"divdev-scale", "-divdev-scale"},
+    {"pFluxMode", "-p-flux-mode"},
+    {"p-flux-mode", "-p-flux-mode"},
+    {"pDeltaMode", "-p-delta-mode"},
+    {"p-delta-mode", "-p-delta-mode"},
+    {"pressureDeltaMode", "-p-delta-mode"},
+    {"pressure-delta-mode", "-p-delta-mode"},
+    {"pDeltaMinCos", "-p-delta-min-cos"},
+    {"p-delta-min-cos", "-p-delta-min-cos"},
+    {"pressureDeltaMinCos", "-p-delta-min-cos"},
+    {"pressure-delta-min-cos", "-p-delta-min-cos"},
+
+    {"initMode", "-init-mode"},
+    {"initialisationMode", "-init-mode"},
+    {"initializationMode", "-init-mode"},
+    {"potentialInitRAU", "-potential-init-rAU"},
+    {"potentialInitRau", "-potential-init-rAU"},
+    {"potentialInitMaxit", "-potential-init-maxit"},
+    {"potentialInitTol", "-potential-init-tol"},
+    {"potentialInitRelTol", "-potential-init-reltol"},
+    {"potentialInitWrite", "-potential-init-write"},
+
+    // PDE-oriented options accepted by v1 case files.
+    {"poissonGradientScheme", "-poisson-gradient-scheme"},
+    {"poissonGradScheme", "-poisson-gradient-scheme"},
+    {"poissonLaplacianScheme", "-poisson-laplacian-scheme"},
+    {"poissonNonOrthCorr", "-poisson-nonorth-corr"},
+
+    {"scalarEnable", "-scalar-enable"},
+    {"scalarSolveMode", "-scalar-solve-mode"},
+    {"scalarName", "-scalar-name"},
+    {"scalarBCConfig", "-scalar-bc-config"},
+    {"scalarBcConfig", "-scalar-bc-config"},
+    {"scalarConvectionScheme", "-scalar-convection-scheme"},
+    {"scalarPhiScheme", "-scalar-convection-scheme"},
+    {"phiScheme", "-scalar-convection-scheme"},
+    {"scalarDiffusionScheme", "-scalar-diffusion-scheme"},
+    {"scalarGamma", "-scalar-gamma"},
+    {"scalarRelax", "-scalar-relax"},
+    {"scalarNonOrthCorr", "-scalar-nonorth-corr"},
+    {"scalarMaxit", "-scalar-maxit"},
+    {"scalarTol", "-scalar-tol"},
+    {"scalarRelTol", "-scalar-reltol"},
+
+    {"badCellAuditEvery", "-bad-cell-audit-every"},
+    {"badCellAuditTop", "-bad-cell-audit-top"},
+    {"badCellAuditStart", "-bad-cell-audit-start"},
+    {"badCellAuditOnGrowth", "-bad-cell-audit-on-growth"},
+    {"badCellAuditGrowthFactor", "-bad-cell-audit-growth-factor"},
+    {"badCellAuditMassFloor", "-bad-cell-audit-mass-floor"},
+    {"badCellAuditWriteCsv", "-bad-cell-audit-write-csv"},
   };
 
   std::ifstream in(casePath);
@@ -259,7 +452,9 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
   out.emplace_back(argv[0]);
 
   std::vector<std::string> bcLines;
+  std::vector<std::string> scalarBCLines;
   bool explicitBCConfig = false;
+  bool explicitScalarBCConfig = false;
 
   std::string raw;
   int lineNo = 0;
@@ -274,6 +469,10 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
 
     if(tok[0] == "velocity" || tok[0] == "pressure"){
       bcLines.push_back(line);
+      continue;
+    }
+    if(tok[0] == "scalar"){
+      scalarBCLines.push_back(line);
       continue;
     }
 
@@ -293,6 +492,7 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
     }
 
     if(tok[0] == "bcConfig") explicitBCConfig = true;
+    if(tok[0] == "scalarBCConfig" || tok[0] == "scalarBcConfig") explicitScalarBCConfig = true;
 
     out.push_back(it->second);
     out.push_back(tok[1]);
@@ -315,6 +515,25 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
 
     out.push_back("-bc-config");
     out.push_back(generatedBCPath);
+  }
+
+  if(!scalarBCLines.empty() && explicitScalarBCConfig){
+    throw std::runtime_error(
+        "Case config cannot contain both scalarBCConfig and inline scalar BC lines");
+  }
+
+  if(!scalarBCLines.empty()){
+    const std::string generatedScalarBCPath = casePath + ".generated.scalar.bc";
+    std::ofstream scalarBCOut(generatedScalarBCPath);
+    if(!scalarBCOut){
+      throw std::runtime_error("Could not write generated scalar BC file: " + generatedScalarBCPath);
+    }
+
+    scalarBCOut << "# Auto-generated scalar BCs from " << casePath << "\n";
+    for(const auto& line : scalarBCLines) scalarBCOut << line << "\n";
+
+    out.push_back("-scalar-bc-config");
+    out.push_back(generatedScalarBCPath);
   }
 
   // Append explicit command-line options after case-file options.
@@ -345,17 +564,17 @@ static void parse_args(int argc, char** argv, Params &par){
     else if(!std::strcmp(argv[i],"-inlet-patch") || !std::strcmp(argv[i],"-lid-patch")){need(argv[i]); par.inletPatchName=argv[++i];}
     else if(!std::strcmp(argv[i],"-outlet-patch")){need(argv[i]); par.outletPatchName=argv[++i];}
     else if(!std::strcmp(argv[i],"-bc-config")){need(argv[i]); par.bcConfigPath=argv[++i];}
-        else if(!std::strcmp(argv[i],"-force-enable")){need(argv[i]); par.forceEnable=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-cfl")){need(argv[i]); par.CFL=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-device")){need(argv[i]); par.device=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-vel-restart")){need(argv[i]); par.velRestart=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-force-enable")){need(argv[i]); par.forceEnable=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-force-patch")){need(argv[i]); par.forcePatchName=argv[++i];}
     else if(!std::strcmp(argv[i],"-force-normal-sign")){need(argv[i]); par.forceNormalSign=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-force-uref")){need(argv[i]); par.forceUref=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-force-area-ref")){need(argv[i]); par.forceAreaRef=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-force-drag-dir")){need(argv[i]); par.forceDragDir=parse_vec3_arg(argv[++i], "-force-drag-dir");}
     else if(!std::strcmp(argv[i],"-force-lift-dir")){need(argv[i]); par.forceLiftDir=parse_vec3_arg(argv[++i], "-force-lift-dir");}
     else if(!std::strcmp(argv[i],"-force-span-dir")){need(argv[i]); par.forceSpanDir=parse_vec3_arg(argv[++i], "-force-span-dir");}
-    else if(!std::strcmp(argv[i],"-force-uref")){need(argv[i]); par.forceUref=std::atof(argv[++i]);}
-    else if(!std::strcmp(argv[i],"-force-area-ref")){need(argv[i]); par.forceAreaRef=std::atof(argv[++i]);}
-else if(!std::strcmp(argv[i],"-cfl")){need(argv[i]); par.CFL=std::atof(argv[++i]);}
-    else if(!std::strcmp(argv[i],"-device")){need(argv[i]); par.device=std::atoi(argv[++i]);}
-    else if(!std::strcmp(argv[i],"-vel-restart")){need(argv[i]); par.velRestart=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-vel-maxit")){need(argv[i]); par.velMaxit=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-vel-tol")){need(argv[i]); par.velTol=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-vel-reltol")){need(argv[i]); par.velRelTol=std::atof(argv[++i]);}
@@ -364,6 +583,180 @@ else if(!std::strcmp(argv[i],"-cfl")){need(argv[i]); par.CFL=std::atof(argv[++i]
     else if(!std::strcmp(argv[i],"-nPressureCorr")){need(argv[i]); par.nPressureCorr=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-u-relax")){need(argv[i]); par.uRelax=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-relax")){need(argv[i]); par.pRelax=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-mom-nonorth-scale") || !std::strcmp(argv[i],"-momNonOrthScale")){need(argv[i]); par.momNonOrthScale=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-momentum-convection-scheme") || !std::strcmp(argv[i],"-momentum-phi-scheme") || !std::strcmp(argv[i],"-div-phi-u-scheme")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="central" || v=="linear" || v=="gauss-linear" || v=="gausslinear" || v=="centered" || v=="centred") par.momentumConvectionScheme=0;
+      else if(v=="upwind" || v=="first-order-upwind" || v=="firstorderupwind") par.momentumConvectionScheme=1;
+      else { std::fprintf(stderr,"Unknown -momentum-convection-scheme '%s'. Use central or upwind.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
+    else if(!std::strcmp(argv[i],"-rc-mode") || !std::strcmp(argv[i],"-rhie-chow-mode")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="old" || v=="explicit" || v=="legacy" || v=="rc") par.rcMode=0;
+      else if(v=="of" || v=="oflike" || v=="openfoam" || v=="chalmers" || v=="none" || v=="noexplicit") par.rcMode=1;
+      else { std::fprintf(stderr,"Unknown -rc-mode '%s'. Use old or oflike.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1);}
+    }
+    else if(!std::strcmp(argv[i],"-rAU-mode") || !std::strcmp(argv[i],"-rau-mode") || !std::strcmp(argv[i],"-rUA-mode") || !std::strcmp(argv[i],"-rua-mode")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="raw" || v=="unrelaxed" || v=="a_raw" || v=="apraw") par.rAUMode=0;
+      else if(v=="relaxed" || v=="of" || v=="oflike" || v=="openfoam" || v=="relaxeddiag") par.rAUMode=1;
+      else { std::fprintf(stderr,"Unknown -rAU-mode '%s'. Use raw or relaxed.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1);}
+    }
+    else if(!std::strcmp(argv[i],"-rAU-scale") || !std::strcmp(argv[i],"-rau-scale") || !std::strcmp(argv[i],"-rUA-scale") || !std::strcmp(argv[i],"-rua-scale")){need(argv[i]); par.rAUScale=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-p-nonorth-scale") || !std::strcmp(argv[i],"-pressure-nonorth-scale") || !std::strcmp(argv[i],"-pNonOrthScale")){need(argv[i]); par.pNonOrthScale=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-p-mode") || !std::strcmp(argv[i],"-pressure-mode")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="pcorr" || v=="correction" || v=="p-correction" || v=="piso" || v=="old") par.pMode=0;
+      else if(v=="absolute" || v=="abs" || v=="openfoam" || v=="of" || v=="simple") par.pMode=1;
+      else { std::fprintf(stderr,"Unknown -p-mode '%s'. Use pcorr or absolute.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1);}
+    }
+    else if(!std::strcmp(argv[i],"-p-solve-mode") || !std::strcmp(argv[i],"-psolve-mode")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="correction" || v=="pcorr" || v=="legacy" || v=="current") par.pSolveMode=0;
+      else if(v=="ofabsolute" || v=="of-absolute" || v=="openfoam" || v=="of" || v=="absolute") { par.pSolveMode=1; par.pMode=1; }
+      else { std::fprintf(stderr,"Unknown -p-solve-mode '%s'. Use correction or ofAbsolute.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1);}
+    }
+    else if(!std::strcmp(argv[i],"-p-grad-scheme") || !std::strcmp(argv[i],"-pgrad-scheme")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="lsq" || v=="least-squares" || v=="leastsquares") par.pGradScheme=0;
+      else if(v=="gauss" || v=="gauss-linear" || v=="gausslinear" || v=="of") par.pGradScheme=1;
+      else { std::fprintf(stderr,"Unknown -p-grad-scheme '%s'. Use lsq or gauss.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1);}
+    }
+    else if(!std::strcmp(argv[i],"-p-coeff-scale") || !std::strcmp(argv[i],"-pressure-coeff-scale") || !std::strcmp(argv[i],"-pCoeffScale")){need(argv[i]); par.pCoeffScale=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-hbya-bc-mode") || !std::strcmp(argv[i],"-HbyA-bc-mode") || !std::strcmp(argv[i],"-constrain-hbya")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="constrained" || v=="constraint" || v=="fixed" || v=="of" || v=="openfoam" || v=="1" || v=="yes" || v=="true") par.hbyaBcMode=1;
+      else if(v=="owner" || v=="cell" || v=="unconstrained" || v=="0" || v=="no" || v=="false") par.hbyaBcMode=0;
+      else { std::fprintf(stderr,"Unknown -hbya-bc-mode '%s'. Use constrained or owner.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
+    else if(!std::strcmp(argv[i],"-p-delta-mode") || !std::strcmp(argv[i],"-pressure-delta-mode")){
+      need(argv[i]);
+      std::string v = argv[++i];
+      if(v=="legacy" || v=="v1" || v=="signed" || v=="signed-projected" || v=="old" || v=="0") par.pDeltaMode=0;
+      else if(v=="of" || v=="openfoam" || v=="oflike" || v=="stabilised" || v=="stabilized" || v=="on" || v=="1") par.pDeltaMode=1;
+      else if(v=="normal" || v=="projected" || v=="orthogonal" || v=="orth" || v=="abs" || v=="2") par.pDeltaMode=2;
+      else if(v=="distance" || v=="magd" || v=="dmag" || v=="magnitude" || v=="3") par.pDeltaMode=3;
+      else {
+        std::fprintf(stderr,"Unknown -p-delta-mode '%s'. Use legacy/v1, of, normal, or distance.\n", v.c_str());
+        MPI_Abort(MPI_COMM_WORLD,1);
+      }
+    }
+    else if(!std::strcmp(argv[i],"-p-delta-min-cos") || !std::strcmp(argv[i],"-pressure-delta-min-cos")){
+      need(argv[i]);
+      par.pDeltaMinCos=std::atof(argv[++i]);
+      if(par.pDeltaMinCos < 0.0) {
+        std::fprintf(stderr,"-p-delta-min-cos must be non-negative.\n");
+        MPI_Abort(MPI_COMM_WORLD,1);
+      }
+    }
+
+    else if(!std::strcmp(argv[i],"-init-mode") || !std::strcmp(argv[i],"-initialisation-mode") || !std::strcmp(argv[i],"-initialization-mode")){
+      need(argv[i]);
+      std::string v = argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="uniform" || v=="default" || v=="inlet-average" || v=="inlet_average" || v=="0") par.initMode=0;
+      else if(v=="potential" || v=="potentialflow" || v=="projection" || v=="projected" || v=="1") par.initMode=1;
+      else { std::fprintf(stderr,"Unknown -init-mode '%s'. Use uniform or potential.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
+    else if(!std::strcmp(argv[i],"-potential-init-rAU") || !std::strcmp(argv[i],"-potential-init-rau")){need(argv[i]); par.potentialInitRAU=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-potential-init-maxit")){need(argv[i]); par.potentialInitMaxit=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-potential-init-tol")){need(argv[i]); par.potentialInitTol=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-potential-init-reltol")){need(argv[i]); par.potentialInitRelTol=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-potential-init-write")){need(argv[i]); par.potentialInitWrite=std::atoi(argv[++i]);}
+
+    else if(!std::strcmp(argv[i],"-poisson-gradient-scheme")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="lsq" || v=="least-squares" || v=="leastsquares" || v=="gauss" || v=="green-gauss" || v=="greengauss" || v=="gauss-linear" || v=="gausslinear") par.poissonGradientScheme=v;
+      else { std::fprintf(stderr,"Unknown -poisson-gradient-scheme '%s'. Use lsq or gauss.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
+    else if(!std::strcmp(argv[i],"-poisson-laplacian-scheme")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="orth" || v=="orthogonal" || v=="nonorth" || v=="nonorthogonal" || v=="corrected") par.poissonLaplacianScheme=v;
+      else { std::fprintf(stderr,"Unknown -poisson-laplacian-scheme '%s'. Use orth or nonorth.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
+    else if(!std::strcmp(argv[i],"-poisson-nonorth-corr")){need(argv[i]); par.poissonNonOrthCorr=std::atoi(argv[++i]);}
+
+    else if(!std::strcmp(argv[i],"-scalar-enable")){need(argv[i]); par.scalarEnable=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-scalar-solve-mode")){need(argv[i]); par.scalarSolveMode=argv[++i];}
+    else if(!std::strcmp(argv[i],"-scalar-name")){need(argv[i]); par.scalarName=argv[++i];}
+    else if(!std::strcmp(argv[i],"-scalar-bc-config")){need(argv[i]); par.scalarBCConfigPath=argv[++i];}
+    else if(!std::strcmp(argv[i],"-scalar-convection-scheme")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="central" || v=="linear" || v=="gauss-linear" || v=="gausslinear" || v=="upwind" || v=="first-order-upwind" || v=="firstorderupwind") par.scalarConvectionScheme=v;
+      else { std::fprintf(stderr,"Unknown -scalar-convection-scheme '%s'. Use central or upwind.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
+    else if(!std::strcmp(argv[i],"-scalar-diffusion-scheme")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="orth" || v=="orthogonal" || v=="nonorth" || v=="nonorthogonal" || v=="corrected") par.scalarDiffusionScheme=v;
+      else { std::fprintf(stderr,"Unknown -scalar-diffusion-scheme '%s'. Use orth or nonorth.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
+    else if(!std::strcmp(argv[i],"-scalar-gamma")){need(argv[i]); par.scalarGamma=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-scalar-relax")){need(argv[i]); par.scalarRelax=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-scalar-nonorth-corr")){need(argv[i]); par.scalarNonOrthCorr=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-scalar-maxit")){need(argv[i]); par.scalarMaxit=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-scalar-tol")){need(argv[i]); par.scalarTol=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-scalar-reltol")){need(argv[i]); par.scalarRelTol=std::atof(argv[++i]);}
+
+    else if(!std::strcmp(argv[i],"-bad-cell-audit-every")){need(argv[i]); par.badCellAuditEvery=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-bad-cell-audit-top")){need(argv[i]); par.badCellAuditTop=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-bad-cell-audit-start")){need(argv[i]); par.badCellAuditStart=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-bad-cell-audit-on-growth")){need(argv[i]); par.badCellAuditOnGrowth=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-bad-cell-audit-growth-factor")){need(argv[i]); par.badCellAuditGrowthFactor=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-bad-cell-audit-mass-floor")){need(argv[i]); par.badCellAuditMassFloor=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-bad-cell-audit-write-csv")){need(argv[i]); par.badCellAuditWriteCsv=std::atoi(argv[++i]);}
+
+    else if(!std::strcmp(argv[i],"-p-flux-mode") || !std::strcmp(argv[i],"-pressure-flux-mode") || !std::strcmp(argv[i],"-pEqn-flux-mode")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="legacy" || v=="old" || v=="0") par.pFluxMode=0;
+      else if(v=="matrix" || v=="mat" || v=="of" || v=="openfoam" || v=="1") par.pFluxMode=1;
+      else { std::fprintf(stderr,"Unknown -p-flux-mode '%s'. Use legacy or matrix.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
+    else if(!std::strcmp(argv[i],"-geom-method")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="legacy" || v=="0") par.geomMethod = 0;
+      else if(v=="robust" || v=="nasa" || v=="1") par.geomMethod = 1;
+      else { std::fprintf(stderr,"Unknown -geom-method '%s'. Use legacy or robust.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
+    else if(!std::strcmp(argv[i],"-lsq-weight-power") || !std::strcmp(argv[i],"-lsqWeightPower")){need(argv[i]); par.lsqWeightPower=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-lsq-stencil")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="compact" || v=="local" || v=="0") par.lsqStencilMode=0;
+      else if(v=="extended" || v=="second" || v=="2" || v=="1") {
+        par.lsqStencilMode=1;
+        if(MPI_COMM_WORLD != MPI_COMM_NULL) {
+          int rank=0; MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+          if(rank==0) std::fprintf(stderr,"WARNING: simple_gpu v1.1 currently accepts -lsq-stencil extended but uses compact LSQ coefficients.\n");
+        }
+      } else { std::fprintf(stderr,"Unknown -lsq-stencil '%s'. Use compact or extended.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
     else if(!std::strcmp(argv[i],"-corrTol")){need(argv[i]); par.corrTol=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-monitor")){need(argv[i]); par.monitor=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-write-vtu")){need(argv[i]); par.write_vtu=std::atoi(argv[++i]);}
@@ -400,11 +793,7 @@ else if(!std::strcmp(argv[i],"-cfl")){need(argv[i]); par.CFL=std::atof(argv[++i]
   }
 }
 
-static void print_device_info(int device){
-  cudaDeviceProp prop;
-  CUDA_CALL(cudaGetDeviceProperties(&prop,device));
-  std::printf("Running on \"%s\", major %d, minor %d, total memory %.2f GiB\n",prop.name,prop.major,prop.minor,(double)prop.totalGlobalMem/(1024.0*1024.0*1024.0));
-}
+// print_device_info is provided by libpoisson/common.h.
 
 
 static double get_cpu_rss_mb(){
@@ -579,24 +968,218 @@ static std::vector<PatchInfo> read_foam_boundary(const std::string &filename){
   }
   return patches;
 }
-static Mesh read_openfoam_polymesh(const std::string &polyMeshDir){
-  Mesh mesh; auto patches=read_foam_boundary(polyMeshDir+"/boundary"); mesh.P=read_foam_points(polyMeshDir+"/points"); mesh.faces=read_foam_faces(polyMeshDir+"/faces"); std::vector<int> owner0=read_foam_labels(polyMeshDir+"/owner"); std::vector<int> neigh0=read_foam_labels(polyMeshDir+"/neighbour");
-  mesh.nFaces=(int)mesh.faces.size(); mesh.nInternalFaces=(int)neigh0.size(); mesh.nCells=0;
-  for(int v:owner0) mesh.nCells=std::max(mesh.nCells,v+1); for(int v:neigh0) mesh.nCells=std::max(mesh.nCells,v+1);
-  mesh.owner.resize(mesh.nFaces); mesh.neigh.assign(mesh.nInternalFaces,0); for(int i=0;i<mesh.nFaces;++i) mesh.owner[i]=owner0[i]; for(int i=0;i<mesh.nInternalFaces;++i) mesh.neigh[i]=neigh0[i];
-  mesh.bPatch.assign(mesh.nFaces,0); mesh.patchNames.resize(patches.size()); mesh.patchStartFace.resize(patches.size()); mesh.patchNFaces.resize(patches.size()); for(std::size_t k=0;k<patches.size();++k){ mesh.patchNames[k]=patches[k].name; mesh.patchStartFace[k]=patches[k].startFace; mesh.patchNFaces[k]=patches[k].nFaces; for(int f=patches[k].startFace; f<patches[k].startFace+patches[k].nFaces; ++f) mesh.bPatch[f]=(int)k+1; }
-  mesh.cellFaces.assign(mesh.nCells,{}); mesh.cellOrient.assign(mesh.nCells,{});
+struct FaceGeomCalc {
+  std::array<double,3> centre{0.0,0.0,0.0};
+  std::array<double,3> areaVec{0.0,0.0,0.0};
+  double area=0.0;
+};
+
+static FaceGeomCalc calc_face_geom_legacy(const std::vector<std::array<double,3>> &P,
+                                          const std::vector<int> &fv){
+  FaceGeomCalc fg;
+  for(int v: fv) fg.centre = add3(fg.centre, P[v]);
+  fg.centre = mul3(1.0/std::max((int)fv.size(),1), fg.centre);
+  const auto a = P[fv[0]];
+  for(std::size_t i=1; i+1<fv.size(); ++i){
+    const auto b = P[fv[i]];
+    const auto d = P[fv[i+1]];
+    fg.areaVec = add3(fg.areaVec, mul3(0.5, cross3(sub3(b,a), sub3(d,a))));
+  }
+  fg.area = norm3(fg.areaVec);
+  return fg;
+}
+
+static FaceGeomCalc calc_face_geom_robust(const std::vector<std::array<double,3>> &P,
+                                          const std::vector<int> &fv){
+  // NASA/AIAA-style polygon handling: triangulate the possibly-warped face
+  // about an internal point, update that point to the area-weighted triangle
+  // centroid, and repeat a few times.  This avoids using the plain vertex
+  // average as the face integration point on warped/non-planar faces.
+  FaceGeomCalc fg;
+  for(int v: fv) fg.centre = add3(fg.centre, P[v]);
+  fg.centre = mul3(1.0/std::max((int)fv.size(),1), fg.centre);
+
+  for(int iter=0; iter<4; ++iter){
+    std::array<double,3> areaVec{0.0,0.0,0.0};
+    for(std::size_t i=0; i<fv.size(); ++i){
+      const auto &ri = P[fv[i]];
+      const auto &rj = P[fv[(i+1)%fv.size()]];
+      areaVec = add3(areaVec, mul3(0.5, cross3(sub3(ri,fg.centre), sub3(rj,fg.centre))));
+    }
+    const double amag = norm3(areaVec);
+    if(amag <= 1e-300) break;
+    const auto nhat = mul3(1.0/amag, areaVec);
+
+    std::array<double,3> csum{0.0,0.0,0.0};
+    double asum = 0.0;
+    for(std::size_t i=0; i<fv.size(); ++i){
+      const auto &ri = P[fv[i]];
+      const auto &rj = P[fv[(i+1)%fv.size()]];
+      const auto avec = mul3(0.5, cross3(sub3(ri,fg.centre), sub3(rj,fg.centre)));
+      const double aSigned = dot3(avec, nhat);
+      const auto ctri = mul3(1.0/3.0, add3(add3(ri,rj), fg.centre));
+      csum = add3(csum, mul3(aSigned, ctri));
+      asum += aSigned;
+    }
+    if(std::fabs(asum) <= 1e-300) break;
+    fg.centre = mul3(1.0/asum, csum);
+  }
+
+  for(std::size_t i=0; i<fv.size(); ++i){
+    const auto &ri = P[fv[i]];
+    const auto &rj = P[fv[(i+1)%fv.size()]];
+    fg.areaVec = add3(fg.areaVec, mul3(0.5, cross3(sub3(ri,fg.centre), sub3(rj,fg.centre))));
+  }
+  fg.area = norm3(fg.areaVec);
+  return fg;
+}
+
+static Mesh read_openfoam_polymesh(const std::string &polyMeshDir, int geomMethod){
+  Mesh mesh;
+  auto patches = read_foam_boundary(polyMeshDir+"/boundary");
+  mesh.P = read_foam_points(polyMeshDir+"/points");
+  mesh.faces = read_foam_faces(polyMeshDir+"/faces");
+  std::vector<int> owner0 = read_foam_labels(polyMeshDir+"/owner");
+  std::vector<int> neigh0 = read_foam_labels(polyMeshDir+"/neighbour");
+
+  mesh.nFaces=(int)mesh.faces.size();
+  mesh.nInternalFaces=(int)neigh0.size();
+  mesh.nCells=0;
+  for(int v:owner0) mesh.nCells=std::max(mesh.nCells,v+1);
+  for(int v:neigh0) mesh.nCells=std::max(mesh.nCells,v+1);
+  mesh.owner.resize(mesh.nFaces);
+  mesh.neigh.assign(mesh.nInternalFaces,0);
+  for(int i=0;i<mesh.nFaces;++i) mesh.owner[i]=owner0[i];
+  for(int i=0;i<mesh.nInternalFaces;++i) mesh.neigh[i]=neigh0[i];
+
+  mesh.bPatch.assign(mesh.nFaces,0);
+  mesh.patchNames.resize(patches.size());
+  for(std::size_t k=0;k<patches.size();++k){
+    mesh.patchNames[k]=patches[k].name;
+    for(int f=patches[k].startFace; f<patches[k].startFace+patches[k].nFaces; ++f) mesh.bPatch[f]=(int)k+1;
+  }
+
+  mesh.cellFaces.assign(mesh.nCells,{});
+  mesh.cellOrient.assign(mesh.nCells,{});
   for(int f=0;f<mesh.nFaces;++f){ int P=mesh.owner[f]; mesh.cellFaces[P].push_back(f); mesh.cellOrient[P].push_back(+1); }
   for(int f=0;f<mesh.nInternalFaces;++f){ int N=mesh.neigh[f]; mesh.cellFaces[N].push_back(f); mesh.cellOrient[N].push_back(-1); }
-  mesh.cc.assign(mesh.nCells,{0,0,0}); mesh.vol.assign(mesh.nCells,0.0);
-  for(int c=0;c<mesh.nCells;++c){ std::set<int> vertsSet; for(int f:mesh.cellFaces[c]) for(int v:mesh.faces[f]) vertsSet.insert(v); std::array<double,3> c0{0,0,0}; for(int v:vertsSet) c0=add3(c0,mesh.P[v]); c0=mul3(1.0/std::max((int)vertsSet.size(),1),c0); double V=0.0; std::array<double,3> M{0,0,0}; for(std::size_t j=0;j<mesh.cellFaces[c].size();++j){ int f=mesh.cellFaces[c][j]; int ori=mesh.cellOrient[c][j]; std::vector<int> fv=mesh.faces[f]; if(ori<0) std::reverse(fv.begin(),fv.end()); auto a=mesh.P[fv[0]]; for(std::size_t i=1;i+1<fv.size();++i){ auto b=mesh.P[fv[i]], d=mesh.P[fv[i+1]]; double vTet=dot3(sub3(a,c0),cross3(sub3(b,c0),sub3(d,c0)))/6.0; auto cTet=mul3(0.25,add3(add3(c0,a),add3(b,d))); V += vTet; M = add3(M,mul3(vTet,cTet)); } } if(V<=0) throw std::runtime_error("Non-positive cell volume at cell "+std::to_string(c)); mesh.vol[c]=V; mesh.cc[c]=mul3(1.0/V,M); }
-  mesh.xf.assign(mesh.nFaces,{0,0,0}); mesh.Af.assign(mesh.nFaces,0.0); mesh.nf.assign(mesh.nFaces,{0,0,0}); mesh.Sf.assign(mesh.nFaces,{0,0,0});
-  for(int f=0;f<mesh.nFaces;++f){ std::array<double,3> xfc{0,0,0}; for(int v:mesh.faces[f]) xfc=add3(xfc,mesh.P[v]); xfc=mul3(1.0/std::max((int)mesh.faces[f].size(),1),xfc); mesh.xf[f]=xfc; auto a=mesh.P[mesh.faces[f][0]]; std::array<double,3> areaVec{0,0,0}; for(std::size_t i=1;i+1<mesh.faces[f].size();++i){ auto b=mesh.P[mesh.faces[f][i]], d=mesh.P[mesh.faces[f][i+1]]; areaVec=add3(areaVec,mul3(0.5,cross3(sub3(b,a),sub3(d,a)))); } double areaMag=norm3(areaVec); if(areaMag<=1e-30) throw std::runtime_error("Degenerate face area at face "+std::to_string(f)); auto nloc=mul3(1.0/areaMag,areaVec); int P=mesh.owner[f]; std::array<double,3> dtest; if(f<mesh.nInternalFaces) dtest=sub3(mesh.cc[mesh.neigh[f]],mesh.cc[P]); else dtest=sub3(mesh.xf[f],mesh.cc[P]); if(dot3(nloc,dtest)<0) nloc=mul3(-1.0,nloc); mesh.Af[f]=areaMag; mesh.nf[f]=nloc; mesh.Sf[f]=mul3(areaMag,nloc); }
-  mesh.cellNbrs.assign(mesh.nCells,{}); mesh.cellBFace.assign(mesh.nCells,{}); for(int f=0;f<mesh.nFaces;++f){ int P=mesh.owner[f]; if(f<mesh.nInternalFaces){ int N=mesh.neigh[f]; mesh.cellNbrs[P].push_back(N); mesh.cellNbrs[N].push_back(P); } else mesh.cellBFace[P].push_back(f); }
-  for(int c=0;c<mesh.nCells;++c){ std::sort(mesh.cellNbrs[c].begin(),mesh.cellNbrs[c].end()); mesh.cellNbrs[c].erase(std::unique(mesh.cellNbrs[c].begin(),mesh.cellNbrs[c].end()),mesh.cellNbrs[c].end()); }
-  mesh.maxNonOrthDeg=0.0; for(int f=0;f<mesh.nInternalFaces;++f){ auto d=sub3(mesh.cc[mesh.neigh[f]],mesh.cc[mesh.owner[f]]); double cosang=std::fabs(dot3(d,mesh.nf[f]))/std::max(norm3(d),1e-30); cosang=std::min(1.0,std::max(0.0,cosang)); mesh.maxNonOrthDeg=std::max(mesh.maxNonOrthDeg, std::acos(cosang)*180.0/M_PI); }
+
+  // Face geometry first; robust mode uses area-weighted triangulated face centres.
+  mesh.xf.assign(mesh.nFaces,{0,0,0});
+  mesh.Af.assign(mesh.nFaces,0.0);
+  mesh.nf.assign(mesh.nFaces,{0,0,0});
+  mesh.Sf.assign(mesh.nFaces,{0,0,0});
+  for(int f=0; f<mesh.nFaces; ++f){
+    FaceGeomCalc fg = (geomMethod == 0)
+        ? calc_face_geom_legacy(mesh.P, mesh.faces[f])
+        : calc_face_geom_robust(mesh.P, mesh.faces[f]);
+    if(fg.area <= 1e-30) throw std::runtime_error("Degenerate face area at face "+std::to_string(f));
+    mesh.xf[f] = fg.centre;
+    mesh.Af[f] = fg.area;
+    mesh.nf[f] = mul3(1.0/fg.area, fg.areaVec);
+    mesh.Sf[f] = fg.areaVec;
+  }
+
+  mesh.cc.assign(mesh.nCells,{0,0,0});
+  mesh.vol.assign(mesh.nCells,0.0);
+
+  if(geomMethod == 0){
+    // true legacy/v1 cell volume and centroid construction: first-vertex fan
+    // on each oriented face about a vertex-average cell point.
+    for(int c=0;c<mesh.nCells;++c){
+      std::set<int> vertsSet;
+      for(int f:mesh.cellFaces[c]) for(int v:mesh.faces[f]) vertsSet.insert(v);
+      std::array<double,3> c0{0,0,0};
+      for(int v:vertsSet) c0=add3(c0,mesh.P[v]);
+      c0=mul3(1.0/std::max((int)vertsSet.size(),1),c0);
+      double V=0.0;
+      std::array<double,3> M{0,0,0};
+      for(std::size_t j=0;j<mesh.cellFaces[c].size();++j){
+        int f=mesh.cellFaces[c][j];
+        int ori=mesh.cellOrient[c][j];
+        std::vector<int> fv=mesh.faces[f];
+        if(ori<0) std::reverse(fv.begin(),fv.end());
+        auto a=mesh.P[fv[0]];
+        for(std::size_t i=1;i+1<fv.size();++i){
+          auto b=mesh.P[fv[i]], d=mesh.P[fv[i+1]];
+          double vTet=dot3(sub3(a,c0),cross3(sub3(b,c0),sub3(d,c0)))/6.0;
+          auto cTet=mul3(0.25,add3(add3(c0,a),add3(b,d)));
+          V += vTet;
+          M = add3(M,mul3(vTet,cTet));
+        }
+      }
+      if(V<=0) throw std::runtime_error("Non-positive cell volume at cell "+std::to_string(c));
+      mesh.vol[c]=V;
+      mesh.cc[c]=mul3(1.0/V,M);
+    }
+  } else {
+    // Robust cell volume and centroid by tetrahedralizing each oriented face
+    // about its own face centre.
+    for(int c=0;c<mesh.nCells;++c){
+      std::set<int> vertsSet;
+      for(int f:mesh.cellFaces[c]) for(int v:mesh.faces[f]) vertsSet.insert(v);
+      std::array<double,3> c0{0,0,0};
+      for(int v:vertsSet) c0=add3(c0,mesh.P[v]);
+      c0=mul3(1.0/std::max((int)vertsSet.size(),1),c0);
+
+      double V=0.0;
+      std::array<double,3> M{0,0,0};
+      for(std::size_t jf=0; jf<mesh.cellFaces[c].size(); ++jf){
+        const int f = mesh.cellFaces[c][jf];
+        const int ori = mesh.cellOrient[c][jf];
+        std::vector<int> fv = mesh.faces[f];
+        if(ori<0) std::reverse(fv.begin(), fv.end());
+        const auto fc = mesh.xf[f];
+        for(std::size_t i=0; i<fv.size(); ++i){
+          const auto b = mesh.P[fv[i]];
+          const auto d = mesh.P[fv[(i+1)%fv.size()]];
+          const double vTet = dot3(sub3(fc,c0), cross3(sub3(b,c0), sub3(d,c0)))/6.0;
+          const auto cTet = mul3(0.25, add3(add3(c0,fc), add3(b,d)));
+          V += vTet;
+          M = add3(M, mul3(vTet,cTet));
+        }
+      }
+      if(V<=0) throw std::runtime_error("Non-positive cell volume at cell "+std::to_string(c));
+      mesh.vol[c]=V;
+      mesh.cc[c]=mul3(1.0/V,M);
+    }
+  }
+
+  // Orient face normals from owner to neighbour / boundary face centre after
+  // cell centres are available.  Keep Sf consistent with nf and Af.
+  for(int f=0; f<mesh.nFaces; ++f){
+    int P=mesh.owner[f];
+    std::array<double,3> dtest;
+    if(f<mesh.nInternalFaces) dtest=sub3(mesh.cc[mesh.neigh[f]],mesh.cc[P]);
+    else dtest=sub3(mesh.xf[f],mesh.cc[P]);
+    if(dot3(mesh.nf[f],dtest)<0){
+      mesh.nf[f]=mul3(-1.0,mesh.nf[f]);
+      mesh.Sf[f]=mul3(-1.0,mesh.Sf[f]);
+    }
+  }
+
+  mesh.cellNbrs.assign(mesh.nCells,{});
+  mesh.cellBFace.assign(mesh.nCells,{});
+  for(int f=0;f<mesh.nFaces;++f){
+    int P=mesh.owner[f];
+    if(f<mesh.nInternalFaces){ int N=mesh.neigh[f]; mesh.cellNbrs[P].push_back(N); mesh.cellNbrs[N].push_back(P); }
+    else mesh.cellBFace[P].push_back(f);
+  }
+  for(int c=0;c<mesh.nCells;++c){
+    std::sort(mesh.cellNbrs[c].begin(),mesh.cellNbrs[c].end());
+    mesh.cellNbrs[c].erase(std::unique(mesh.cellNbrs[c].begin(),mesh.cellNbrs[c].end()),mesh.cellNbrs[c].end());
+  }
+
+  mesh.maxNonOrthDeg=0.0;
+  for(int f=0;f<mesh.nInternalFaces;++f){
+    auto d=sub3(mesh.cc[mesh.neigh[f]],mesh.cc[mesh.owner[f]]);
+    double cosang=std::fabs(dot3(d,mesh.nf[f]))/std::max(norm3(d),1e-30);
+    cosang=std::min(1.0,std::max(0.0,cosang));
+    mesh.maxNonOrthDeg=std::max(mesh.maxNonOrthDeg, std::acos(cosang)*180.0/M_PI);
+  }
   return mesh;
 }
+
 
 static void compute_lsq_gradient(const Mesh &mesh,const std::vector<double> &phi,const std::vector<std::string> &bcType,const std::vector<double> &bcFaceValue,std::vector<std::array<double,3>> &grad){
   grad.assign(mesh.nCells,{0.0,0.0,0.0});
@@ -972,6 +1555,220 @@ static CylinderForceReport compute_cylinder_forces_paper(
   return r;
 }
 
+
+
+static void write_runtime_velocity_bc_patch_vtp(
+    const Mesh& mesh,
+    const std::string& patchName,
+    const std::vector<std::string>& bcUType,
+    const std::vector<double>& uFaceBC,
+    const std::vector<std::string>& bcVType,
+    const std::vector<double>& vFaceBC,
+    const std::vector<std::string>& bcWType,
+    const std::vector<double>& wFaceBC,
+    double rho,
+    const std::string& filename)
+{
+  const int patch = find_patch_index_local(mesh, patchName);
+  if(patch < 0){
+    std::printf("Runtime velocity BC VTP skipped: patch '%s' not found.\n",
+                patchName.c_str());
+    return;
+  }
+
+  const int f0 = mesh.patchStartFace[patch];
+  const int nf = mesh.patchNFaces[patch];
+  const int f1 = f0 + nf;
+
+  if(nf <= 0){
+    std::printf("Runtime velocity BC VTP skipped: patch '%s' has zero faces.\n",
+                patchName.c_str());
+    return;
+  }
+
+  std::vector<int> pointMap(mesh.P.size(), -1);
+  std::vector<std::array<double,3>> outPts;
+  std::vector<long long> conn;
+  std::vector<long long> offsets;
+
+  std::vector<std::array<double,3>> Ubc;
+  std::vector<double> Umag, UnOut, inwardSpeed, flux, massFlux;
+  std::vector<int> isDirichlet;
+
+  outPts.reserve((std::size_t)nf * 4);
+  Ubc.reserve(nf);
+  Umag.reserve(nf);
+  UnOut.reserve(nf);
+  inwardSpeed.reserve(nf);
+  flux.reserve(nf);
+  massFlux.reserve(nf);
+  isDirichlet.reserve(nf);
+
+  long long off = 0;
+
+  double area = 0.0;
+  double sumFlux = 0.0;
+  double sumMassFlux = 0.0;
+  int outwardFaces = 0;
+
+  double minUx=1.0e300, maxUx=-1.0e300, sumUx=0.0;
+  double minUy=1.0e300, maxUy=-1.0e300, sumUy=0.0;
+  double minUz=1.0e300, maxUz=-1.0e300, sumUz=0.0;
+  double minUm=1.0e300, maxUm=-1.0e300, sumUm=0.0;
+  double minUn=1.0e300, maxUn=-1.0e300, sumUn=0.0;
+  double minIn=1.0e300, maxIn=-1.0e300, sumIn=0.0;
+
+  for(int f = f0; f < f1; ++f){
+    const int dir =
+      (bcUType[patch] == "Dirichlet" &&
+       bcVType[patch] == "Dirichlet" &&
+       bcWType[patch] == "Dirichlet") ? 1 : 0;
+
+    const double ux = uFaceBC[f];
+    const double uy = vFaceBC[f];
+    const double uz = wFaceBC[f];
+
+    const double un =
+      ux*mesh.nf[f][0] +
+      uy*mesh.nf[f][1] +
+      uz*mesh.nf[f][2];
+
+    const double q = mesh.Af[f] * un;
+    const double mq = rho * q;
+    const double um = std::sqrt(ux*ux + uy*uy + uz*uz);
+    const double inSpeed = -un;
+
+    area += mesh.Af[f];
+    sumFlux += q;
+    sumMassFlux += mq;
+    if(q > 1.0e-14) ++outwardFaces;
+
+    minUx = std::min(minUx, ux); maxUx = std::max(maxUx, ux); sumUx += ux;
+    minUy = std::min(minUy, uy); maxUy = std::max(maxUy, uy); sumUy += uy;
+    minUz = std::min(minUz, uz); maxUz = std::max(maxUz, uz); sumUz += uz;
+    minUm = std::min(minUm, um); maxUm = std::max(maxUm, um); sumUm += um;
+    minUn = std::min(minUn, un); maxUn = std::max(maxUn, un); sumUn += un;
+    minIn = std::min(minIn, inSpeed); maxIn = std::max(maxIn, inSpeed); sumIn += inSpeed;
+
+    Ubc.push_back({ux, uy, uz});
+    Umag.push_back(um);
+    UnOut.push_back(un);
+    inwardSpeed.push_back(inSpeed);
+    flux.push_back(q);
+    massFlux.push_back(mq);
+    isDirichlet.push_back(dir);
+
+    for(int p : mesh.faces[f]){
+      if(pointMap[p] < 0){
+        pointMap[p] = (int)outPts.size();
+        outPts.push_back(mesh.P[p]);
+      }
+      conn.push_back((long long)pointMap[p]);
+      ++off;
+    }
+    offsets.push_back(off);
+  }
+
+  auto avg = [&](double x){ return x / std::max(nf, 1); };
+
+  std::printf("Runtime velocity BC patch audit [%s]\n", patchName.c_str());
+  std::printf("  file                  : %s\n", filename.c_str());
+  std::printf("  faces                 : %d\n", nf);
+  std::printf("  area                  : %.15e\n", area);
+  std::printf("  Ux min/max/avg         : %.15e %.15e %.15e\n", minUx, maxUx, avg(sumUx));
+  std::printf("  Uy min/max/avg         : %.15e %.15e %.15e\n", minUy, maxUy, avg(sumUy));
+  std::printf("  Uz min/max/avg         : %.15e %.15e %.15e\n", minUz, maxUz, avg(sumUz));
+  std::printf("  |U| min/max/avg        : %.15e %.15e %.15e\n", minUm, maxUm, avg(sumUm));
+  std::printf("  Un_out min/max/avg     : %.15e %.15e %.15e\n", minUn, maxUn, avg(sumUn));
+  std::printf("  inward speed min/max/avg: %.15e %.15e %.15e\n", minIn, maxIn, avg(sumIn));
+  std::printf("  sum volumetric flux    : %.15e\n", sumFlux);
+  std::printf("  inward flow rate       : %.15e\n", -sumFlux);
+  std::printf("  sum mass flux          : %.15e\n", sumMassFlux);
+  std::printf("  faces with outward flux: %d\n", outwardFaces);
+
+  {
+    std::string csv = filename;
+    const std::size_t dot = csv.find_last_of('.');
+    if(dot != std::string::npos) csv = csv.substr(0, dot);
+    csv += ".csv";
+
+    std::ofstream c(csv.c_str());
+    c << "localFace,globalFace,isDirichlet,Ux,Uy,Uz,Umag,Un_out,inwardSpeed,flux,massFlux,Af,nx,ny,nz\n";
+    for(int i=0; i<nf; ++i){
+      const int f = f0 + i;
+      c << i << "," << f << "," << isDirichlet[i] << ","
+        << std::setprecision(17)
+        << Ubc[i][0] << "," << Ubc[i][1] << "," << Ubc[i][2] << ","
+        << Umag[i] << "," << UnOut[i] << "," << inwardSpeed[i] << ","
+        << flux[i] << "," << massFlux[i] << ","
+        << mesh.Af[f] << ","
+        << mesh.nf[f][0] << "," << mesh.nf[f][1] << "," << mesh.nf[f][2] << "\n";
+    }
+    std::printf("  csv                   : %s\n", csv.c_str());
+  }
+
+  std::ofstream out(filename.c_str());
+  if(!out){
+    std::printf("WARNING: Could not write runtime velocity BC VTP: %s\n", filename.c_str());
+    return;
+  }
+
+  out << "<?xml version=\"1.0\"?>\n";
+  out << "<VTKFile type=\"PolyData\" version=\"1.0\" byte_order=\"LittleEndian\">\n";
+  out << "  <PolyData>\n";
+  out << "    <Piece NumberOfPoints=\"" << outPts.size()
+      << "\" NumberOfPolys=\"" << nf << "\">\n";
+
+  out << "      <Points>\n";
+  out << "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+  for(const auto& p : outPts){
+    out << "          " << std::setprecision(17)
+        << p[0] << " " << p[1] << " " << p[2] << "\n";
+  }
+  out << "        </DataArray>\n";
+  out << "      </Points>\n";
+
+  out << "      <Polys>\n";
+  out << "        <DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">\n          ";
+  for(long long x : conn) out << x << " ";
+  out << "\n        </DataArray>\n";
+  out << "        <DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">\n          ";
+  for(long long x : offsets) out << x << " ";
+  out << "\n        </DataArray>\n";
+  out << "      </Polys>\n";
+
+  out << "      <CellData>\n";
+
+  out << "        <DataArray type=\"Int32\" Name=\"isDirichlet\" NumberOfComponents=\"1\" format=\"ascii\">\n";
+  for(int x : isDirichlet) out << "          " << x << "\n";
+  out << "        </DataArray>\n";
+
+  out << "        <DataArray type=\"Float64\" Name=\"U_bc\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+  for(const auto& U : Ubc){
+    out << "          " << std::setprecision(17)
+        << U[0] << " " << U[1] << " " << U[2] << "\n";
+  }
+  out << "        </DataArray>\n";
+
+  auto write_scalar = [&](const char* name, const std::vector<double>& a){
+    out << "        <DataArray type=\"Float64\" Name=\"" << name
+        << "\" NumberOfComponents=\"1\" format=\"ascii\">\n";
+    for(double x : a) out << "          " << std::setprecision(17) << x << "\n";
+    out << "        </DataArray>\n";
+  };
+
+  write_scalar("Umag", Umag);
+  write_scalar("Un_out", UnOut);
+  write_scalar("inwardSpeed", inwardSpeed);
+  write_scalar("flux", flux);
+  write_scalar("massFlux", massFlux);
+
+  out << "      </CellData>\n";
+  out << "    </Piece>\n";
+  out << "  </PolyData>\n";
+  out << "</VTKFile>\n";
+}
+
 static void write_vtu_polyhedron_cell_data(const std::string &filename,const Mesh &mesh,const std::vector<std::string> &scalarNames,const std::vector<std::vector<double>> &scalarData,const std::string &vecName,const std::vector<std::array<double,3>> *vecData){
   int nPts=(int)mesh.P.size(), nCells=mesh.nCells; std::vector<long long> connectivity, offsets(nCells), facesStream, faceoffsets(nCells); std::vector<int> types(nCells,42); long long connCount=0, faceCount=0;
   for(int c=0;c<nCells;++c){ const auto &fids=mesh.cellFaces[c]; const auto &oris=mesh.cellOrient[c]; std::vector<std::vector<int>> cellFacePts(fids.size()); std::vector<int> allPts; for(std::size_t j=0;j<fids.size();++j){ int f=fids[j]; cellFacePts[j]=mesh.faces[f]; if(oris[j]<0) std::reverse(cellFacePts[j].begin(),cellFacePts[j].end()); allPts.insert(allPts.end(),cellFacePts[j].begin(),cellFacePts[j].end()); } std::vector<int> uniqPts; std::set<int> seen; for(int p:allPts) if(seen.insert(p).second) uniqPts.push_back(p); for(int p:uniqPts) connectivity.push_back((long long)p); connCount += (long long)uniqPts.size(); offsets[c]=connCount; facesStream.push_back((long long)fids.size()); for(const auto &fv:cellFacePts){ facesStream.push_back((long long)fv.size()); for(int p:fv) facesStream.push_back((long long)p); } faceCount += 1; for(const auto &fv:cellFacePts) faceCount += 1 + (long long)fv.size(); faceoffsets[c]=faceCount; }
@@ -980,6 +1777,229 @@ static void write_vtu_polyhedron_cell_data(const std::string &filename,const Mes
   if(vecData){ fid<<"        <DataArray type=\"Float64\" Name=\""<<vecName<<"\" NumberOfComponents=\"3\" format=\"ascii\">\n"; for(const auto &v:*vecData) fid<<"          "<<std::setprecision(15)<<v[0]<<" "<<v[1]<<" "<<v[2]<<"\n"; fid<<"        </DataArray>\n"; }
   for(std::size_t k=0;k<scalarNames.size();++k){ fid<<"        <DataArray type=\"Float64\" Name=\""<<scalarNames[k]<<"\" NumberOfComponents=\"1\" format=\"ascii\">\n"; for(double v:scalarData[k]) fid<<"          "<<std::setprecision(15)<<v<<"\n"; fid<<"        </DataArray>\n"; }
   fid<<"      </CellData>\n    </Piece>\n  </UnstructuredGrid>\n</VTKFile>\n";
+}
+
+
+// -----------------------------------------------------------------------------
+// simple_gpu v1.1 bad-cell / bad-face diagnostics
+// -----------------------------------------------------------------------------
+struct AuditMetricRow {
+  int id=-1;
+  double value=0.0;
+};
+
+static std::vector<AuditMetricRow> top_abs_rows(const std::vector<double>& a, int topN){
+  std::vector<AuditMetricRow> rows;
+  rows.reserve(a.size());
+  for(int i=0; i<(int)a.size(); ++i){
+    const double v = std::fabs(a[i]);
+    if(std::isfinite(v)) rows.push_back({i, v});
+  }
+  std::sort(rows.begin(), rows.end(), [](const AuditMetricRow& x, const AuditMetricRow& y){return x.value > y.value;});
+  if(topN > 0 && (int)rows.size() > topN) rows.resize(topN);
+  return rows;
+}
+
+static void print_top_cell_metric(
+    const char* name,
+    const std::vector<double>& metric,
+    int topN,
+    const Mesh& mesh,
+    const std::vector<double>& pCorr,
+    const std::vector<double>& gradx,
+    const std::vector<double>& grady,
+    const std::vector<double>& gradz,
+    const std::vector<double>& rAU,
+    const std::vector<double>& divCorr,
+    const std::vector<double>& dUmag)
+{
+  std::printf("  Top cells by %s\n", name);
+  std::printf("    rank cell value vol ccx ccy ccz |pCorr| |gradCorr| rAU |div| |dU|\n");
+  auto rows = top_abs_rows(metric, topN);
+  for(int k=0; k<(int)rows.size(); ++k){
+    const int c = rows[k].id;
+    const double gmag = std::sqrt(gradx[c]*gradx[c] + grady[c]*grady[c] + gradz[c]*gradz[c]);
+    std::printf("    %4d %8d %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e\n",
+        k+1, c, rows[k].value, mesh.vol[c], mesh.cc[c][0], mesh.cc[c][1], mesh.cc[c][2],
+        std::fabs(pCorr[c]), gmag, rAU[c], std::fabs(divCorr[c]), dUmag[c]);
+  }
+}
+
+struct AuditFaceRow {
+  int f=-1, P=-1, N=-1, patch=-1;
+  double score=0.0;
+  double coeff=0.0;
+  double cosTheta=0.0;
+  double dpn=0.0;
+  double dmag=0.0;
+  double Af=0.0;
+  double rAUf=0.0;
+  double pJump=0.0;
+  double phiStar=0.0;
+  double phi=0.0;
+  double phiNonOrth=0.0;
+};
+
+static std::vector<AuditFaceRow> top_face_rows_by(
+    std::vector<AuditFaceRow> rows, int topN)
+{
+  rows.erase(std::remove_if(rows.begin(), rows.end(), [](const AuditFaceRow& r){return !std::isfinite(r.score);}), rows.end());
+  std::sort(rows.begin(), rows.end(), [](const AuditFaceRow& a, const AuditFaceRow& b){return a.score > b.score;});
+  if(topN > 0 && (int)rows.size() > topN) rows.resize(topN);
+  return rows;
+}
+
+static void print_face_table(const char* name, const std::vector<AuditFaceRow>& rows){
+  std::printf("  Top faces by %s\n", name);
+  std::printf("    rank face P N patch score coeff cos dpn dmag Af rAUf pJump phiStar phi phiNonOrth\n");
+  for(int k=0; k<(int)rows.size(); ++k){
+    const auto& r = rows[k];
+    std::printf("    %4d %8d %8d %8d %5d %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.6e\n",
+        k+1, r.f, r.P, r.N, r.patch, r.score, r.coeff, r.cosTheta, r.dpn, r.dmag,
+        r.Af, r.rAUf, r.pJump, r.phiStar, r.phi, r.phiNonOrth);
+  }
+}
+
+static void write_bad_cell_audit_csv(
+    const Params& par, int step,
+    const Mesh& mesh,
+    const std::vector<double>& pCorr,
+    const std::vector<double>& gradx,
+    const std::vector<double>& grady,
+    const std::vector<double>& gradz,
+    const std::vector<double>& rAU,
+    const std::vector<double>& divCorr,
+    const std::vector<double>& dUmag)
+{
+  std::ostringstream fn;
+  fn << par.outPrefix << "_badcell_iter" << std::setw(6) << std::setfill('0') << step << ".csv";
+  std::ofstream out(fn.str().c_str());
+  if(!out){
+    std::printf("WARNING: Could not write bad-cell audit CSV: %s\n", fn.str().c_str());
+    return;
+  }
+  out << "cell,ccx,ccy,ccz,vol,pCorr,gradx,grady,gradz,gradMag,rAU,divCorr,dUmag\n";
+  for(int c=0; c<mesh.nCells; ++c){
+    const double gmag = std::sqrt(gradx[c]*gradx[c] + grady[c]*grady[c] + gradz[c]*gradz[c]);
+    out << c << ',' << std::setprecision(17)
+        << mesh.cc[c][0] << ',' << mesh.cc[c][1] << ',' << mesh.cc[c][2] << ','
+        << mesh.vol[c] << ',' << pCorr[c] << ','
+        << gradx[c] << ',' << grady[c] << ',' << gradz[c] << ',' << gmag << ','
+        << rAU[c] << ',' << divCorr[c] << ',' << dUmag[c] << '\n';
+  }
+  std::printf("  Wrote bad-cell audit CSV: %s\n", fn.str().c_str());
+}
+
+static void run_bad_cell_audit(
+    const Params& par,
+    const Mesh& mesh,
+    const std::vector<std::string>& bcPType,
+    int step,
+    const char* reason,
+    double massRes, double duRel, double dvRel, double dwRel, double dpRel,
+    const std::vector<double>& pCorr,
+    const std::vector<double>& gradx,
+    const std::vector<double>& grady,
+    const std::vector<double>& gradz,
+    const std::vector<double>& rAU,
+    const std::vector<double>& divCorr,
+    const std::vector<double>& uStar,
+    const std::vector<double>& vStar,
+    const std::vector<double>& wStar,
+    const std::vector<double>& u,
+    const std::vector<double>& v,
+    const std::vector<double>& w,
+    const std::vector<double>& phiStar,
+    const std::vector<double>& phi,
+    const std::vector<double>& phiNonOrth)
+{
+  const int topN = std::max(par.badCellAuditTop, 1);
+  std::vector<double> gradMag(mesh.nCells, 0.0), dUmag(mesh.nCells, 0.0), pcorrAbs(mesh.nCells, 0.0), divAbs(mesh.nCells, 0.0), rauAbs(mesh.nCells, 0.0);
+  for(int c=0; c<mesh.nCells; ++c){
+    gradMag[c] = std::sqrt(gradx[c]*gradx[c] + grady[c]*grady[c] + gradz[c]*gradz[c]);
+    const double du = u[c] - uStar[c];
+    const double dv = v[c] - vStar[c];
+    const double dw = w[c] - wStar[c];
+    dUmag[c] = std::sqrt(du*du + dv*dv + dw*dw);
+    pcorrAbs[c] = std::fabs(pCorr[c]);
+    divAbs[c] = std::fabs(divCorr[c]);
+    rauAbs[c] = std::fabs(rAU[c]);
+  }
+
+  std::printf("\n------------------------------------------------------------\n");
+  std::printf("BAD-CELL AUDIT simple_gpu at iter %d, reason=%s\n", step, reason ? reason : "periodic");
+  std::printf("  residuals: massRes=%.6e duRel=%.6e dvRel=%.6e dwRel=%.6e dpRel=%.6e\n", massRes, duRel, dvRel, dwRel, dpRel);
+  std::printf("  modes: pMode=%s pSolveMode=%s pGradScheme=%s rcMode=%s rAUMode=%s pDeltaMode=%d pDeltaMinCos=%.6g momNonOrthScale=%.6g pNonOrthScale=%.6g\n",
+      par.pMode == 0 ? "pcorr" : "absolute",
+      par.pSolveMode == 1 ? "ofAbsolute" : "correction",
+      par.pGradScheme == 1 ? "gauss" : "lsq",
+      par.rcMode == 0 ? "old" : "oflike",
+      par.rAUMode == 0 ? "raw" : "relaxed",
+      par.pDeltaMode, par.pDeltaMinCos, par.momNonOrthScale, par.pNonOrthScale);
+
+  print_top_cell_metric("|divCorr|", divAbs, topN, mesh, pCorr, gradx, grady, gradz, rAU, divCorr, dUmag);
+  print_top_cell_metric("|pCorr|", pcorrAbs, topN, mesh, pCorr, gradx, grady, gradz, rAU, divCorr, dUmag);
+  print_top_cell_metric("|grad(correction)|", gradMag, topN, mesh, pCorr, gradx, grady, gradz, rAU, divCorr, dUmag);
+  print_top_cell_metric("|dU correction|", dUmag, topN, mesh, pCorr, gradx, grady, gradz, rAU, divCorr, dUmag);
+  print_top_cell_metric("|rAU|", rauAbs, topN, mesh, pCorr, gradx, grady, gradz, rAU, divCorr, dUmag);
+
+  std::vector<AuditFaceRow> byCoeff, byBadCos, byFluxChange;
+  byCoeff.reserve(mesh.nFaces);
+  byBadCos.reserve(mesh.nFaces);
+  byFluxChange.reserve(mesh.nFaces);
+  for(int f=0; f<mesh.nFaces; ++f){
+    const int P = mesh.owner[f];
+    int N = -1;
+    int patch = -1;
+    std::array<double,3> d{{0.0,0.0,0.0}};
+    double rAUf = rAU[P];
+    double pJump = 0.0;
+    bool include = false;
+    if(f < mesh.nInternalFaces){
+      N = mesh.neigh[f];
+      d = sub3(mesh.cc[N], mesh.cc[P]);
+      const double denom = std::max(dot3(d,d), 1.0e-30);
+      double lam = dot3(sub3(mesh.xf[f], mesh.cc[P]), d) / denom;
+      lam = std::min(1.0, std::max(0.0, lam));
+      rAUf = (1.0-lam)*rAU[P] + lam*rAU[N];
+      pJump = pCorr[N] - pCorr[P];
+      include = true;
+    } else {
+      patch = mesh.bPatch[f] - 1;
+      if(patch >= 0 && patch < (int)bcPType.size() && bcPType[patch] == "Dirichlet"){
+        d = sub3(mesh.xf[f], mesh.cc[P]);
+        pJump = -pCorr[P]; // fixed-value pressure correction BC value is usually zero in this app audit
+        include = true;
+      }
+    }
+    if(!include) continue;
+    const double dmag = std::max(norm3(d), 1.0e-300);
+    const double dpn = dot3(mesh.nf[f], d);
+    const double cosTheta = dpn / dmag;
+    const double deltaCoeff = pressure_delta_coeff_runtime(mesh.nf[f], d);
+    const double coeff = par.pCoeffScale * par.rho * mesh.Af[f] * rAUf * deltaCoeff;
+    AuditFaceRow row;
+    row.f = f; row.P = P; row.N = N; row.patch = patch;
+    row.coeff = coeff; row.cosTheta = cosTheta; row.dpn = dpn; row.dmag = dmag;
+    row.Af = mesh.Af[f]; row.rAUf = rAUf; row.pJump = pJump;
+    row.phiStar = (f < (int)phiStar.size() ? phiStar[f] : 0.0);
+    row.phi = (f < (int)phi.size() ? phi[f] : 0.0);
+    row.phiNonOrth = (f < (int)phiNonOrth.size() ? phiNonOrth[f] : 0.0);
+    row.score = std::fabs(coeff);
+    byCoeff.push_back(row);
+    row.score = 1.0 / std::max(std::fabs(cosTheta), 1.0e-12);
+    byBadCos.push_back(row);
+    row.score = std::fabs(row.phi - row.phiStar);
+    byFluxChange.push_back(row);
+  }
+  print_face_table("|pressure coeff|", top_face_rows_by(byCoeff, topN));
+  print_face_table("1/|cos(theta)|", top_face_rows_by(byBadCos, topN));
+  print_face_table("|phi-phiStar|", top_face_rows_by(byFluxChange, topN));
+
+  if(par.badCellAuditWriteCsv){
+    write_bad_cell_audit_csv(par, step, mesh, pCorr, gradx, grady, gradz, rAU, divCorr, dUmag);
+  }
+  std::printf("------------------------------------------------------------\n\n");
 }
 
 struct DeviceMesh {
@@ -1156,7 +2176,7 @@ __global__ static void kernel_continuity_residual_from_flux(
     const double *phi, double *divCell);
 
 
-static void build_lsq_gradient_operator(const Mesh &mesh, DeviceGradientOperator &op){
+static void build_lsq_gradient_operator(const Mesh &mesh, DeviceGradientOperator &op, double weightPower){
   op.nCells = mesh.nCells;
   std::vector<int> offsets(mesh.nCells + 1, 0), src, face;
   std::vector<double> cx, cy, cz;
@@ -1182,7 +2202,7 @@ static void build_lsq_gradient_operator(const Mesh &mesh, DeviceGradientOperator
 
     for(int N: mesh.cellNbrs[P]){
       auto r = sub3(mesh.cc[N], xP);
-      double w = 1.0/std::max(dot3(r,r),1e-30);
+      double w = 1.0/std::pow(std::max(std::sqrt(dot3(r,r)),1e-300), weightPower);
       for(int i=0;i<3;++i)
         for(int j=0;j<3;++j)
           M[i][j] += w*r[i]*r[j];
@@ -1197,7 +2217,7 @@ static void build_lsq_gradient_operator(const Mesh &mesh, DeviceGradientOperator
 
     for(int f: mesh.cellBFace[P]){
       auto r = sub3(mesh.xf[f], xP);
-      double w = 1.0/std::max(dot3(r,r),1e-30);
+      double w = 1.0/std::pow(std::max(std::sqrt(dot3(r,r)),1e-300), weightPower);
       for(int i=0;i<3;++i)
         for(int j=0;j<3;++j)
           M[i][j] += w*r[i]*r[j];
@@ -1274,6 +2294,16 @@ __global__ static void kernel_apply_lsq_gradient(
     const double *phi, const int *bPatch, const int *bcType, const double *bcFaceValue,
     double *gx, double *gy, double *gz);
 
+__global__ static void kernel_apply_gauss_linear_gradient(
+    int nFaces, int nInternalFaces,
+    const int *owner, const int *neigh, const int *bPatch,
+    const double *ccx, const double *ccy, const double *ccz,
+    const double *xfx, const double *xfy, const double *xfz,
+    const double *sfx, const double *sfy, const double *sfz,
+    const double *vol,
+    const double *phi, const int *bcType, const double *bcFaceValue,
+    double *gx, double *gy, double *gz);
+
 __global__ static void kernel_add_scaled_inplace(int n, double *y, const double *x, double a);
 __global__ static void kernel_update_pressure_relax(int n, double *p, const double *pcorr, double pRelax);
 __global__ static void kernel_maxabs_reduce(int n, const double *x, double *blockMax);
@@ -1297,6 +2327,32 @@ static void compute_lsq_gradient_gpu(const DeviceGradientOperator &gop, const De
       d_phi, dm.d_bPatch, bc.d_type, bc.d_faceValue,
       d_gx, d_gy, d_gz);
   CUDA_CHECK_LAST();
+}
+
+static void compute_gauss_linear_gradient_gpu(const DeviceMesh &dm, const DeviceBC &bc,
+                                              const double *d_phi, double *d_gx, double *d_gy, double *d_gz){
+  const int block = 256;
+  kernel_zero_double<<<(dm.nCells + block - 1)/block, block>>>(d_gx, dm.nCells);
+  kernel_zero_double<<<(dm.nCells + block - 1)/block, block>>>(d_gy, dm.nCells);
+  kernel_zero_double<<<(dm.nCells + block - 1)/block, block>>>(d_gz, dm.nCells);
+  CUDA_CHECK_LAST();
+  kernel_apply_gauss_linear_gradient<<<(dm.nFaces + block - 1)/block, block>>>(
+      dm.nFaces, dm.nInternalFaces,
+      dm.d_owner, dm.d_neigh, dm.d_bPatch,
+      dm.d_ccx, dm.d_ccy, dm.d_ccz,
+      dm.d_xfx, dm.d_xfy, dm.d_xfz,
+      dm.d_sfx, dm.d_sfy, dm.d_sfz,
+      dm.d_vol,
+      d_phi, bc.d_type, bc.d_faceValue,
+      d_gx, d_gy, d_gz);
+  CUDA_CHECK_LAST();
+}
+
+static void compute_pressure_gradient_gpu(const Params &par, const DeviceGradientOperator &gop,
+                                          const DeviceMesh &dm, const DeviceBC &bc,
+                                          const double *d_phi, double *d_gx, double *d_gy, double *d_gz){
+  if(par.pGradScheme == 1) compute_gauss_linear_gradient_gpu(dm, bc, d_phi, d_gx, d_gy, d_gz);
+  else compute_lsq_gradient_gpu(gop, dm, bc, d_phi, d_gx, d_gy, d_gz);
 }
 
 static double maxabs_device(const double *d_x, int n, double *d_reduce, int reduceSize){
@@ -1399,6 +2455,11 @@ __global__ static void kernel_zero_double(double *x, int n){
   if(i < n) x[i] = 0.0;
 }
 
+__global__ static void kernel_fill_double(double *x, int n, double value){
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i < n) x[i] = value;
+}
+
 
 __global__ static void kernel_apply_lsq_gradient(
     int nCells, const int *offsets, const int *src, const int *face,
@@ -1437,6 +2498,61 @@ __global__ static void kernel_apply_lsq_gradient(
   gx[P]=sx;
   gy[P]=sy;
   gz[P]=sz;
+}
+
+
+__global__ static void kernel_apply_gauss_linear_gradient(
+    int nFaces, int nInternalFaces,
+    const int *owner, const int *neigh, const int *bPatch,
+    const double *ccx, const double *ccy, const double *ccz,
+    const double *xfx, const double *xfy, const double *xfz,
+    const double *sfx, const double *sfy, const double *sfz,
+    const double *vol,
+    const double *phi, const int *bcType, const double *bcFaceValue,
+    double *gx, double *gy, double *gz)
+{
+  const int f = blockIdx.x*blockDim.x + threadIdx.x;
+  if(f >= nFaces) return;
+
+  const int P = owner[f];
+  if(P < 0) return;
+
+  double phiF = phi[P];
+  if(f < nInternalFaces){
+    const int N = neigh[f];
+    if(N >= 0){
+      const double dx = ccx[N] - ccx[P];
+      const double dy = ccy[N] - ccy[P];
+      const double dz = ccz[N] - ccz[P];
+      const double d2 = dx*dx + dy*dy + dz*dz;
+      double lam = 0.5;
+      if(d2 > 1.0e-300){
+        const double fx = xfx[f] - ccx[P];
+        const double fy = xfy[f] - ccy[P];
+        const double fz = xfz[f] - ccz[P];
+        lam = (fx*dx + fy*dy + fz*dz)/d2;
+        if(lam < 0.0) lam = 0.0;
+        if(lam > 1.0) lam = 1.0;
+      }
+      phiF = (1.0 - lam)*phi[P] + lam*phi[N];
+      const double invVP = (vol[P] > 1.0e-300) ? 1.0/vol[P] : 0.0;
+      const double invVN = (vol[N] > 1.0e-300) ? 1.0/vol[N] : 0.0;
+      atomicAdd(&gx[P],  sfx[f]*phiF*invVP);
+      atomicAdd(&gy[P],  sfy[f]*phiF*invVP);
+      atomicAdd(&gz[P],  sfz[f]*phiF*invVP);
+      atomicAdd(&gx[N], -sfx[f]*phiF*invVN);
+      atomicAdd(&gy[N], -sfy[f]*phiF*invVN);
+      atomicAdd(&gz[N], -sfz[f]*phiF*invVN);
+      return;
+    }
+  }
+
+  const int patch = bPatch[f] - 1;
+  if(patch >= 0 && bcType[patch] == 1) phiF = bcFaceValue[f];
+  const double invVP = (vol[P] > 1.0e-300) ? 1.0/vol[P] : 0.0;
+  atomicAdd(&gx[P], sfx[f]*phiF*invVP);
+  atomicAdd(&gy[P], sfy[f]*phiF*invVP);
+  atomicAdd(&gz[P], sfz[f]*phiF*invVP);
 }
 
 __global__ static void kernel_add_scaled_inplace(int n, double *y, const double *x, double a){
@@ -1486,6 +2602,7 @@ __global__ static void kernel_build_rhiechow_predicted_flux_stokes_3d(
     const int *bcVType, const double *vFaceBC,
     const int *bcWType, const double *wFaceBC,
     double rho,
+    int rcMode, int hbyaBcMode,
     double *phiStar)
 {
   int f = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1508,14 +2625,19 @@ __global__ static void kernel_build_rhiechow_predicted_flux_stokes_3d(
     const double gpz = (1.0-lam)*gradz[P] + lam*gradz[N];
     const double rAUf = (1.0-lam)*rAU[P] + lam*rAU[N];
     const double phiInterp = rho * Af[f] * (ubar*nfx[f] + vbar*nfy[f] + wbar*nfz[f]);
-    const double rc = rho * Af[f] * rAUf / fmax(fabs(dpn), 1.0e-30) *
-                      ((p[N] - p[P]) - (gpx*dx + gpy*dy + gpz*dz));
+    // rcMode 0: old explicit Rhie-Chow pressure-consistency term.
+    // rcMode 1: OpenFOAM/Chalmers-style predictor phi = interpolate(U*) & Sf only.
+    const double rc = (rcMode == 0)
+      ? rho * Af[f] * rAUf * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]) *
+          ((p[N] - p[P]) - (gpx*dx + gpy*dy + gpz*dz))
+      : 0.0;
     phiStar[f] = phiInterp - rc;
   } else {
     const int patch = bPatch[f] - 1;
-    const double uf = (bcUType[patch] == 1) ? uFaceBC[f] : u[P];
-    const double vf = (bcVType[patch] == 1) ? vFaceBC[f] : v[P];
-    const double wf = (bcWType[patch] == 1) ? wFaceBC[f] : w[P];
+    const bool constrain = (hbyaBcMode != 0);
+    const double uf = (constrain && bcUType[patch] == 1) ? uFaceBC[f] : u[P];
+    const double vf = (constrain && bcVType[patch] == 1) ? vFaceBC[f] : v[P];
+    const double wf = (constrain && bcWType[patch] == 1) ? wFaceBC[f] : w[P];
     phiStar[f] = rho * Af[f] * (uf*nfx[f] + vf*nfy[f] + wf*nfz[f]);
   }
 }
@@ -1542,7 +2664,7 @@ __global__ static void kernel_pressure_nonorth_flux_and_divergence(
     const double *xfx, const double *xfy, const double *xfz,
     const double *nfx, const double *nfy, const double *nfz,
     const double *sfx, const double *sfy, const double *sfz,
-    const double *Af, const double *rAU,
+    const double *Af, const double *rAU, double rho,
     const int *bcPType,
     const double *gradx, const double *grady, const double *gradz,
     double *phiNonOrth, double *divNonOrth)
@@ -1557,7 +2679,9 @@ __global__ static void kernel_pressure_nonorth_flux_and_divergence(
     double dy = ccy[N] - ccy[P];
     double dz = ccz[N] - ccz[P];
     double dpn = nfx[f]*dx + nfy[f]*dy + nfz[f]*dz;
-    if(fabs(dpn) > 1.0e-30){
+    (void)dpn;
+    {
+      const double deltaCoeff = pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
       double denom = fmax(dx*dx + dy*dy + dz*dz, 1.0e-30);
       double lam = ((xfx[f]-ccx[P])*dx + (xfy[f]-ccy[P])*dy + (xfz[f]-ccz[P])*dz) / denom;
       lam = fmin(1.0, fmax(0.0, lam));
@@ -1565,10 +2689,10 @@ __global__ static void kernel_pressure_nonorth_flux_and_divergence(
       double gx = (1.0-lam)*gradx[P] + lam*gradx[N];
       double gy = (1.0-lam)*grady[P] + lam*grady[N];
       double gz = (1.0-lam)*gradz[P] + lam*gradz[N];
-      double tx = sfx[f] - (Af[f]/dpn)*dx;
-      double ty = sfy[f] - (Af[f]/dpn)*dy;
-      double tz = sfz[f] - (Af[f]/dpn)*dz;
-      flux = rAUf * (gx*tx + gy*ty + gz*tz);
+      double tx = sfx[f] - (Af[f]*deltaCoeff)*dx;
+      double ty = sfy[f] - (Af[f]*deltaCoeff)*dy;
+      double tz = sfz[f] - (Af[f]*deltaCoeff)*dz;
+      flux = rho * rAUf * (gx*tx + gy*ty + gz*tz);
       atomicAdd(&divNonOrth[P], flux);
       atomicAdd(&divNonOrth[N], -flux);
     }
@@ -1580,11 +2704,13 @@ __global__ static void kernel_pressure_nonorth_flux_and_divergence(
       double dy = xfy[f] - ccy[P];
       double dz = xfz[f] - ccz[P];
       double dpn = nfx[f]*dx + nfy[f]*dy + nfz[f]*dz;
-      if(fabs(dpn) > 1.0e-30){
-        double tx = sfx[f] - (Af[f]/dpn)*dx;
-        double ty = sfy[f] - (Af[f]/dpn)*dy;
-        double tz = sfz[f] - (Af[f]/dpn)*dz;
-        flux = rAU[P] * (gradx[P]*tx + grady[P]*ty + gradz[P]*tz);
+      (void)dpn;
+      {
+        const double deltaCoeff = pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
+        double tx = sfx[f] - (Af[f]*deltaCoeff)*dx;
+        double ty = sfy[f] - (Af[f]*deltaCoeff)*dy;
+        double tz = sfz[f] - (Af[f]*deltaCoeff)*dz;
+        flux = rho * rAU[P] * (gradx[P]*tx + grady[P]*ty + gradz[P]*tz);
         atomicAdd(&divNonOrth[P], flux);
       }
     }
@@ -1593,13 +2719,13 @@ __global__ static void kernel_pressure_nonorth_flux_and_divergence(
 }
 
 __global__ static void kernel_build_pressure_rhs_from_divs(
-    int nCells, const double *divBase, const double *divNonOrth,
+    int nCells, const double *divBase, const double *divNonOrth, double nonOrthScale,
     int useAnchor, int refCell, HYPRE_Complex *rhs)
 {
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   if(c < nCells){
     rhs[c] = (useAnchor && c == refCell) ? (HYPRE_Complex)0.0 :
-             (HYPRE_Complex)(-divBase[c] + divNonOrth[c]);
+             (HYPRE_Complex)(-divBase[c] + nonOrthScale * divNonOrth[c]);
   }
 }
 
@@ -1618,9 +2744,10 @@ __global__ static void kernel_correct_face_fluxes_simple_nonorth(
     const double *ccx, const double *ccy, const double *ccz,
     const double *xfx, const double *xfy, const double *xfz,
     const double *nfx, const double *nfy, const double *nfz,
-    const double *Af, const double *rAU,
+    const double *Af, const double *rAU, double rho,
     const int *bcPType, const double *pFaceBC,
-    const double *phiStar, const double *pCorr, const double *phiNonOrth, double *phi)
+    const double *phiStar, const double *pCorr, const double *phiNonOrth,
+    double nonOrthScale, double pCoeffScale, int pFluxMode, double *phi)
 {
   int f = blockIdx.x * blockDim.x + threadIdx.x;
   if(f >= nFaces) return;
@@ -1635,8 +2762,13 @@ __global__ static void kernel_correct_face_fluxes_simple_nonorth(
     double lam = ((xfx[f]-ccx[P])*dx + (xfy[f]-ccy[P])*dy + (xfz[f]-ccz[P])*dz) / denom;
     lam = fmin(1.0, fmax(0.0, lam));
     double rAUf = (1.0-lam)*rAU[P] + lam*rAU[N];
-    double coeff = Af[f] * rAUf / dpn;
-    phi[f] = phiStar[f] - coeff*(pCorr[N] - pCorr[P]) - phiNonOrth[f];
+    double coeff = pCoeffScale * rho * Af[f] * rAUf * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
+    // Matrix-consistent pressure-equation flux.  pFluxMode is currently kept
+    // as an explicit runtime switch for audit/testing; both modes use the
+    // same sign convention as the pressure matrix for internal faces.
+    double pEqnFlux = coeff*(pCorr[N] - pCorr[P]) + nonOrthScale * phiNonOrth[f];
+    (void)pFluxMode;
+    phi[f] = phiStar[f] - pEqnFlux;
   } else {
     int patch = bPatch[f] - 1;
     if(patch >= 0 && bcPType[patch] == 1){
@@ -1645,12 +2777,13 @@ __global__ static void kernel_correct_face_fluxes_simple_nonorth(
       double dy = xfy[f] - ccy[P];
       double dz = xfz[f] - ccz[P];
       double dpn = nfx[f]*dx + nfy[f]*dy + nfz[f]*dz;
-      if(fabs(dpn) <= 1.0e-30){
-        phi[f] = phiStar[f];
-        return;
-      }
-      double coeff = Af[f] * rAU[P] / dpn;
-      phi[f] = phiStar[f] - coeff*(pFaceBC[f] - pCorr[P]) - phiNonOrth[f];
+      (void)dpn;
+      double coeff = pCoeffScale * rho * Af[f] * rAU[P] * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
+      // Matrix-consistent fixed-pressure boundary flux.  Zero-gradient
+      // boundaries are handled by the else branch below and have pEqnFlux=0.
+      double pEqnFlux = coeff*(pFaceBC[f] - pCorr[P]) + nonOrthScale * phiNonOrth[f];
+      (void)pFluxMode;
+      phi[f] = phiStar[f] - pEqnFlux;
     } else {
       phi[f] = phiStar[f];
     }
@@ -1669,6 +2802,27 @@ __global__ static void kernel_correct_velocity_from_pcorr_grad(
     w[c] = wStar[c] - rAU[c] * gradz[c];
   }
 }
+
+__global__ static void kernel_add_rau_grad_to_velocity(
+    int nCells, double *u, double *v, double *w,
+    const double *rAU, const double *gradx, const double *grady, const double *gradz)
+{
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if(c < nCells){
+    u[c] += rAU[c] * gradx[c];
+    v[c] += rAU[c] * grady[c];
+    w[c] += rAU[c] * gradz[c];
+  }
+}
+
+__global__ static void kernel_update_pressure_absolute_relax(
+    int n, double *p, const double *pAbs, double pRelax)
+{
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i < n) p[i] = p[i] + pRelax * (pAbs[i] - p[i]);
+}
+
+
 
 __global__ static void kernel_zero_values(HYPRE_Complex *vals, int n){
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1793,11 +2947,15 @@ __global__ static void kernel_relax_momentum_rhs_only_from_relaxed_matrix(int nC
   }
 }
 
-__global__ static void kernel_extract_vol_over_diag(int nCells, const int *diagPos, const HYPRE_Complex *vals, const double *vol, double *rAU){
+__global__ static void kernel_extract_vol_over_diag(int nCells, const int *diagPos, const HYPRE_Complex *vals, const double *vol, double *rAU, double diagScale, double rAUScale){
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   if(c < nCells){
-    double a = (double) vals[diagPos[c]];
-    rAU[c] = (fabs(a) > 1e-30) ? vol[c] / a : 0.0;
+    // vals[diagPos[c]] is normally the matrix diagonal currently being solved.
+    // After equation relaxation this is aP_relaxed = aP_raw/uRelax.
+    // diagScale=1      -> V/aP_relaxed
+    // diagScale=uRelax -> V/aP_raw
+    double a = ((double) vals[diagPos[c]]) * diagScale;
+    rAU[c] = (fabs(a) > 1e-30) ? rAUScale * vol[c] / a : 0.0;
   }
 }
 
@@ -1811,7 +2969,7 @@ __global__ static void kernel_momentum_internal_faces(
     const double *Af,
     const double *gradQx, const double *gradQy, const double *gradQz,
     const double *uConv, const double *vConv, const double *wConv,
-    double rho, double mu, double corrPsi,
+    double rho, double mu, double corrPsi, int momentumConvectionScheme,
     const int *facePP, const int *facePN, const int *faceNP, const int *faceNN,
     HYPRE_Complex *vals, HYPRE_Complex *rhs)
 {
@@ -1840,10 +2998,30 @@ __global__ static void kernel_momentum_internal_faces(
   double vcf = (1.0-lam)*vConv[P] + lam*vConv[N];
   double wcf = (1.0-lam)*wConv[P] + lam*wConv[N];
   double F = rho * af * (ucf*nfx[f] + vcf*nfy[f] + wcf*nfz[f]);
-  hypreAtomicAdd(&vals[facePP[f]], (HYPRE_Complex)(alpha + F*(1.0-lam)));
-  hypreAtomicAdd(&vals[facePN[f]], (HYPRE_Complex)(-alpha + F*lam));
-  hypreAtomicAdd(&vals[faceNP[f]], (HYPRE_Complex)(-alpha - F*(1.0-lam)));
-  hypreAtomicAdd(&vals[faceNN[f]], (HYPRE_Complex)(alpha - F*lam));
+
+  double cPP=0.0, cPN=0.0, cNP=0.0, cNN=0.0;
+  if(momentumConvectionScheme == 1){
+    // First-order upwind for div(phi,q), matching libscalar upwind algebra.
+    // F is owner-outward. If F >= 0, owner value is upwind; otherwise neighbour.
+    if(F >= 0.0){
+      cPP += F;
+      cNP -= F;
+    } else {
+      cPN += F;
+      cNN -= F;
+    }
+  } else {
+    // Central/linear interpolation to the face.
+    cPP += F*(1.0-lam);
+    cPN += F*lam;
+    cNP -= F*(1.0-lam);
+    cNN -= F*lam;
+  }
+
+  hypreAtomicAdd(&vals[facePP[f]], (HYPRE_Complex)(alpha + cPP));
+  hypreAtomicAdd(&vals[facePN[f]], (HYPRE_Complex)(-alpha + cPN));
+  hypreAtomicAdd(&vals[faceNP[f]], (HYPRE_Complex)(-alpha + cNP));
+  hypreAtomicAdd(&vals[faceNN[f]], (HYPRE_Complex)(alpha + cNN));
   hypreAtomicAdd(&rhs[P], (HYPRE_Complex)corr);
   hypreAtomicAdd(&rhs[N], (HYPRE_Complex)(-corr));
 }
@@ -1901,7 +3079,7 @@ __global__ static void kernel_pressure_internal_faces_rau(
     const double *ccx, const double *ccy, const double *ccz,
     const double *xfx, const double *xfy, const double *xfz,
     const double *nfx, const double *nfy, const double *nfz,
-    const double *Af, const double *rAU,
+    const double *Af, const double *rAU, double rho, double pCoeffScale,
     const int *facePP, const int *facePN, const int *faceNP, const int *faceNN,
     HYPRE_Complex *vals)
 {
@@ -1913,12 +3091,12 @@ __global__ static void kernel_pressure_internal_faces_rau(
   double dy = ccy[N] - ccy[P];
   double dz = ccz[N] - ccz[P];
   double dpn = nfx[f]*dx + nfy[f]*dy + nfz[f]*dz;
-  if(dpn <= 1e-14) return;
+  (void)dpn;
   double denom = dx*dx + dy*dy + dz*dz;
   double lam = ((xfx[f]-ccx[P])*dx + (xfy[f]-ccy[P])*dy + (xfz[f]-ccz[P])*dz) / (denom > 1e-30 ? denom : 1e-30);
   lam = fmin(1.0, fmax(0.0, lam));
   double rAUf = (1.0-lam)*rAU[P] + lam*rAU[N];
-  double coeff = Af[f] * rAUf / dpn;
+  double coeff = pCoeffScale * rho * Af[f] * rAUf * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
   if(facePP[f] >= 0) hypreAtomicAdd(&vals[facePP[f]], (HYPRE_Complex)coeff);
   if(facePN[f] >= 0) hypreAtomicAdd(&vals[facePN[f]], (HYPRE_Complex)(-coeff));
   if(faceNP[f] >= 0) hypreAtomicAdd(&vals[faceNP[f]], (HYPRE_Complex)(-coeff));
@@ -1931,7 +3109,7 @@ __global__ static void kernel_pressure_boundary_faces_rau(
     const double *ccx, const double *ccy, const double *ccz,
     const double *xfx, const double *xfy, const double *xfz,
     const double *nfx, const double *nfy, const double *nfz,
-    const double *Af, const double *rAU,
+    const double *Af, const double *rAU, double rho, double pCoeffScale,
     const int *bcPType, const int *diagPos, HYPRE_Complex *vals)
 {
   int ib = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1944,8 +3122,8 @@ __global__ static void kernel_pressure_boundary_faces_rau(
   double dy = xfy[f] - ccy[P];
   double dz = xfz[f] - ccz[P];
   double dpn = nfx[f]*dx + nfy[f]*dy + nfz[f]*dz;
-  if(dpn <= 1e-14) return;
-  double coeff = Af[f] * rAU[P] / dpn;
+  (void)dpn;
+  double coeff = pCoeffScale * rho * Af[f] * rAU[P] * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
   hypreAtomicAdd(&vals[diagPos[P]], (HYPRE_Complex)coeff);
 }
 
@@ -2278,7 +3456,7 @@ static void assemble_momentum_on_gpu(
     const std::vector<double> &qOld, const std::vector<double> &uConv, const std::vector<double> &vConv, const std::vector<double> &wConv,
     const std::vector<std::array<double,3>> &gradQ, const std::vector<double> &gradPcomp,
     const DeviceBC &bcQ, const DeviceBC &bcU, const DeviceBC &bcV, const DeviceBC &bcW,
-    double corrPsi)
+    double corrPsi, int momentumConvectionScheme)
 {
   std::vector<double> gradQx(mesh.nCells), gradQy(mesh.nCells), gradQz(mesh.nCells);
   for(int c=0;c<mesh.nCells;++c){ gradQx[c]=gradQ[c][0]; gradQy[c]=gradQ[c][1]; gradQz[c]=gradQ[c][2]; }
@@ -2301,7 +3479,7 @@ static void assemble_momentum_on_gpu(
 
   kernel_zero_values<<<gridVals, block>>>(Avals, mom.lin.pat.nnz);
   kernel_momentum_base_steady<<<gridCells, block>>>(mesh.nCells, mom.lin.pat.d_diagPos, dm.d_vol, mom.d_gradPcomp, Avals, mom.lin.d_rhs);
-  kernel_momentum_internal_faces<<<gridFaces, block>>>(mesh.nInternalFaces, dm.d_owner, dm.d_neigh, dm.d_ccx, dm.d_ccy, dm.d_ccz, dm.d_xfx, dm.d_xfy, dm.d_xfz, dm.d_nfx, dm.d_nfy, dm.d_nfz, dm.d_sfx, dm.d_sfy, dm.d_sfz, dm.d_Af, mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, mom.d_uConv, mom.d_vConv, mom.d_wConv, rho, mu, corrPsi, mom.lin.pat.d_facePP, mom.lin.pat.d_facePN, mom.lin.pat.d_faceNP, mom.lin.pat.d_faceNN, Avals, mom.lin.d_rhs);
+  kernel_momentum_internal_faces<<<gridFaces, block>>>(mesh.nInternalFaces, dm.d_owner, dm.d_neigh, dm.d_ccx, dm.d_ccy, dm.d_ccz, dm.d_xfx, dm.d_xfy, dm.d_xfz, dm.d_nfx, dm.d_nfy, dm.d_nfz, dm.d_sfx, dm.d_sfy, dm.d_sfz, dm.d_Af, mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, mom.d_uConv, mom.d_vConv, mom.d_wConv, rho, mu, corrPsi, momentumConvectionScheme, mom.lin.pat.d_facePP, mom.lin.pat.d_facePN, mom.lin.pat.d_faceNP, mom.lin.pat.d_faceNN, Avals, mom.lin.d_rhs);
   kernel_momentum_boundary_faces<<<gridBFaces, block>>>(nBoundaryFaces, mesh.nInternalFaces, dm.d_owner, dm.d_bPatch, dm.d_ccx, dm.d_ccy, dm.d_ccz, dm.d_xfx, dm.d_xfy, dm.d_xfz, dm.d_nfx, dm.d_nfy, dm.d_nfz, dm.d_sfx, dm.d_sfy, dm.d_sfz, dm.d_Af, mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, mom.d_uConv, mom.d_vConv, mom.d_wConv, bcQ.d_type, bcQ.d_faceValue, bcU.d_type, bcU.d_faceValue, bcV.d_type, bcV.d_faceValue, bcW.d_type, bcW.d_faceValue, rho, mu, corrPsi, mom.lin.pat.d_diagPos, Avals, mom.lin.d_rhs);
   CUDA_CHECK_LAST();
 }
@@ -2358,7 +3536,7 @@ static void assemble_momentum_on_gpu_device_grad(
     const DeviceBC &bcU,
     const DeviceBC &bcV,
     const DeviceBC &bcW,
-    double corrPsi)
+    double corrPsi, int momentumConvectionScheme)
 {
   copy_vec_to_device(qOld, mom.d_qOld);
   copy_vec_to_device(uConv, mom.d_uConv);
@@ -2394,7 +3572,7 @@ static void assemble_momentum_on_gpu_device_grad(
       dm.d_Af,
       d_gradQx, d_gradQy, d_gradQz,
       mom.d_uConv, mom.d_vConv, mom.d_wConv,
-      rho, mu, corrPsi,
+      rho, mu, corrPsi, momentumConvectionScheme,
       mom.lin.pat.d_facePP,
       mom.lin.pat.d_facePN,
       mom.lin.pat.d_faceNP,
@@ -2509,11 +3687,12 @@ static void assemble_momentum_rhs_only_on_gpu_device_grad(
   CUDA_CHECK_LAST();
 }
 
-static void extract_rAU_from_momentum_matrix(const Mesh &mesh, const DeviceMesh &dm, GPUMomentumAssembler &mom, std::vector<double> &rAU_host){
+static void extract_rAU_from_momentum_matrix(const Mesh &mesh, const DeviceMesh &dm, GPUMomentumAssembler &mom, const Params &par, std::vector<double> &rAU_host){
   int block=256;
   int gridCells=(mesh.nCells + block - 1)/block;
   HYPRE_Complex *Avals = matrix_values_ptr(mom.lin);
-  kernel_extract_vol_over_diag<<<gridCells, block>>>(mesh.nCells, mom.lin.pat.d_diagPos, Avals, dm.d_vol, mom.d_rAU);
+  const double diagScale = (par.rAUMode == 0 && par.uRelax < 0.999999) ? par.uRelax : 1.0;
+  kernel_extract_vol_over_diag<<<gridCells, block>>>(mesh.nCells, mom.lin.pat.d_diagPos, Avals, dm.d_vol, mom.d_rAU, diagScale, par.rAUScale);
   CUDA_CHECK_LAST();
   rAU_host.clear(); // device-resident rAU is used by pressure and Rhie-Chow; host copy is not needed in optimized path.
 }
@@ -2529,7 +3708,7 @@ static void relax_momentum_system_on_gpu(const Mesh &mesh, GPUMomentumAssembler 
 
 static void pressure_solver_setup(GPULinearSystem &ps);
 
-static void update_pressure_matrix_from_rAU(const Mesh &mesh, const DeviceMesh &dm, GPULinearSystem &ps, const DeviceBC &bcP, const double *d_rAU, int refCell, bool usePressureAnchor, bool doSetup, double &tsetup){
+static void update_pressure_matrix_from_rAU(const Mesh &mesh, const DeviceMesh &dm, GPULinearSystem &ps, const DeviceBC &bcP, const double *d_rAU, double rho, double pCoeffScale, int refCell, bool usePressureAnchor, bool doSetup, double &tsetup){
   int block=256;
   int gridVals=(ps.pat.nnz + block - 1)/block;
   int gridFaces=(mesh.nInternalFaces + block - 1)/block;
@@ -2538,8 +3717,8 @@ static void update_pressure_matrix_from_rAU(const Mesh &mesh, const DeviceMesh &
   HYPRE_Complex *Avals = matrix_values_ptr(ps);
   double t0 = MPI_Wtime();
   kernel_zero_values<<<gridVals, block>>>(Avals, ps.pat.nnz);
-  kernel_pressure_internal_faces_rau<<<gridFaces, block>>>(mesh.nInternalFaces, dm.d_owner, dm.d_neigh, dm.d_ccx, dm.d_ccy, dm.d_ccz, dm.d_xfx, dm.d_xfy, dm.d_xfz, dm.d_nfx, dm.d_nfy, dm.d_nfz, dm.d_Af, d_rAU, ps.pat.d_facePP, ps.pat.d_facePN, ps.pat.d_faceNP, ps.pat.d_faceNN, Avals);
-  kernel_pressure_boundary_faces_rau<<<gridBFaces, block>>>(nBoundaryFaces, mesh.nInternalFaces, dm.d_owner, dm.d_bPatch, dm.d_ccx, dm.d_ccy, dm.d_ccz, dm.d_xfx, dm.d_xfy, dm.d_xfz, dm.d_nfx, dm.d_nfy, dm.d_nfz, dm.d_Af, d_rAU, bcP.d_type, ps.pat.d_diagPos, Avals);
+  kernel_pressure_internal_faces_rau<<<gridFaces, block>>>(mesh.nInternalFaces, dm.d_owner, dm.d_neigh, dm.d_ccx, dm.d_ccy, dm.d_ccz, dm.d_xfx, dm.d_xfy, dm.d_xfz, dm.d_nfx, dm.d_nfy, dm.d_nfz, dm.d_Af, d_rAU, rho, pCoeffScale, ps.pat.d_facePP, ps.pat.d_facePN, ps.pat.d_faceNP, ps.pat.d_faceNN, Avals);
+  kernel_pressure_boundary_faces_rau<<<gridBFaces, block>>>(nBoundaryFaces, mesh.nInternalFaces, dm.d_owner, dm.d_bPatch, dm.d_ccx, dm.d_ccy, dm.d_ccz, dm.d_xfx, dm.d_xfy, dm.d_xfz, dm.d_nfx, dm.d_nfy, dm.d_nfz, dm.d_Af, d_rAU, rho, pCoeffScale, bcP.d_type, ps.pat.d_diagPos, Avals);
   if(usePressureAnchor) kernel_pressure_anchor<<<1,1>>>(refCell, ps.pat.d_diagPos, Avals);
   CUDA_CHECK_LAST();
   if(doSetup){
@@ -2845,6 +4024,7 @@ static PatchForceReport compute_patch_forces_wall_shear(
   r.requested = true;
 
   if(patchIndex < 0 || patchIndex >= (int)mesh.patchNames.size()) return r;
+  if(Uref <= 0.0 || Aref <= 0.0) return r;
 
   r.valid = true;
   r.patchIndex = patchIndex;
@@ -2858,10 +4038,7 @@ static PatchForceReport compute_patch_forces_wall_shear(
   r.mu = mu;
   r.Uref = Uref;
   r.Aref = Aref;
-  r.coeffDenom =
-      (rho > 0.0 && Uref > 0.0 && Aref > 0.0)
-      ? (rho * Uref * Uref * Aref)
-      : 0.0;
+  r.coeffDenom = rho * Uref * Uref * Aref;
 
   const int f0 = mesh.patchStartFace[patchIndex];
   const int f1 = f0 + mesh.patchNFaces[patchIndex];
@@ -2933,6 +4110,165 @@ static PatchForceReport compute_patch_forces_wall_shear(
 }
 
 
+
+// -----------------------------------------------------------------------------
+// Scalar transport coupling helpers (v1 modular path)
+// -----------------------------------------------------------------------------
+static std::string lower_copy_local(std::string v){
+  for(char &c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return v;
+}
+
+static libscalar::DiffusionScheme scalar_diffusion_scheme_from_case(const std::string& raw){
+  const std::string v = lower_copy_local(raw);
+  if(v == "orth" || v == "orthogonal" || v == "uncorrected") return libscalar::DiffusionScheme::Orth;
+  if(v == "nonorth" || v == "nonorthogonal" || v == "corrected") return libscalar::DiffusionScheme::NonOrth;
+  throw std::runtime_error("Unknown scalarDiffusionScheme '" + raw + "'. Use orth or nonorth.");
+}
+
+static libscalar::ScalarBCSet read_scalar_bc_config(const Mesh& mesh, const std::string& path){
+  libscalar::ScalarBCSet out;
+  if(path.empty()) return out;
+
+  std::ifstream in(path);
+  if(!in) throw std::runtime_error("Could not open scalar BC config file: " + path);
+
+  std::set<std::string> known(mesh.patchNames.begin(), mesh.patchNames.end());
+  std::set<std::string> covered;
+
+  std::string raw;
+  int lineNo = 0;
+  while(std::getline(in, raw)){
+    ++lineNo;
+    const std::string line = trim_case_line(raw);
+    if(line.empty()) continue;
+    const auto tok = tokenize_case_line(line);
+    if(tok.empty()) continue;
+
+    if(tok[0] != "scalar"){
+      std::ostringstream oss;
+      oss << "Scalar BC parse error in '" << path << "' at line " << lineNo
+          << ": expected 'scalar <patch> <bcType> [value]'";
+      throw std::runtime_error(oss.str());
+    }
+    if(tok.size() < 3){
+      std::ostringstream oss;
+      oss << "Scalar BC parse error in '" << path << "' at line " << lineNo
+          << ": expected 'scalar <patch> <bcType> [value]'";
+      throw std::runtime_error(oss.str());
+    }
+
+    const std::string patch = tok[1];
+    if(!known.count(patch)){
+      std::ostringstream oss;
+      oss << "Scalar BC references unknown patch '" << patch << "' at line " << lineNo;
+      throw std::runtime_error(oss.str());
+    }
+
+    const std::string typ = lower_copy_local(tok[2]);
+    if(typ == "fixed_value" || typ == "fixedvalue" || typ == "dirichlet" || typ == "value"){
+      if(tok.size() != 4){
+        std::ostringstream oss;
+        oss << "Scalar fixed_value BC for patch '" << patch << "' needs one value at line " << lineNo;
+        throw std::runtime_error(oss.str());
+      }
+      out.patches.push_back(libscalar::make_dirichlet_constant_bc(patch, std::atof(tok[3].c_str())));
+    } else if(typ == "zero_gradient" || typ == "zerogradient" || typ == "outlet"){
+      if(tok.size() != 3){
+        std::ostringstream oss;
+        oss << "Scalar zero_gradient BC for patch '" << patch << "' takes no value at line " << lineNo;
+        throw std::runtime_error(oss.str());
+      }
+      out.patches.push_back(libscalar::make_zero_gradient_patch_bc(patch));
+    } else if(typ == "neumann" || typ == "neumann_gradient" || typ == "gradient"){
+      if(tok.size() != 4){
+        std::ostringstream oss;
+        oss << "Scalar neumann_gradient BC for patch '" << patch << "' needs one gradient value at line " << lineNo;
+        throw std::runtime_error(oss.str());
+      }
+      out.patches.push_back(libscalar::make_neumann_gradient_constant_bc(patch, std::atof(tok[3].c_str())));
+    } else {
+      std::ostringstream oss;
+      oss << "Unknown scalar BC type '" << tok[2] << "' for patch '" << patch << "' at line " << lineNo
+          << ". Use fixed_value, zero_gradient, or neumann_gradient.";
+      throw std::runtime_error(oss.str());
+    }
+    covered.insert(patch);
+  }
+
+  for(const auto& name : mesh.patchNames){
+    if(!covered.count(name)){
+      throw std::runtime_error("No scalar BC provided for patch '" + name + "' in " + path);
+    }
+  }
+  return out;
+}
+
+static bool scalar_solve_mode_is_after_flow(const std::string& raw){
+  const std::string v = lower_copy_local(raw);
+  return (v == "afterflow" || v == "after-flow" || v == "postflow" || v == "post-flow" || v == "post" || v == "once");
+}
+
+static std::vector<double> solve_scalar_after_flow(
+    const Params& par,
+    const Mesh& mesh,
+    const std::vector<double>& facePhi,
+    int rank)
+{
+  if(par.scalarBCConfigPath.empty()){
+    throw std::runtime_error("scalarEnable=1 requires inline scalar BC lines or scalarBCConfig <file>");
+  }
+  if(!scalar_solve_mode_is_after_flow(par.scalarSolveMode)){
+    throw std::runtime_error("Only scalarSolveMode afterFlow is implemented in simple_gpu v1.1/v1 modular build.");
+  }
+
+  libscalar::ScalarTransportInputs in;
+  in.faceFlux.resize(mesh.nFaces, 0.0);
+  const double rhoSafe = std::max(std::fabs(par.rho), 1.0e-300);
+  for(int f=0; f<mesh.nFaces; ++f) in.faceFlux[f] = facePhi[f] / rhoSafe; // convert mass flux to volume flux when rho != 1
+  in.gammaFace.assign(mesh.nFaces, par.scalarGamma);
+  in.Su.assign(mesh.nCells, 0.0);
+  in.Sp.assign(mesh.nCells, 0.0);
+
+  libscalar::ScalarTransportOptions opt;
+  opt.convectionScheme = libscalar::convection_scheme_from_string(par.scalarConvectionScheme);
+  opt.diffusionScheme = scalar_diffusion_scheme_from_case(par.scalarDiffusionScheme);
+  opt.nNonOrthCorr = par.scalarNonOrthCorr;
+  opt.maxIter = par.scalarMaxit;
+  opt.absTol = par.scalarTol;
+  opt.relTol = par.scalarRelTol;
+  opt.monitor = par.monitor ? 1 : 0;
+
+  const auto bcSet = read_scalar_bc_config(mesh, par.scalarBCConfigPath);
+
+  if(rank == 0){
+    std::printf("\nScalar transport solve after flow:\n");
+    std::printf("  scalarName             : %s\n", par.scalarName.c_str());
+    std::printf("  scalarConvectionScheme : %s\n", libscalar::convection_scheme_name(opt.convectionScheme));
+    std::printf("  scalarDiffusionScheme  : %s\n", opt.diffusionScheme == libscalar::DiffusionScheme::NonOrth ? "nonorth" : "orth");
+    std::printf("  scalarGamma            : %.12e\n", par.scalarGamma);
+    std::printf("  scalarNonOrthCorr      : %d\n", opt.nNonOrthCorr);
+    std::printf("  scalarBCConfig         : %s\n", par.scalarBCConfigPath.c_str());
+  }
+
+  const double t0 = MPI_Wtime();
+  const auto result = libscalar::solve_steady_scalar_transport(mesh, in, bcSet, opt);
+  const double t1 = MPI_Wtime();
+
+  if(rank == 0){
+    double mn = 0.0, mx = 0.0;
+    if(!result.phi.empty()){
+      mn = *std::min_element(result.phi.begin(), result.phi.end());
+      mx = *std::max_element(result.phi.begin(), result.phi.end());
+    }
+    std::printf("  scalar iterations      : %d\n", result.iterations);
+    std::printf("  scalar final relres    : %.12e\n", result.finalRelRes);
+    std::printf("  scalar min/max         : %.12e / %.12e\n", mn, mx);
+    std::printf("  scalar wall time       : %.6e s\n", t1 - t0);
+  }
+  return result.phi;
+}
+
 int main(int argc, char **argv){
   MPI_Init(&argc,&argv);
   int rank=0,size=1; MPI_Comm_rank(MPI_COMM_WORLD,&rank); MPI_Comm_size(MPI_COMM_WORLD,&size);
@@ -2944,13 +4280,17 @@ int main(int argc, char **argv){
   expandedArgv.reserve(expandedArgs.size());
   for(auto& a : expandedArgs) expandedArgv.push_back(a.data());
   parse_args((int)expandedArgv.size(), expandedArgv.data(), par);
+  if(par.pSolveMode == 1) par.pMode = 1;
   g_profile_enabled = (par.profileSteps > 0);
   g_p_amg_setup_scope = par.pAmgSetupScope;
   CUDA_CALL(cudaSetDevice(par.device));
-  CUDA_CALL(cudaFree(0));
+
+  g_pDeltaMode = par.pDeltaMode;
+  g_pDeltaMinCos = par.pDeltaMinCos;
+CUDA_CALL(cudaFree(0));
   if(rank==0) print_device_info(par.device);
 
-  Mesh mesh=read_openfoam_polymesh(par.polyMeshDir);
+  Mesh mesh=read_openfoam_polymesh(par.polyMeshDir, par.geomMethod);
   double xmin=1e300,xmax=-1e300,ymin=1e300,ymax=-1e300,zmin=1e300,zmax=-1e300,vmin=1e300,vmax=-1e300;
   for(const auto &p:mesh.P){ xmin=std::min(xmin,p[0]); xmax=std::max(xmax,p[0]); ymin=std::min(ymin,p[1]); ymax=std::max(ymax,p[1]); zmin=std::min(zmin,p[2]); zmax=std::max(zmax,p[2]); }
   for(double v:mesh.vol){ vmin=std::min(vmin,v); vmax=std::max(vmax,v); }
@@ -2969,7 +4309,7 @@ int main(int argc, char **argv){
 
   if(rank==0){
     std::printf("============================================================\n");
-    std::printf("generic_simple_v1: OpenFOAM polyMesh SIMPLE solver\n");
+    std::printf("Anabasis simple_gpu v1.1: OpenFOAM polyMesh SIMPLE solver\n");
     std::printf("GPU linear-system assembly + GPU solve; U/V/W matrix reuse; GPU pressure RHS/flux/div/vel-correct; direct hypre matrix writes; GPU old-field LSQ gradients\n");
     std::printf("============================================================\n");
     std::printf("polyMeshDir : %s\n", par.polyMeshDir.c_str());
@@ -2985,6 +4325,7 @@ int main(int argc, char **argv){
     std::printf("Momentum solve : ParCSR BiCGSTAB + DiagScale\n");
     std::printf("Pressure solve : ParCSR PCG + %s\n", par.p_use_amg ? "BoomerAMG" : "DiagScale");
     std::printf("rho            : %.8g\n", par.rho);
+    std::printf("rho in pEqn    : ON (pressure coeff/flux use rho*rAU)\n");
     std::printf("Re             : %.8g\n", par.Re);
     std::printf("Umean          : %.8g\n", par.Umean);
     std::printf("pipeDiameter   : %.8g\n", par.pipeDiameter);
@@ -2997,6 +4338,40 @@ int main(int argc, char **argv){
     std::printf("nVelNonOrthCorr: %d\n", par.nVelNonOrthCorr);
     std::printf("nNonOrthCorr   : %d\n", par.nNonOrthCorr);
     std::printf("nPressureCorr  : %d\n", par.nPressureCorr);
+    std::printf("geomMethod     : %s\n", par.geomMethod == 0 ? "legacy/v1" : "robust");
+    std::printf("LSQ stencil    : %s\n", par.lsqStencilMode == 0 ? "compact" : "extended-accepted-as-compact");
+    std::printf("LSQ weight     : 1/|d|^%.6g\n", par.lsqWeightPower);
+    std::printf("momNonOrthScale: %.8g\n", par.momNonOrthScale);
+    std::printf("Momentum convection: %s\n", par.momentumConvectionScheme == 1 ? "upwind" : "central");
+    std::printf("pNonOrthScale  : %.8g\n", par.pNonOrthScale);
+    std::printf("pMode          : %s\n", par.pMode == 0 ? "pcorr" : "absolute");
+    std::printf("pSolveMode     : %s\n", par.pSolveMode == 1 ? "ofAbsolute" : "correction-compatible");
+    std::printf("pGradScheme    : %s\n", par.pGradScheme == 1 ? "Gauss linear" : "LSQ");
+    std::printf("pCoeffScale    : %.8g\n", par.pCoeffScale);
+    std::printf("rcMode         : %s\n", par.rcMode == 0 ? "old-explicit" : "oflike-no-explicit");
+    std::printf("rAUMode        : %s\n", par.rAUMode == 0 ? "raw V/aP_raw" : "relaxed V/aP_relaxed");
+    std::printf("pDeltaMode     : %s\n",
+        par.pDeltaMode == 0 ? "legacy/v1 signed 1/(n.d)" :
+        par.pDeltaMode == 1 ? "OF-stabilised" :
+        par.pDeltaMode == 2 ? "abs-projected 1/|n.d|" : "distance 1/|d|");
+    std::printf("pDeltaMinCos   : %.8g\n", par.pDeltaMinCos);
+    std::printf("initMode       : %s\n", par.initMode == 1 ? "potential/projection" : "uniform inlet-average");
+    if(par.initMode == 1){
+      std::printf("potential init : rAU=%.8g maxit=%d tol=%.3e relTol=%.3e write=%d\n",
+                  par.potentialInitRAU, par.potentialInitMaxit,
+                  par.potentialInitTol, par.potentialInitRelTol, par.potentialInitWrite);
+    }
+    std::printf("badCellAudit   : every=%d top=%d start=%d onGrowth=%d growthFactor=%.3g massFloor=%.3e writeCsv=%d\n",
+        par.badCellAuditEvery, par.badCellAuditTop, par.badCellAuditStart,
+        par.badCellAuditOnGrowth, par.badCellAuditGrowthFactor,
+        par.badCellAuditMassFloor, par.badCellAuditWriteCsv);
+    std::printf("Poisson PDE opts: gradient=%s laplacian=%s nNonOrthCorr=%d\n",
+        par.poissonGradientScheme.c_str(), par.poissonLaplacianScheme.c_str(), par.poissonNonOrthCorr);
+    std::printf("Scalar PDE opts : enable=%d solveMode=%s name=%s phiScheme=%s diffusion=%s gamma=%.8g relax=%.8g nNonOrthCorr=%d maxit=%d tol=%.3e relTol=%.3e\n",
+        par.scalarEnable, par.scalarSolveMode.c_str(), par.scalarName.c_str(),
+        par.scalarConvectionScheme.c_str(), par.scalarDiffusionScheme.c_str(),
+        par.scalarGamma, par.scalarRelax, par.scalarNonOrthCorr,
+        par.scalarMaxit, par.scalarTol, par.scalarRelTol);
     if(par.profileSteps>0) std::printf("profileSteps   : %d\n", par.profileSteps);
     std::printf("velTol / velRelTol : %.3e / %.3e\n", par.velTol, par.velRelTol);
     std::printf("pTol   / pRelTol   : %.3e / %.3e\n", par.pTol, par.pRelTol);
@@ -3008,6 +4383,83 @@ int main(int argc, char **argv){
   HYPRE_CALL(HYPRE_SetMemoryLocation(HYPRE_MEMORY_DEVICE));
   HYPRE_CALL(HYPRE_SetExecutionPolicy(HYPRE_EXEC_DEVICE));
 
+
+  // Repair OpenFOAM patch range metadata if the v2 reader populated names
+  // but forgot patchStartFace/patchNFaces.  The working v1 reader filled
+  // these from boundary startFace/nFaces; here we reconstruct from bPatch.
+  if (mesh.patchStartFace.size() != mesh.patchNames.size()
+      || mesh.patchNFaces.size() != mesh.patchNames.size())
+  {
+    const int nPatches = static_cast<int>(mesh.patchNames.size());
+
+    if (nPatches <= 0) {
+      throw std::runtime_error("No boundary patches found in mesh.patchNames");
+    }
+    if (static_cast<int>(mesh.bPatch.size()) != mesh.nFaces) {
+      throw std::runtime_error(
+        "Cannot reconstruct patch ranges: mesh.bPatch size="
+        + std::to_string(mesh.bPatch.size())
+        + " but mesh.nFaces=" + std::to_string(mesh.nFaces));
+    }
+
+    int minRaw = 1000000000;
+    int maxRaw = -1000000000;
+    for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
+      minRaw = std::min(minRaw, mesh.bPatch[f]);
+      maxRaw = std::max(maxRaw, mesh.bPatch[f]);
+    }
+
+    const bool oneBased  = (minRaw >= 1 && maxRaw <= nPatches);
+    const bool zeroBased = (minRaw >= 0 && maxRaw <  nPatches);
+
+    if (!oneBased && !zeroBased) {
+      throw std::runtime_error(
+        "Cannot reconstruct patch ranges: unexpected bPatch raw range ["
+        + std::to_string(minRaw) + ", " + std::to_string(maxRaw)
+        + "] for nPatches=" + std::to_string(nPatches));
+    }
+
+    mesh.patchStartFace.assign(nPatches, -1);
+    mesh.patchNFaces.assign(nPatches, 0);
+
+    for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
+      const int raw = mesh.bPatch[f];
+      const int pidx = oneBased ? (raw - 1) : raw;
+
+      if (pidx < 0 || pidx >= nPatches) {
+        throw std::runtime_error(
+          "Patch index out of range while reconstructing patch ranges: raw="
+          + std::to_string(raw) + " pidx=" + std::to_string(pidx));
+      }
+
+      if (mesh.patchNFaces[pidx] == 0) mesh.patchStartFace[pidx] = f;
+      ++mesh.patchNFaces[pidx];
+    }
+
+    int totalBoundaryFaces = 0;
+    for (int pidx = 0; pidx < nPatches; ++pidx) {
+      totalBoundaryFaces += mesh.patchNFaces[pidx];
+      if (mesh.patchStartFace[pidx] < mesh.nInternalFaces || mesh.patchNFaces[pidx] <= 0) {
+        throw std::runtime_error(
+          "Bad reconstructed patch range for "
+          + mesh.patchNames[pidx]
+          + ": startFace=" + std::to_string(mesh.patchStartFace[pidx])
+          + " nFaces=" + std::to_string(mesh.patchNFaces[pidx]));
+      }
+    }
+
+    if (totalBoundaryFaces != mesh.nFaces - mesh.nInternalFaces) {
+      throw std::runtime_error(
+        "Bad reconstructed patch ranges: totalBoundaryFaces="
+        + std::to_string(totalBoundaryFaces)
+        + " expected=" + std::to_string(mesh.nFaces - mesh.nInternalFaces));
+    }
+
+    std::fprintf(stderr,
+      "Reconstructed patch ranges from bPatch: nPatches=%d, rawRange=[%d,%d], base=%s\n",
+      nPatches, minRaw, maxRaw, oneBased ? "one-based" : "zero-based");
+  }
+
   pipebc::PatchGeometryInput patchGeomIn;
   patchGeomIn.nInternalFaces = mesh.nInternalFaces;
   patchGeomIn.nFaces = mesh.nFaces;
@@ -3015,6 +4467,12 @@ int main(int argc, char **argv){
   patchGeomIn.nf = &mesh.nf;
   patchGeomIn.Sf = &mesh.Sf;
   patchGeomIn.Af = &mesh.Af;
+  patchGeomIn.patchNames = &mesh.patchNames;
+  patchGeomIn.patchStartFace = &mesh.patchStartFace;
+  patchGeomIn.patchNFaces = &mesh.patchNFaces;
+
+
+  // Ensure PatchGeometryInput points at the actual mesh-owned arrays.
   patchGeomIn.patchNames = &mesh.patchNames;
   patchGeomIn.patchStartFace = &mesh.patchStartFace;
   patchGeomIn.patchNFaces = &mesh.patchNFaces;
@@ -3033,13 +4491,13 @@ int main(int argc, char **argv){
   std::vector<pipebc::VelocityPatchBCSpec> velocityPatchSpecs;
   std::vector<pipebc::PressurePatchBCSpec> pressurePatchSpecs;
 
-  // generic_simple_v1 rule:
+  // simple_gpu rule:
   // all physical BCs must come from the runtime/generated BC config.
   // This avoids silent fallback/default BCs on newly added patches.
   if(par.bcConfigPath.empty()){
     if(rank==0){
       std::fprintf(stderr,
-          "generic_simple_v1 requires explicit runtime BCs.\n"
+          "simple_gpu requires explicit runtime BCs.\n"
           "Add velocity/pressure lines to the case file, or set bcConfig.\n");
     }
     MPI_Abort(MPI_COMM_WORLD, 1);
@@ -3226,7 +4684,7 @@ int main(int argc, char **argv){
       }
 
       std::fprintf(stderr,
-          "\nEvery polyMesh boundary patch must have exactly one velocity BC and one pressure BC in generic_simple_v1.\n");
+          "\nEvery polyMesh boundary patch must have exactly one velocity BC and one pressure BC in simple_gpu.\n");
     }
 
     MPI_Abort(MPI_COMM_WORLD, 1);
@@ -3291,6 +4749,22 @@ int main(int argc, char **argv){
       wFaceBC,
       pFaceBC);
 
+  {
+    static bool wroteRuntimeVelocityBCPatch = false;
+    if(!wroteRuntimeVelocityBCPatch){
+      wroteRuntimeVelocityBCPatch = true;
+      write_runtime_velocity_bc_patch_vtp(
+          mesh,
+          par.inletPatchName,
+          bcUType, uFaceBC,
+          bcVType, vFaceBC,
+          bcWType, wFaceBC,
+          par.rho,
+          par.outPrefix + "_runtime_inlet_bc.vtp");
+    }
+  }
+
+
   const bool usePressureAnchor = false;
 
   DeviceMesh dmesh; build_device_mesh(mesh, dmesh);
@@ -3328,7 +4802,7 @@ int main(int argc, char **argv){
   int refCell=0;
   double totalAssemble=0.0, totalSetup=0.0, totalSolve=0.0;
   double pressureSetup=0.0, pressureSolve=0.0;
-  
+
   GPUMomentumAssembler mom;
   init_momentum_system(mom, mesh);
   GPULinearSystem pressureSys;
@@ -3336,7 +4810,125 @@ int main(int argc, char **argv){
   GPUSimpleScratch ss;
   init_simple_scratch(ss, mesh);
   DeviceGradientOperator gop;
-  build_lsq_gradient_operator(mesh, gop);
+  build_lsq_gradient_operator(mesh, gop, par.lsqWeightPower);
+
+  if(par.initMode == 1){
+    const double tPot0 = MPI_Wtime();
+    const int block = 256;
+    const int gridCells = (mesh.nCells + block - 1) / block;
+    const int gridFaces = (mesh.nFaces + block - 1) / block;
+
+    // Potential/projection initialisation:
+    //   1) start from zero cell velocity, but honour fixed velocity BCs in phiStar;
+    //   2) solve L(potential) = -div(phiStar) with a constant rAU;
+    //   3) set U = -rAU * grad(potential) and corrected phi.
+    // This is intentionally not used as physical pressure; p remains zero.
+    std::fill(u.begin(), u.end(), 0.0);
+    std::fill(v.begin(), v.end(), 0.0);
+    std::fill(w.begin(), w.end(), 0.0);
+    std::fill(p.begin(), p.end(), 0.0);
+
+    copy_vec_to_device(u, ss.d_u);
+    copy_vec_to_device(v, ss.d_v);
+    copy_vec_to_device(w, ss.d_w);
+    copy_vec_to_device(p, ss.d_p);
+
+    kernel_fill_double<<<gridCells, block>>>(mom.d_rAU, mesh.nCells, par.potentialInitRAU);
+    kernel_zero_double<<<gridCells, block>>>(ss.d_gradx, mesh.nCells);
+    kernel_zero_double<<<gridCells, block>>>(ss.d_grady, mesh.nCells);
+    kernel_zero_double<<<gridCells, block>>>(ss.d_gradz, mesh.nCells);
+    CUDA_CHECK_LAST();
+
+    kernel_build_rhiechow_predicted_flux_stokes_3d<<<gridFaces, block>>>(
+        mesh.nFaces, mesh.nInternalFaces,
+        dmesh.d_owner, dmesh.d_neigh, dmesh.d_bPatch,
+        dmesh.d_ccx, dmesh.d_ccy, dmesh.d_ccz,
+        dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
+        dmesh.d_nfx, dmesh.d_nfy, dmesh.d_nfz,
+        dmesh.d_Af,
+        ss.d_u, ss.d_v, ss.d_w,
+        ss.d_p,
+        ss.d_gradx, ss.d_grady, ss.d_gradz,
+        mom.d_rAU,
+        dbcU.d_type, dbcU.d_faceValue,
+        dbcV.d_type, dbcV.d_faceValue,
+        dbcW.d_type, dbcW.d_faceValue,
+        par.rho, 1, par.hbyaBcMode, ss.d_phiStar);
+    CUDA_CHECK_LAST();
+
+    continuity_residual_gpu(dmesh, ss.d_phiStar, ss.d_divStar);
+    const double potMassBefore = maxabs_device(ss.d_divStar, mesh.nCells, ss.d_reduce, ss.reduceSize);
+
+    double potSetup = 0.0;
+    update_pressure_matrix_from_rAU(mesh, dmesh, pressureSys, dbcP, mom.d_rAU,
+                                    par.rho, par.pCoeffScale, refCell, usePressureAnchor,
+                                    true, potSetup);
+
+    kernel_zero_double<<<gridCells, block>>>(ss.d_pCorr, mesh.nCells);
+    kernel_zero_double<<<gridCells, block>>>(ss.d_divNonOrth, mesh.nCells);
+    kernel_zero_double<<<gridFaces, block>>>(ss.d_phiNonOrth, mesh.nFaces);
+    CUDA_CHECK_LAST();
+
+    kernel_build_pressure_rhs_from_divs<<<gridCells, block>>>(
+        mesh.nCells, ss.d_divStar, ss.d_divNonOrth, 0.0,
+        usePressureAnchor ? 1 : 0, refCell, pressureSys.d_rhs);
+    CUDA_CHECK_LAST();
+
+    HYPRE_Int potIts = 0;
+    double potRel = 0.0;
+    double potSolve = 0.0;
+    solve_pressure_gpu_device_rhs_device_x0(pressureSys, ss.d_pCorr, ss.d_pCorr,
+        par.potentialInitRelTol, par.potentialInitTol,
+        par.potentialInitMaxit, potIts, potRel, potSolve);
+
+    compute_lsq_gradient_gpu(gop, dmesh, dbcP, ss.d_pCorr,
+                             ss.d_gradx, ss.d_grady, ss.d_gradz);
+
+    kernel_correct_face_fluxes_simple_nonorth<<<gridFaces, block>>>(
+        mesh.nFaces, mesh.nInternalFaces,
+        dmesh.d_owner, dmesh.d_neigh, dmesh.d_bPatch,
+        dmesh.d_ccx, dmesh.d_ccy, dmesh.d_ccz,
+        dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
+        dmesh.d_nfx, dmesh.d_nfy, dmesh.d_nfz,
+        dmesh.d_Af, mom.d_rAU, par.rho,
+        dbcP.d_type, dbcP.d_faceValue,
+        ss.d_phiStar, ss.d_pCorr, ss.d_phiNonOrth, 0.0,
+        par.pCoeffScale, par.pFluxMode, ss.d_phi);
+    CUDA_CHECK_LAST();
+
+    kernel_correct_velocity_from_pcorr_grad<<<gridCells, block>>>(
+        mesh.nCells, ss.d_u, ss.d_v, ss.d_w, mom.d_rAU,
+        ss.d_gradx, ss.d_grady, ss.d_gradz,
+        ss.d_u, ss.d_v, ss.d_w);
+    CUDA_CHECK_LAST();
+
+    continuity_residual_gpu(dmesh, ss.d_phi, ss.d_divCorr);
+    const double potMassAfter = maxabs_device(ss.d_divCorr, mesh.nCells, ss.d_reduce, ss.reduceSize);
+
+    copy_device_to_vec(ss.d_u, u);
+    copy_device_to_vec(ss.d_v, v);
+    copy_device_to_vec(ss.d_w, w);
+    std::fill(p.begin(), p.end(), 0.0);
+
+    if(rank == 0){
+      std::printf("Potential init : mass before/after = %.3e / %.3e, pcgIts=%d, finalRel=%.3e, setup=%.3e s, solve=%.3e s, wall=%.3e s\n",
+                  potMassBefore, potMassAfter, (int)potIts, potRel,
+                  potSetup, potSolve, MPI_Wtime() - tPot0);
+    }
+
+    if(par.potentialInitWrite && par.write_vtu){
+      std::vector<std::array<double,3>> Uvec(mesh.nCells);
+      std::vector<double> umag(mesh.nCells);
+      std::vector<double> divPot(mesh.nCells, 0.0);
+      copy_device_to_vec(ss.d_divCorr, divPot);
+      for(int c=0;c<mesh.nCells;++c){
+        Uvec[c] = {u[c], v[c], w[c]};
+        umag[c] = std::sqrt(u[c]*u[c] + v[c]*v[c] + w[c]*w[c]);
+      }
+      write_vtu_polyhedron_cell_data(par.outPrefix + "_potential_init.vtu", mesh,
+          {"p","umag","cell_volume","divPotential"}, {p,umag,mesh.vol,divPot}, "U", &Uvec);
+    }
+  }
 
   int stepConverged=0;
   double massRes=0.0, duRel=0.0, dvRel=0.0, dwRel=0.0, dpRel=0.0;
@@ -3362,11 +4954,11 @@ int main(int argc, char **argv){
       const bool doMatrixSetup = rebuildMomentumMatrix && (it == 1);
       PhaseMark pm_asm = profile_begin();
       if(doMatrixSetup){
-        assemble_momentum_on_gpu_device_grad(dmesh, mesh, mom, par.rho, mu, 1.0, qIter, uConv, vConv, wConv, mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, d_gradPcomp, dbcQ, dbcU, dbcV, dbcW, 1.0);
+        assemble_momentum_on_gpu_device_grad(dmesh, mesh, mom, par.rho, mu, 1.0, qIter, uConv, vConv, wConv, mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, d_gradPcomp, dbcQ, dbcU, dbcV, dbcW, par.momNonOrthScale, par.momentumConvectionScheme);
         relax_momentum_system_on_gpu(mesh, mom, par.uRelax);
-        if(extractRAU) extract_rAU_from_momentum_matrix(mesh, dmesh, mom, rAU);
+        if(extractRAU) extract_rAU_from_momentum_matrix(mesh, dmesh, mom, par, rAU);
       } else {
-        assemble_momentum_rhs_only_on_gpu_device_grad(dmesh, mesh, mom, par.rho, mu, qIter, uConv, vConv, wConv, mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, d_gradPcomp, dbcQ, dbcU, dbcV, dbcW, 1.0, par.uRelax);
+        assemble_momentum_rhs_only_on_gpu_device_grad(dmesh, mesh, mom, par.rho, mu, qIter, uConv, vConv, wConv, mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, d_gradPcomp, dbcQ, dbcU, dbcV, dbcW, par.momNonOrthScale, par.uRelax);
       }
       double dtAsm = MPI_Wtime()-pm_asm.t0;
       totalAssemble += dtAsm;
@@ -3384,6 +4976,7 @@ int main(int argc, char **argv){
   };
 
   double runStart = MPI_Wtime();
+  double prevMassResForBadCellAudit = -1.0;
   int maxSteps = (par.profileSteps>0 ? std::min(par.nsteps, par.profileSteps) : par.nsteps);
   for(int step=1; step<=maxSteps; ++step){
     double iterStart = MPI_Wtime();
@@ -3408,16 +5001,27 @@ int main(int argc, char **argv){
     double ps0 = pressureSetup;
     const int rebuildEvery = std::max(par.pAmgRebuildEvery, 1);
     const bool doPressureSetup = (!pressureSys.is_setup) || (step == 1) || (((step - 1) % rebuildEvery) == 0);
-    update_pressure_matrix_from_rAU(mesh, dmesh, pressureSys, dbcP, mom.d_rAU, refCell, usePressureAnchor, doPressureSetup, pressureSetup);
+    update_pressure_matrix_from_rAU(mesh, dmesh, pressureSys, dbcP, mom.d_rAU, par.rho, par.pCoeffScale, refCell, usePressureAnchor, doPressureSetup, pressureSetup);
     profile_record(prof[PH_PSETUP], pm_psetup);
 
     u = uStar; v = vStar; w = wStar; p = pOld;
-    PhaseMark pm_phi = profile_begin();
     copy_vec_to_device(uStar, ss.d_u);
     copy_vec_to_device(vStar, ss.d_v);
     copy_vec_to_device(wStar, ss.d_w);
     copy_vec_to_device(p, ss.d_p);
-    compute_lsq_gradient_gpu(gop, dmesh, dbcP, ss.d_p, ss.d_gradx, ss.d_grady, ss.d_gradz);
+    if(par.pMode == 1 && par.pSolveMode == 1){
+      compute_pressure_gradient_gpu(par, gop, dmesh, dbcP, ss.d_p, ss.d_gradx, ss.d_grady, ss.d_gradz);
+    } else {
+      compute_lsq_gradient_gpu(gop, dmesh, dbcP, ss.d_p, ss.d_gradx, ss.d_grady, ss.d_gradz);
+    }
+    if(par.pMode == 1){
+      const int block = 256;
+      // Reconstruct OpenFOAM-like HbyA from predictor Ustar = HbyA - rAU*grad(pOld).
+      kernel_add_rau_grad_to_velocity<<<(mesh.nCells + block - 1)/block, block>>>(
+          mesh.nCells, ss.d_u, ss.d_v, ss.d_w, mom.d_rAU, ss.d_gradx, ss.d_grady, ss.d_gradz);
+      CUDA_CHECK_LAST();
+    }
+    PhaseMark pm_phi = profile_begin();
     {
       const int block = 256;
       kernel_build_rhiechow_predicted_flux_stokes_3d<<<(mesh.nFaces + block - 1)/block, block>>>(
@@ -3434,7 +5038,7 @@ int main(int argc, char **argv){
           dbcU.d_type, dbcU.d_faceValue,
           dbcV.d_type, dbcV.d_faceValue,
           dbcW.d_type, dbcW.d_faceValue,
-          par.rho, ss.d_phiStar);
+          par.rho, par.rcMode, par.hbyaBcMode, ss.d_phiStar);
       CUDA_CHECK_LAST();
       CUDA_CALL(cudaMemcpy(ss.d_phi, ss.d_phiStar, mesh.nFaces*sizeof(double), cudaMemcpyDeviceToDevice));
     }
@@ -3449,7 +5053,14 @@ int main(int argc, char **argv){
     int pressureSolveCounter = 0;
     int pcgTotalIts = 0;
     std::vector<int> pcgPassIts(nPressureSolves, 0);
-    { const int block = 256; kernel_zero_double<<<(mesh.nCells + block - 1)/block, block>>>(ss.d_pCorr, mesh.nCells); CUDA_CHECK_LAST(); }
+    { const int block = 256;
+      if(par.pMode == 1){
+        CUDA_CALL(cudaMemcpy(ss.d_pCorr, ss.d_p, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+      } else {
+        kernel_zero_double<<<(mesh.nCells + block - 1)/block, block>>>(ss.d_pCorr, mesh.nCells);
+        CUDA_CHECK_LAST();
+      }
+    }
 
     for(int pcorr=1; pcorr<=nPressureSolves; ++pcorr){
       PhaseMark pm_pcorrg_iter = profile_begin();
@@ -3466,13 +5077,13 @@ int main(int argc, char **argv){
           dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
           dmesh.d_nfx, dmesh.d_nfy, dmesh.d_nfz,
           dmesh.d_sfx, dmesh.d_sfy, dmesh.d_sfz,
-          dmesh.d_Af, mom.d_rAU,
+          dmesh.d_Af, mom.d_rAU, par.rho,
           dbcP.d_type,
           ss.d_gradx, ss.d_grady, ss.d_gradz,
           ss.d_phiNonOrth, ss.d_divNonOrth);
       CUDA_CHECK_LAST();
       kernel_build_pressure_rhs_from_divs<<<(mesh.nCells + block - 1)/block, block>>>(
-          mesh.nCells, ss.d_divStar, ss.d_divNonOrth, usePressureAnchor ? 1 : 0, refCell, pressureSys.d_rhs);
+          mesh.nCells, ss.d_divStar, ss.d_divNonOrth, par.pNonOrthScale, usePressureAnchor ? 1 : 0, refCell, pressureSys.d_rhs);
       CUDA_CHECK_LAST();
 
       ++pressureSolveCounter;
@@ -3496,7 +5107,7 @@ int main(int argc, char **argv){
             dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
             dmesh.d_nfx, dmesh.d_nfy, dmesh.d_nfz,
             dmesh.d_sfx, dmesh.d_sfy, dmesh.d_sfz,
-            dmesh.d_Af, mom.d_rAU,
+            dmesh.d_Af, mom.d_rAU, par.rho,
             dbcP.d_type,
             ss.d_gradx, ss.d_grady, ss.d_gradz,
             ss.d_phiNonOrth, ss.d_divNonOrth);
@@ -3507,9 +5118,9 @@ int main(int argc, char **argv){
             dmesh.d_ccx, dmesh.d_ccy, dmesh.d_ccz,
             dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
             dmesh.d_nfx, dmesh.d_nfy, dmesh.d_nfz,
-            dmesh.d_Af, mom.d_rAU,
+            dmesh.d_Af, mom.d_rAU, par.rho,
             dbcP.d_type, dbcP.d_faceValue,
-            ss.d_phiStar, ss.d_pCorr, ss.d_phiNonOrth, ss.d_phi);
+            ss.d_phiStar, ss.d_pCorr, ss.d_phiNonOrth, par.pNonOrthScale, par.pCoeffScale, par.pFluxMode, ss.d_phi);
         CUDA_CHECK_LAST();
         profile_record(prof[PH_FLUX_CORR_LOOP], pm_flux);
         PhaseMark pm_contp = profile_begin();
@@ -3545,7 +5156,7 @@ int main(int argc, char **argv){
           dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
           dmesh.d_nfx, dmesh.d_nfy, dmesh.d_nfz,
           dmesh.d_sfx, dmesh.d_sfy, dmesh.d_sfz,
-          dmesh.d_Af, mom.d_rAU,
+          dmesh.d_Af, mom.d_rAU, par.rho,
           dbcP.d_type,
           ss.d_gradx, ss.d_grady, ss.d_gradz,
           ss.d_phiNonOrth, ss.d_divNonOrth);
@@ -3556,9 +5167,9 @@ int main(int argc, char **argv){
           dmesh.d_ccx, dmesh.d_ccy, dmesh.d_ccz,
           dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
           dmesh.d_nfx, dmesh.d_nfy, dmesh.d_nfz,
-          dmesh.d_Af, mom.d_rAU,
+          dmesh.d_Af, mom.d_rAU, par.rho,
           dbcP.d_type, dbcP.d_faceValue,
-          ss.d_phiStar, ss.d_pCorr, ss.d_phiNonOrth, ss.d_phi);
+          ss.d_phiStar, ss.d_pCorr, ss.d_phiNonOrth, par.pNonOrthScale, par.pCoeffScale, par.pFluxMode, ss.d_phi);
       CUDA_CHECK_LAST();
       profile_record(prof[PH_FLUX_CORR_LOOP], pm_flux);
       PhaseMark pm_contp = profile_begin();
@@ -3569,14 +5180,23 @@ int main(int argc, char **argv){
     copy_device_to_vec(ss.d_pCorr, pCorr);
     {
       const int block = 256;
-      kernel_update_pressure_relax<<<(mesh.nCells + block - 1)/block, block>>>(mesh.nCells, ss.d_p, ss.d_pCorr, par.pRelax);
+      if(par.pMode == 1){
+        kernel_update_pressure_absolute_relax<<<(mesh.nCells + block - 1)/block, block>>>(mesh.nCells, ss.d_p, ss.d_pCorr, par.pRelax);
+      } else {
+        kernel_update_pressure_relax<<<(mesh.nCells + block - 1)/block, block>>>(mesh.nCells, ss.d_p, ss.d_pCorr, par.pRelax);
+      }
       CUDA_CHECK_LAST();
       copy_device_to_vec(ss.d_p, p);
     }
     if(usePressureAnchor){ double pref = p[refCell]; for(double &pv : p) pv -= pref; }
 
     PhaseMark pm_pcorrg = profile_begin();
-    compute_lsq_gradient_gpu(gop, dmesh, dbcP, ss.d_pCorr, ss.d_gradx, ss.d_grady, ss.d_gradz);
+    if(par.pMode == 1){
+      if(par.pSolveMode == 1) compute_pressure_gradient_gpu(par, gop, dmesh, dbcP, ss.d_p, ss.d_gradx, ss.d_grady, ss.d_gradz);
+      else compute_lsq_gradient_gpu(gop, dmesh, dbcP, ss.d_p, ss.d_gradx, ss.d_grady, ss.d_gradz);
+    } else {
+      compute_lsq_gradient_gpu(gop, dmesh, dbcP, ss.d_pCorr, ss.d_gradx, ss.d_grady, ss.d_gradz);
+    }
     profile_record(prof[PH_PCORR_GRAD], pm_pcorrg);
     PhaseMark pm_velcorr = profile_begin();
     {
@@ -3601,6 +5221,40 @@ int main(int argc, char **argv){
     dvRel = relchg_field(v, vOld);
     dwRel = relchg_field(w, wOld);
     dpRel = relchg_field(p, pOld);
+
+    if(rank == 0){
+      bool doBadCellAudit = false;
+      const char* badCellAuditReason = "periodic";
+      if(par.badCellAuditEvery > 0 && step >= par.badCellAuditStart && (step % par.badCellAuditEvery) == 0){
+        doBadCellAudit = true;
+        badCellAuditReason = "periodic";
+      }
+      if(par.badCellAuditOnGrowth != 0 && step >= par.badCellAuditStart && prevMassResForBadCellAudit > 0.0){
+        const double growthFactor = std::max(par.badCellAuditGrowthFactor, 1.0);
+        if(massRes > growthFactor * prevMassResForBadCellAudit && massRes >= par.badCellAuditMassFloor){
+          doBadCellAudit = true;
+          badCellAuditReason = "mass-growth";
+        }
+      }
+      if(doBadCellAudit){
+        std::vector<double> gradxH(mesh.nCells), gradyH(mesh.nCells), gradzH(mesh.nCells);
+        std::vector<double> rAUH(mesh.nCells), divCorrH(mesh.nCells);
+        std::vector<double> phiStarH(mesh.nFaces), phiH(mesh.nFaces), phiNonOrthH(mesh.nFaces);
+        copy_device_to_vec(ss.d_gradx, gradxH);
+        copy_device_to_vec(ss.d_grady, gradyH);
+        copy_device_to_vec(ss.d_gradz, gradzH);
+        copy_device_to_vec(mom.d_rAU, rAUH);
+        copy_device_to_vec(ss.d_divCorr, divCorrH);
+        copy_device_to_vec(ss.d_phiStar, phiStarH);
+        copy_device_to_vec(ss.d_phi, phiH);
+        copy_device_to_vec(ss.d_phiNonOrth, phiNonOrthH);
+        run_bad_cell_audit(par, mesh, bcPType, step, badCellAuditReason,
+            massRes, duRel, dvRel, dwRel, dpRel,
+            pCorr, gradxH, gradyH, gradzH, rAUH, divCorrH,
+            uStar, vStar, wStar, u, v, w, phiStarH, phiH, phiNonOrthH);
+      }
+      prevMassResForBadCellAudit = massRes;
+    }
 
     double iterWall = MPI_Wtime() - iterStart;
     double totalWall = MPI_Wtime() - runStart;
@@ -3644,13 +5298,20 @@ int main(int argc, char **argv){
     umax=std::max(umax,std::fabs(u[c])); vmaxf=std::max(vmaxf,std::fabs(v[c])); wmaxf=std::max(wmaxf,std::fabs(w[c])); pmax=std::max(pmax,std::fabs(p[c]));
   }
 
+  std::vector<double> scalarField;
+  if(par.scalarEnable != 0){
+    phi.assign(mesh.nFaces, 0.0);
+    copy_device_to_vec(ss.d_phi, phi);
+    scalarField = solve_scalar_after_flow(par, mesh, phi, rank);
+  }
+
   const double forceBenchmarkH = 0.41;
   const double forceUbar = (4.0/9.0) * par.Umean;
   CylinderForceReport cylForce;
   CylinderForceVectorReport cylForceVec;
   PatchForceReport patchForce;
 
-  if(cylinderPatch >= 0){
+  if(par.forceEnable && cylinderPatch >= 0){
     cylForce = compute_cylinder_forces_paper(
         mesh, cylinderPatch, u, v, w, p,
         par.rho, mu, par.pipeDiameter, forceBenchmarkH, forceUbar);
@@ -3701,8 +5362,6 @@ int main(int argc, char **argv){
       std::printf("CL            = %.12e\n", cylForce.CL);
       std::printf("wall dn min/max = %.12e / %.12e\n", cylForce.minWallDistance, cylForce.maxWallDistance);
       std::printf("max|dvt/dn|   = %.12e\n", cylForce.maxAbsDvtDn);
-    } else {
-      std::printf("Cylinder force postprocess skipped: patch_3_0 not found.\n");
     }
 
     if(cylForceVec.valid){
@@ -3731,34 +5390,40 @@ int main(int argc, char **argv){
     if(par.forceEnable){
       std::printf("------------------------------------------------------------\n");
       if(patchForce.valid){
-        std::printf("Patch force postprocess, raw Cartesian wall traction\n");
-        std::printf("force patch       = %s\n", patchForce.patchName.c_str());
-        std::printf("force faces       = %d\n", patchForce.nFaces);
-        std::printf("force area        = %.12e\n", patchForce.area);
-        std::printf("normalSign        = %d\n", patchForce.normalSign);
-        std::printf("rho, mu           = %.12e  %.12e\n", patchForce.rho, patchForce.mu);
+        std::printf("Patch force postprocess, generic wall-shear traction\n");
+        std::printf("force patch      = %s\n", patchForce.patchName.c_str());
+        std::printf("force faces      = %d\n", patchForce.nFaces);
+        std::printf("force area       = %.12e\n", patchForce.area);
+        std::printf("normalSign       = %d\n", patchForce.normalSign);
+        std::printf("rho, mu          = %.12e  %.12e\n", patchForce.rho, patchForce.mu);
+        std::printf("Uref, Aref       = %.12e  %.12e\n", patchForce.Uref, patchForce.Aref);
+        std::printf("coeff denom      = rho*Uref^2*Aref = %.12e\n", patchForce.coeffDenom);
+        std::printf("dragDir          = [%.12e, %.12e, %.12e]\n", patchForce.dragDir[0], patchForce.dragDir[1], patchForce.dragDir[2]);
+        std::printf("liftDir          = [%.12e, %.12e, %.12e]\n", patchForce.liftDir[0], patchForce.liftDir[1], patchForce.liftDir[2]);
+        std::printf("spanDir          = [%.12e, %.12e, %.12e]\n", patchForce.spanDir[0], patchForce.spanDir[1], patchForce.spanDir[2]);
 
-        std::printf("pressureForce     = [%.12e, %.12e, %.12e]\n", patchForce.Fp[0], patchForce.Fp[1], patchForce.Fp[2]);
-        std::printf("viscousForce      = [%.12e, %.12e, %.12e]\n", patchForce.Fv[0], patchForce.Fv[1], patchForce.Fv[2]);
-        std::printf("totalForce        = [%.12e, %.12e, %.12e]\n", patchForce.F[0],  patchForce.F[1],  patchForce.F[2]);
+        std::printf("Fp vector        = [%.12e, %.12e, %.12e]\n", patchForce.Fp[0], patchForce.Fp[1], patchForce.Fp[2]);
+        std::printf("Fv vector        = [%.12e, %.12e, %.12e]\n", patchForce.Fv[0], patchForce.Fv[1], patchForce.Fv[2]);
+        std::printf("F  vector        = [%.12e, %.12e, %.12e]\n", patchForce.F[0],  patchForce.F[1],  patchForce.F[2]);
 
-        std::printf("pressureForce_x   = %.12e\n", patchForce.Fp[0]);
-        std::printf("pressureForce_y   = %.12e\n", patchForce.Fp[1]);
-        std::printf("pressureForce_z   = %.12e\n", patchForce.Fp[2]);
+        std::printf("F_drag pressure  = %.12e\n", patchForce.FpDrag);
+        std::printf("F_drag viscous   = %.12e\n", patchForce.FvDrag);
+        std::printf("F_drag total     = %.12e\n", patchForce.FDrag);
+        std::printf("F_lift pressure  = %.12e\n", patchForce.FpLift);
+        std::printf("F_lift viscous   = %.12e\n", patchForce.FvLift);
+        std::printf("F_lift total     = %.12e\n", patchForce.FLift);
+        std::printf("F_span pressure  = %.12e\n", patchForce.FpSpan);
+        std::printf("F_span viscous   = %.12e\n", patchForce.FvSpan);
+        std::printf("F_span total     = %.12e\n", patchForce.FSpan);
 
-        std::printf("viscousForce_x    = %.12e\n", patchForce.Fv[0]);
-        std::printf("viscousForce_y    = %.12e\n", patchForce.Fv[1]);
-        std::printf("viscousForce_z    = %.12e\n", patchForce.Fv[2]);
-
-        std::printf("totalForce_x      = %.12e\n", patchForce.F[0]);
-        std::printf("totalForce_y      = %.12e\n", patchForce.F[1]);
-        std::printf("totalForce_z      = %.12e\n", patchForce.F[2]);
-
-        std::printf("wall dn min/max   = %.12e / %.12e\n", patchForce.minWallDistance, patchForce.maxWallDistance);
-        std::printf("max|Ut|           = %.12e\n", patchForce.maxUt);
-        std::printf("max shear mag     = %.12e\n", patchForce.maxShearMag);
+        std::printf("C_drag           = %.12e\n", patchForce.CDrag);
+        std::printf("C_lift           = %.12e\n", patchForce.CLift);
+        std::printf("C_span           = %.12e\n", patchForce.CSpan);
+        std::printf("wall dn min/max  = %.12e / %.12e\n", patchForce.minWallDistance, patchForce.maxWallDistance);
+        std::printf("max|Ut|          = %.12e\n", patchForce.maxUt);
+        std::printf("max shear mag    = %.12e\n", patchForce.maxShearMag);
       } else {
-        std::printf("Patch force postprocess requested but skipped. Check forcePatch.\n");
+        std::printf("Patch force postprocess requested but skipped. Check forcePatch, forceUref, forceAreaRef.\n");
         std::printf("requested patch  = %s\n", par.forcePatchName.c_str());
         std::printf("forceUref        = %.12e\n", par.forceUref);
         std::printf("forceAreaRef     = %.12e\n", par.forceAreaRef);
@@ -3837,7 +5502,13 @@ int main(int argc, char **argv){
 
   if(par.write_vtu){
     std::string vtuFile = par.outPrefix + "_final.vtu";
-    write_vtu_polyhedron_cell_data(vtuFile, mesh, {"p","umag","cell_volume","divCorr"}, {p,umag,mesh.vol,divCorr}, "U", &Uvec);
+    std::vector<std::string> scalarNames = {"p","umag","cell_volume","divCorr"};
+    std::vector<std::vector<double>> scalarData = {p,umag,mesh.vol,divCorr};
+    if(!scalarField.empty()){
+      scalarNames.push_back(par.scalarName);
+      scalarData.push_back(scalarField);
+    }
+    write_vtu_polyhedron_cell_data(vtuFile, mesh, scalarNames, scalarData, "U", &Uvec);
     if(rank==0) std::printf("Wrote VTU         : %s\n", vtuFile.c_str());
   }
 
@@ -3848,6 +5519,14 @@ int main(int argc, char **argv){
   sout << "steps " << stepConverged << "\nmassRes " << massRes << "\n";
   sout << "maxAbsU " << umax << "\nmaxAbsV " << vmaxf << "\nmaxAbsW " << wmaxf << "\nmaxAbsP " << pmax << "\n";
   sout << "lastBiCGSTABU " << lastItsU << "\nlastBiCGSTABV " << lastItsV << "\nlastBiCGSTABW " << lastItsW << "\nlastPCG " << lastItsP << "\n";
+  if(!scalarField.empty()){
+    auto mnmx = std::minmax_element(scalarField.begin(), scalarField.end());
+    sout << "scalarName " << par.scalarName << "\n";
+    sout << "scalarMin " << *mnmx.first << "\n";
+    sout << "scalarMax " << *mnmx.second << "\n";
+    sout << "scalarConvectionScheme " << par.scalarConvectionScheme << "\n";
+    sout << "scalarGamma " << par.scalarGamma << "\n";
+  }
   if(cylForce.valid){
     sout << "cylinderForcePatch " << cylForce.patchName << "\n";
     sout << "cylinderForceFaces " << cylForce.nFaces << "\n";
@@ -3883,24 +5562,26 @@ int main(int argc, char **argv){
     sout << "FzTotalVector " << cylForceVec.F[2] << "\n";
   }
   if(patchForce.valid){
-    sout << "patchForcePatch " << patchForce.patchName << "\n";
-    sout << "patchForceFaces " << patchForce.nFaces << "\n";
-    sout << "patchForceArea " << patchForce.area << "\n";
-    sout << "patchForceNormalSign " << patchForce.normalSign << "\n";
-
-    sout << "pressureForce_x " << patchForce.Fp[0] << "\n";
-    sout << "pressureForce_y " << patchForce.Fp[1] << "\n";
-    sout << "pressureForce_z " << patchForce.Fp[2] << "\n";
-
-    sout << "viscousForce_x " << patchForce.Fv[0] << "\n";
-    sout << "viscousForce_y " << patchForce.Fv[1] << "\n";
-    sout << "viscousForce_z " << patchForce.Fv[2] << "\n";
-
-    sout << "totalForce_x " << patchForce.F[0] << "\n";
-    sout << "totalForce_y " << patchForce.F[1] << "\n";
-    sout << "totalForce_z " << patchForce.F[2] << "\n";
+    sout << "genericForcePatch " << patchForce.patchName << "\n";
+    sout << "genericForceFaces " << patchForce.nFaces << "\n";
+    sout << "genericForceArea " << patchForce.area << "\n";
+    sout << "genericForceNormalSign " << patchForce.normalSign << "\n";
+    sout << "genericForceUref " << patchForce.Uref << "\n";
+    sout << "genericForceAref " << patchForce.Aref << "\n";
+    sout << "genericForceCoeffDenom " << patchForce.coeffDenom << "\n";
+    sout << "genericFxPressure " << patchForce.Fp[0] << "\n";
+    sout << "genericFyPressure " << patchForce.Fp[1] << "\n";
+    sout << "genericFzPressure " << patchForce.Fp[2] << "\n";
+    sout << "genericFxViscous " << patchForce.Fv[0] << "\n";
+    sout << "genericFyViscous " << patchForce.Fv[1] << "\n";
+    sout << "genericFzViscous " << patchForce.Fv[2] << "\n";
+    sout << "genericFxTotal " << patchForce.F[0] << "\n";
+    sout << "genericFyTotal " << patchForce.F[1] << "\n";
+    sout << "genericFzTotal " << patchForce.F[2] << "\n";
+    sout << "genericCDrag " << patchForce.CDrag << "\n";
+    sout << "genericCLift " << patchForce.CLift << "\n";
+    sout << "genericCSpan " << patchForce.CSpan << "\n";
   }
-
   sout.close();
 
   destroy_momentum_system(mom);

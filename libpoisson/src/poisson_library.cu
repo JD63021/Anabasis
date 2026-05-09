@@ -6,9 +6,7 @@ EllipticResult solve_scalar_elliptic(
     const std::vector<double>& cellSource,
     const ScalarBCSet& bcSet,
     const EllipticOptions& opts) {
-  if (opts.gradScheme != "lsq") {
-    throw std::runtime_error("Only gradScheme=lsq is implemented in this build.");
-  }
+  const GradientScheme gradScheme = gradient_scheme_from_string(opts.gradScheme);
   if (opts.laplacianScheme != "orth" && opts.laplacianScheme != "nonorth") {
     throw std::runtime_error("Use laplacianScheme=orth or laplacianScheme=nonorth.");
   }
@@ -32,7 +30,7 @@ EllipticResult solve_scalar_elliptic(
   }
 
   for (int outer = 0; outer < nOuter; ++outer) {
-    compute_lsq_gradient(mesh, phi, bcFaceData, grad);
+    compute_gradient(mesh, phi, bcFaceData, gradScheme, grad);
     assemble_scalar_elliptic_system(
         mesh, pat, gammaFace, cellSource, bcFaceData, grad,
         values, rhs, includeNonOrth,

@@ -14,6 +14,7 @@ struct Mesh {
   std::vector<std::vector<int>> faces;
   std::vector<int> owner, neigh, bPatch;
   std::vector<std::string> patchNames;
+  std::vector<int> patchStartFace, patchNFaces;
   int nFaces = 0;
   int nInternalFaces = 0;
   int nCells = 0;
