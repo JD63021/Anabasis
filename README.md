@@ -1,210 +1,149 @@
-# Anabasis v0
+# Anabasis
 
-Anabasis v0 is an early CUDA/HYPRE finite-volume CFD solver checkpoint focused on a GPU-accelerated SIMPLE-style incompressible-flow loop using OpenFOAM polyMesh input.
+Anabasis is a journey towards a modular GPU finite-volume codebase for CFD and transport problems.
 
-The current recommended app is:
+The current public focus is a CUDA/HYPRE steady incompressible SIMPLE solver that reads OpenFOAM `polyMesh` meshes and runtime boundary conditions from a flat `.case` file. The code is being organized toward a modular PDE-solver layout with separate flow, Poisson, and scalar-transport options.
 
-    apps/generic_simple_v1
+## Current solver
 
-It reads an OpenFOAM constant/polyMesh, applies runtime boundary conditions from a .case file, solves the steady incompressible SIMPLE loop on the GPU, writes VTU output, and can integrate raw Cartesian forces over any named wall patch.
+The main application is:
 
----
+```text
+apps/simple_gpu
+```
 
-## Current validated example
+Direct-build executable:
 
-The repository includes a small cylinder/channel polyhedral mesh:
+```text
+./simple_gpu
+```
 
-    examples/cylinder/constant/polyMesh
+The solver currently supports:
 
-and a matching case file:
+- Steady segregated SIMPLE incompressible flow.
+- OpenFOAM-inspired absolute-pressure/HbyA mode:
 
-    cases/cylinder.case
+  ```text
+  pMode absolute
+  pSolveMode ofAbsolute
+  rcMode oflike
+  pGradScheme gauss
+  ```
 
-This example uses:
+- CUDA assembly and GPU linear solves through HYPRE/PETSc linkage.
+- Runtime velocity and pressure boundary conditions from the `.case` file.
+- Momentum convection choice:
 
-- patch_1_0 as inlet
-- patch_2_0 as outlet
-- patch_0_0 and patch_5_0 as outer no-slip walls
-- patch_3_0 as the cylinder wall and force-integration patch
+  ```text
+  momentumConvectionScheme central
+  momentumConvectionScheme upwind
+  ```
 
-The case validates the current runtime BC system and generic raw Cartesian force output.
+- Poisson module gradient choice:
 
----
+  ```text
+  poissonGradientScheme gauss
+  poissonGradientScheme lsq
+  ```
 
-## Build
+- Passive scalar transport module options, including:
 
-Example local build for RTX 3060 / CUDA architecture 86:
+  ```text
+  scalarConvectionScheme upwind
+  scalarConvectionScheme central
+  ```
 
-    cd ~/anabasis_v0
+- Optional cylinder / patch force postprocessing, enabled only by:
 
-    cmake -S . -B build \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_CUDA_ARCHITECTURES=86
+  ```text
+  forceEnable 1
+  ```
 
-    cmake --build build --target generic_simple_v1 -j"$(nproc)"
+## Repository layout
 
-The GPU path requires a CUDA-enabled HYPRE build. A CPU-only HYPRE build is not sufficient for the intended GPU solver path.
+```text
+apps/simple_gpu/       Main SIMPLE flow solver app
+libpoisson/            Mesh, BC, gradient, HYPRE, and Poisson/elliptic utilities
+libscalar/             Passive scalar transport library
+cases/reference.case   Verbose documented reference case
+cases/cylinder.case    Cylinder benchmark case
+docs/INSTALL.md        Build notes for RTX 3060 and A100
+docs/RUN_CYLINDER.md   Full cylinder run command
+build_simple_gpu.sh    Direct NVCC build script
+```
 
-If you use a PETSc-installed HYPRE, set your PETSc/HYPRE environment before configuring, for example:
+## Build on RTX 3060
 
-    export PETSC_DIR=$HOME/src/petsc
-    export PETSC_ARCH=arch-linux-cuda-opt
-    export HYPRE_ROOT=$PETSC_DIR/$PETSC_ARCH
-    export HYPRE_DIR=$PETSC_DIR/$PETSC_ARCH
-    export LD_LIBRARY_PATH=$PETSC_DIR/$PETSC_ARCH/lib:$LD_LIBRARY_PATH
+```bash
+cd ~/anabasis_v1_1
 
-For A100, use CUDA architecture 80 instead of 86.
+export PETSC_DIR=$HOME/src/petsc
+export PETSC_ARCH=arch-linux-cuda-opt
+export LD_LIBRARY_PATH="$PETSC_DIR/$PETSC_ARCH/lib:${LD_LIBRARY_PATH:-}"
 
----
+SM_ARCH=sm_86 ./build_simple_gpu.sh
+```
 
-## Run the cylinder example
+## Build on A100
 
-    cd ~/anabasis_v0
+```bash
+cd ~/anabasis_v1_1
 
-    mpirun -n 1 ./build/apps/generic_simple_v1/generic_simple_v1 \
-      -case-config cases/cylinder.case
+export PETSC_DIR=$HOME/src/petsc
+export PETSC_ARCH=arch-linux-cuda-opt
+export LD_LIBRARY_PATH="$PETSC_DIR/$PETSC_ARCH/lib:${LD_LIBRARY_PATH:-}"
 
-The solver prints:
+SM_ARCH=sm_80 ./build_simple_gpu.sh
+```
 
-- mesh statistics
-- all detected boundary patches
-- runtime BC patch coverage
-- SIMPLE iteration history
-- final residual summary
-- raw Cartesian force output
-- VTU output path
+## Run the cylinder case
 
-The final VTU file can be opened in ParaView.
+The mesh should be available at:
 
----
+```text
+/tmp/meshCase/constant/polyMesh
+```
 
-## Runtime boundary conditions
+Run:
 
-Every boundary patch in the OpenFOAM polyMesh/boundary file must have exactly one velocity BC and one pressure BC.
+```bash
+cd ~/anabasis_v1_1
 
-Example:
+mkdir -p runs/cylinder
 
-    velocity patch_0_0 wall_noslip
-    velocity patch_5_0 wall_noslip
-    velocity patch_3_0 wall_noslip
-    velocity patch_1_0 parabolic_box_inlet 0.41 0.45 y z average_patch_normal
-    velocity patch_2_0 zero_gradient
+mpirun -n 1 ./simple_gpu \
+  -case-config cases/cylinder.case \
+  -out-prefix runs/cylinder/case \
+  2>&1 | tee runs/cylinder/run.log
+```
 
-    pressure patch_0_0 zero_gradient
-    pressure patch_5_0 zero_gradient
-    pressure patch_3_0 zero_gradient
-    pressure patch_1_0 zero_gradient
-    pressure patch_2_0 fixed_value 0.0
+Check the force output:
 
-Supported velocity BCs currently include:
+```bash
+grep -E "Ubar, D, H|CD_vector|CL_y_vector|CL_z_vector|Wrote VTU" runs/cylinder/run.log
+```
 
-    velocity <patch> wall_noslip
-    velocity <patch> zero_gradient
-    velocity <patch> fixed_uniform_vector <ux> <uy> <uz>
-    velocity <patch> fixed_normal_speed <value> [average_patch_normal|local_face_normal]
-    velocity <patch> fixed_flow_rate <value> [average_patch_normal|local_face_normal]
-    velocity <patch> parabolic_box_inlet <H> <Umax> <coord1> <coord2> [average_patch_normal|local_face_normal]
+## Case files
 
-Supported pressure BCs currently include:
+The case format is intentionally flat key/value text. Sections such as `[mesh/output]`, `[physics/fluid]`, `[Poisson module options]`, and `[Scalar transport module options]` are comments only. They are there to make future multiphysics additions easier without changing the parser.
 
-    pressure <patch> zero_gradient
-    pressure <patch> fixed_value <value>
-    pressure <patch> open
+Use `cases/reference.case` as the documented template and `cases/cylinder.case` as the cylinder benchmark run file.
 
-If any patch is missing a velocity or pressure BC, generic_simple_v1 aborts and prints a patch coverage table.
+## Notes
 
----
+For the OpenFOAM-like absolute-pressure path, keep:
 
-## Raw Cartesian force integration
+```text
+pSolveMode ofAbsolute
+rcMode oflike
+pGradScheme gauss
+```
 
-The generic force postprocessor integrates pressure and viscous traction over a named patch.
+Avoid:
 
-Example:
+```text
+pSolveMode ofAbsolute
+rcMode old
+```
 
-    forceEnable 1
-    forcePatch patch_3_0
-    forceNormalSign -1
-
-The output is dimensional Cartesian force, not drag/lift coefficient:
-
-    pressureForce     = [Fx, Fy, Fz]
-    viscousForce      = [Fx, Fy, Fz]
-    totalForce        = [Fx, Fy, Fz]
-
-    pressureForce_x   = ...
-    pressureForce_y   = ...
-    pressureForce_z   = ...
-
-    viscousForce_x    = ...
-    viscousForce_y    = ...
-    viscousForce_z    = ...
-
-    totalForce_x      = ...
-    totalForce_y      = ...
-    totalForce_z      = ...
-
-This is intentionally general and does not require a cylinder diameter, reference velocity, reference area, drag direction, or lift direction.
-
----
-
-## Numerical method summary
-
-The current generic_simple_v1 app implements a steady SIMPLE-like segregated incompressible finite-volume algorithm.
-
-Each outer iteration does approximately:
-
-1. Apply runtime boundary conditions.
-2. Assemble and solve scalar momentum equations for u, v, and w.
-3. Extract rAU = V/aP.
-4. Build Rhie-Chow-style predicted face fluxes.
-5. Assemble/update the pressure equation.
-6. Solve pressure correction using HYPRE PCG + BoomerAMG.
-7. Apply pressure non-orthogonal correction loops.
-8. Correct face fluxes.
-9. Update pressure.
-10. Correct velocity using pressure-correction gradients.
-11. Check continuity and field-change convergence.
-
-The current validated path is steady laminar incompressible flow.
-
----
-
-## Output
-
-With:
-
-    writeVtu 1
-    writeEvery 0
-
-the solver writes a final VTU file.
-
-The example cylinder case writes:
-
-    runs/cylinder_final.vtu
-
-Open this file in ParaView.
-
----
-
-## Current limitations
-
-- Single MPI rank only.
-- No domain-decomposed multi-rank CFD yet.
-- Current focus is steady laminar incompressible SIMPLE.
-- Runtime BC support is useful but not yet a full OpenFOAM-style dictionary system.
-- HYPRE must be CUDA-enabled for the GPU path.
-- The codebase is still a research/development checkpoint.
-
----
-
-## Development direction
-
-Near-term goals:
-
-- keep generic_simple_v1 as the clean main SIMPLE app
-- remove older cylinder-specific print blocks from the generic app
-- improve force-output file handling
-- add more boundary-condition variants
-- add stronger validation cases
-- modularize solver kernels further
-- later add RANS/turbulence support
+That combination was unstable in development because the old explicit Rhie-Chow pressure term conflicts with the OpenFOAM-style absolute pressure flux path.

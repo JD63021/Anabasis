@@ -9,11 +9,11 @@ PETSC_ARCH=${PETSC_ARCH:-arch-linux-cuda-opt}
 SM_ARCH=${SM_ARCH:-sm_86}
 
 SRC_APP=(
-  apps/generic_simple_v2/src/main.cu
-  apps/generic_simple_v2/src/bc_specs.cu
-  apps/generic_simple_v2/src/patch_geometry.cu
-  apps/generic_simple_v2/src/velocity_bc_eval.cu
-  apps/generic_simple_v2/src/bc_runtime_config.cu
+  apps/simple_gpu/src/main.cu
+  apps/simple_gpu/src/bc_specs.cu
+  apps/simple_gpu/src/patch_geometry.cu
+  apps/simple_gpu/src/velocity_bc_eval.cu
+  apps/simple_gpu/src/bc_runtime_config.cu
 )
 SRC_LIBPOISSON=(
   libpoisson/src/poisson_library.cu
@@ -27,8 +27,8 @@ SRC_LIBSCALAR=(
   libscalar/src/scalar_transport_library.cu
 )
 
-EXE=generic_simple_v2_direct
-LOG=build_generic_simple_v2_direct.log
+EXE=simple_gpu
+LOG=build_simple_gpu.log
 
 MPI_COMPILE="$(mpicxx --showme:compile 2>/dev/null || true)"
 MPI_LINK="$(mpicxx --showme:link 2>/dev/null || true)"
@@ -38,7 +38,7 @@ rm -f "$EXE"
 "$NVCC" -std=c++17 -O3 \
   -arch="$SM_ARCH" \
   -ccbin "$(command -v mpicxx)" \
-  -Iapps/generic_simple_v2/src \
+  -Iapps/simple_gpu/src \
   -Ilibpoisson/include \
   -Ilibscalar/include \
   -I"$PETSC_DIR/$PETSC_ARCH/include" \

@@ -1,33 +1,17 @@
+# Build and run outputs
 build/
-build_*/
-runs/
-*.vtu
-*.pvd
-*.log
-*.o
-*.so
-*.a
-*.tmp
-*.bak
-*.bak_*
-*.before_*
-*.generated.bc
-__pycache__/
-.DS_Store
-*.pre_*
-*.pre*
-
-# Local generated binaries and run outputs
-generic_simple_v2_direct
+build_mms/
 runs/
 *.log
 *.vtu
 *.vtp
 *.csv
 
-# Local patch/scratch bundles
-generic_simple_v2_patch_bundle/
-apps/archive/
-apps/generic_simple_pseudo_v1/
+# Direct-build executable
+/simple_gpu
+
+# Local/editor/backup files
 *.bak*
-*.broken_before_clean_repatch
+*.generated.bc
+__pycache__/
+.DS_Store

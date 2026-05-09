@@ -1,439 +1,244 @@
-# reference.case
-# ==============================================================================
-# generic_simple_v2 complete reference case file
-# ==============================================================================
-# Usage:
-#   cd ~/anabasis_v0
-#   mkdir -p runs/reference
-#   mpirun -n 1 ./generic_simple_v2_direct \
-#     -case-config cases/reference.case \
-#     -out-prefix runs/reference/case \
-#     2>&1 | tee runs/reference/run.log
+# ======================================================================
+# Anabasis v1.1 reference case file
+# ======================================================================
+# The parser uses a flat key/value format. The bracketed headings are only
+# organization for humans and for the future modular PDE solver layout.
 #
-# Notes:
-#   - One active value is provided for each commonly supported generic_simple_v2 key.
-#   - Alternatives are written directly above each entry.
-#   - Keep only patch names that actually exist in the current polyMesh boundary file.
-#   - For pipe/spiral, patch_3_0 may not exist. Comment out cylinder-wall BCs and forcePatch.
-#   - For cylinder, patch_3_0 is usually the cylinder wall / force patch.
-#   - If a key is rejected by your build, your parser is older than the latest v2 patch.
-# ==============================================================================
+# Recommended robust SIMPLE pair:
+#   pSolveMode ofAbsolute
+#   rcMode oflike
+#   pGradScheme gauss
+#
+# Avoid:
+#   pSolveMode ofAbsolute
+#   rcMode old
+# ======================================================================
 
-
-# ==============================================================================
-# 1. Mesh and output
-# ==============================================================================
-
-# polyMeshDir:
-#   /tmp/meshCase/constant/polyMesh
-#   examples/cylinder/constant/polyMesh
-#   any OpenFOAM constant/polyMesh directory
+# ----------------------------------------------------------------------
+# [mesh/output]
+# ----------------------------------------------------------------------
+# OpenFOAM polyMesh directory.
 polyMeshDir /tmp/meshCase/constant/polyMesh
 
-# outPrefix:
-#   Prefix for final VTU and audit outputs.
-#   Make sure the parent directory exists, or override on command line with -out-prefix.
+# Output prefix. Final VTU becomes <outPrefix>_final.vtu.
 outPrefix runs/reference/case
 
-# device:
-#   0 = first CUDA GPU
-#   1,2,... = other CUDA devices if present
+# CUDA device id.
 device 0
 
+# Output and profiling.
+writeVtu 1
+writeEvery 0
+monitor 1
+profileSteps 0
 
-# ==============================================================================
-# 2. Physical parameters
-# ==============================================================================
-
-# rho:
-#   Density.
+# ----------------------------------------------------------------------
+# [physics/fluid]
+# ----------------------------------------------------------------------
 rho 1.0
-
-# mu:
-#   Direct viscosity/dynamic viscosity used by the solver.
-#   Pipe low-Re/Stokes-like debug: 1e5 with Umean 1e-3
-#   Cylinder Re~20 style case: 0.001 with Umean 0.45 and D=0.1
-#   Pipe moderate case: 0.05 with Umean 1.0 and D=0.05
 mu 0.001
-
-# Umean:
-#   Mean/reference inlet velocity.
-#   Pipe/spiral very-low-speed debug: 1.0e-3
-#   Pipe U=1 case: 1.0
-#   Cylinder benchmark-style case: 0.45
 Umean 0.45
 
-# pipeD:
-#   Reference diameter/length scale.
-#   Pipe: 0.05
-#   Cylinder: 0.1
+# Characteristic dimensions. These are harmless for generic cases and are
+# used by pipe/cylinder postprocessing when enabled.
 pipeD 0.1
-
-# pipeL:
-#   Reference length.
-#   Pipe: 0.5
-#   Cylinder channel length used in earlier cases: 2.5
 pipeL 2.5
 
-
-# ==============================================================================
-# 3. Patch role aliases
-# ==============================================================================
-# These are convenience aliases used by app logic and audits.
-# Every active runtime BC below must still match actual mesh patch names.
-
-# wallPatch:
-#   Pipe/spiral/cylinder channel walls often patch_0_0
+# ----------------------------------------------------------------------
+# [patch aliases]
+# ----------------------------------------------------------------------
+# These are summary/helper aliases. The actual runtime BC lines below are
+# the decisive boundary conditions.
 wallPatch patch_0_0
-
-# inletPatch:
-#   Pipe often patch_1_0 or patch_2_0 depending on direction.
-#   Cylinder examples often patch_1_0.
 inletPatch patch_1_0
-
-# outletPatch:
-#   Pipe often patch_2_0 or patch_1_0 depending on direction.
-#   Cylinder examples often patch_2_0.
 outletPatch patch_2_0
 
+# ----------------------------------------------------------------------
+# [SIMPLE outer loop]
+# ----------------------------------------------------------------------
+nsteps 500
+printEvery 10
+corrTol 1e-10
+tolMass 1e-3
+tolVel 1e-3
 
-# ==============================================================================
-# 4. Run length, output, and monitoring
-# ==============================================================================
-
-# nsteps:
-#   Maximum SIMPLE outer iterations.
-nsteps 1000
-
-# printEvery:
-#   Print every N outer iterations.
-#   Use 1 for debugging, 5/20 for normal runs.
-printEvery 20
-
-# writeVtu:
-#   0 = no VTU
-#   1 = write final VTU, and optionally intermediate VTUs if writeEvery > 0
-writeVtu 1
-
-# writeEvery:
-#   0 = final only
-#   N = write every N iterations
-writeEvery 0
-
-# monitor:
-#   0 = off
-#   1 = extra monitor/force output if available
-monitor 1
-
-
-# ==============================================================================
-# 5. Geometry, gradient, and pressure-delta formulation
-# ==============================================================================
-
-# geomMethod:
-#   legacy = v1-style geometry/volume path; use for v1 head-to-head matching.
-#   robust = robust triangulated polygon/cell geometry; use for difficult polyMesh.
-geomMethod legacy
-
-# lsqStencil:
-#   compact  = face-neighbor LSQ stencil.
-#   extended = second-ring stencil; heavier memory, sometimes smoother on bad meshes.
-lsqStencil compact
-
-# lsqWeightPower:
-#   1 = weights 1/|d|; common robust/OpenFOAM-like testing value.
-#   2 = weights 1/|d|^2; closer to previous v1 cylinder behavior.
-lsqWeightPower 2
-
-# pDeltaMode:
-#   legacy = v1-compatible signed pressure delta, approximately 1/(n.d).
-#   of     = OpenFOAM-like stabilized delta, 1/max(n.d, pDeltaMinCos*|d|).
-#   For v1-matching cylinder: legacy.
-#   For difficult non-orthogonal complex geometry: of.
-pDeltaMode legacy
-
-# pDeltaMinCos:
-#   Used by pDeltaMode of.
-#   Typical OpenFOAM-like floor: 0.05.
-pDeltaMinCos 0.05
-
-
-# ==============================================================================
-# 6. SIMPLE / pressure-velocity coupling choices
-# ==============================================================================
-
-# pMode:
-#   pcorr    = pressure-correction formulation; v1-compatible path.
-#   absolute = absolute-pressure / HbyA-style path; often more robust on complex cases.
-pMode pcorr
-
-# rcMode:
-#   old    = old explicit Rhie-Chow pressure consistency term.
-#   oflike = OpenFOAM/Chalmers-style no explicit old RC term in phi predictor.
-rcMode old
-
-# rAUMode:
-#   raw     = V/aP_raw.
-#   relaxed = V/aP_relaxed; useful for v1 matching.
-rAUMode relaxed
-
-# pCoeffScale:
-#   Pressure matrix coefficient multiplier.
-#   Keep 1 for real runs. Use 0.9/1.1 only as diagnostics.
-pCoeffScale 1
-
-# momNonOrthScale:
-#   Momentum non-orthogonal correction scale.
-#   0 = off.
-#   1 = on / v1-like.
-momNonOrthScale 1
-
-# pNonOrthScale:
-#   Pressure non-orthogonal correction scale.
-#   0 = off.
-#   1 = on / v1-like.
-pNonOrthScale 1
-
-# divDevScale:
-#   0 = disable extra divDev contribution if supported by your build.
-#   1 = normal/default.
-divDevScale 1
-
-# HbyABcMode:
-#   unconstrained = default/unconstrained HbyA boundary extrapolation if supported.
-#   constrained   = fixed-velocity boundary flux/HbyA constrained path; useful for absolute robust mode.
-#   If your parser rejects this key, leave it as a command-line option or remove it.
-HbyABcMode constrained
-
-# adjustPhi:
-#   0 = off.
-#   1 = OpenFOAM-like global flux adjustment if implemented in your build.
-adjustPhi 0
-
-# fixedUFluxLock:
-#   0 = off.
-#   1 = lock fixed-velocity patch fluxes if implemented in your build.
-fixedUFluxLock 0
-
-
-# ==============================================================================
-# 7. SIMPLE correction counts and relaxation
-# ==============================================================================
-
-# nVelNonOrthCorr:
-#   Velocity non-orthogonal correctors.
-#   Usually 0.
-nVelNonOrthCorr 0
-
-# nNonOrthCorr:
-#   Pressure non-orthogonal correctors.
-#   0 = fastest.
-#   1 = common cylinder/v1 comparison.
-#   3-5 = sometimes stabilizes difficult high non-orthogonal meshes.
-nNonOrthCorr 1
-
-# nPressureCorr:
-#   Extra pressure correctors.
-#   Usually 0 for SIMPLE-like steady runs.
-nPressureCorr 0
-
-# uRelax:
-#   Velocity under-relaxation.
-#   Common: 0.7
-#   More conservative: 0.5 or 0.3
-uRelax 0.5
-
-# pRelax:
-#   Pressure under-relaxation.
-#   Common: 0.3
-#   More conservative: 0.1
-#   Sometimes 0.5 works for easier pipe cases.
+uRelax 0.7
 pRelax 0.3
 
+# ----------------------------------------------------------------------
+# [geometry / reconstruction]
+# ----------------------------------------------------------------------
+# geomMethod:
+#   robust = robust triangulated polygon/cell geometry path
+#   legacy = older geometry path
+geomMethod robust
 
-# ==============================================================================
-# 8. Convergence tolerances
-# ==============================================================================
+# LSQ settings used by old-field gradient/reconstruction paths.
+# lsqStencil extended may be accepted for compatibility, but compact is the
+# normal path in this public solver.
+lsqStencil compact
+lsqWeightPower 1
 
-# corrTol:
-#   Internal correction tolerance, if used.
-corrTol 1e-10
+# ----------------------------------------------------------------------
+# [pressure-velocity coupling]
+# ----------------------------------------------------------------------
+# pMode:
+#   absolute = absolute pressure mode
+#   pcorr    = correction mode
+pMode absolute
 
-# tolMass:
-#   Stopping tolerance for continuity/mass residual.
-#   Engineering/convenience: 1e-3
-#   Strict comparison: 1e-6 or 1e-7
-tolMass 1e-7
+# pSolveMode:
+#   ofAbsolute = OpenFOAM-like HbyA/absolute-pressure path
+#   correction = older correction-style path
+pSolveMode ofAbsolute
 
-# tolVel:
-#   Stopping tolerance for velocity relative changes.
-#   Engineering/convenience: 1e-3
-#   Strict comparison: 1e-6 or 1e-7
-tolVel 1e-7
+# rcMode:
+#   oflike = no old explicit RC term in predictor flux; use with ofAbsolute
+#   old    = old explicit pressure-consistency term; use only with correction mode
+rcMode oflike
 
+# pGradScheme controls the SIMPLE pressure-gradient path:
+#   gauss = Gauss/Green-Gauss pressure gradient, robust OpenFOAM-like default
+#   lsq   = least-squares pressure gradient, useful for comparison
+pGradScheme gauss
 
-# ==============================================================================
-# 9. Momentum linear solver controls
-# ==============================================================================
+# rAU mode:
+#   raw     = V/aP_raw
+#   relaxed = V/aP_relaxed
+rAUMode raw
+pCoeffScale 1
 
-# velMaxit:
-#   Max BiCGSTAB iterations for each velocity component.
-velMaxit 1000
+# pDeltaMode:
+#   of     = OpenFOAM-style 1/max(n.d, pDeltaMinCos*|d|)
+#   legacy = older/v1-style delta behavior
+pDeltaMode of
+pDeltaMinCos 0.05
 
-# velTol:
-#   Absolute velocity linear-solver tolerance.
-velTol 1e-10
+# ----------------------------------------------------------------------
+# [momentum / pressure discretization]
+# ----------------------------------------------------------------------
+# momNonOrthScale controls explicit momentum cross-diffusion correction.
+# 0 is robust/orthogonal-only; 0.3/0.5/1 can be tested for pressure-drop match.
+momNonOrthScale 0
 
-# velRelTol:
-#   Relative velocity linear-solver tolerance.
-#   0 = force absolute tolerance.
-#   1e-10 = strict relative solve in some monolithic experiments.
-velRelTol 0
+# Momentum convection scheme:
+#   central = central/linear face value
+#   upwind  = first-order upwind using the current face flux sign
+momentumConvectionScheme central
 
+# Pressure non-orthogonal explicit correction amplitude.
+pNonOrthScale 0
 
-# ==============================================================================
-# 10. Pressure linear solver / AMG controls
-# ==============================================================================
+# Repeated correction loops.
+nVelNonOrthCorr 0
+nNonOrthCorr 0
+nPressureCorr 0
 
-# pUseAmg:
-#   1 = BoomerAMG preconditioned PCG.
-#   0 = no AMG path if your build supports fallback.
+# ----------------------------------------------------------------------
+# [initialization]
+# ----------------------------------------------------------------------
+# initMode:
+#   uniform   = uniform inlet-average startup
+#   potential = potential/projection startup when enabled in the app
+initMode uniform
+potentialInitRAU 1.0
+potentialInitMaxit 4000
+potentialInitTol 1e-10
+potentialInitRelTol 0.0
+potentialInitWrite 0
+
+# ----------------------------------------------------------------------
+# [linear solvers]
+# ----------------------------------------------------------------------
+velMaxit 2000
+velTol 0
+velRelTol 1e-10
+
 pUseAmg 1
-
-# pMaxit:
-#   Max pressure PCG iterations.
 pMaxit 4000
-
-# pTol:
-#   Absolute pressure solver tolerance.
-pTol 1e-10
-
-# pRelTol:
-#   Relative pressure solver tolerance.
-#   0 = force absolute tolerance.
-pRelTol 0
-
-# pAmgCoarsenType:
-#   8 commonly used in the monolithic runs.
+pTol 1e-12
+pRelTol 0.0
 pAmgCoarsenType 8
-
-# pAmgInterpType:
-#   6 commonly used in the monolithic runs.
 pAmgInterpType 6
-
-# pAmgAggLevels:
-#   0 or 1.
-#   1 often used.
 pAmgAggLevels 1
-
-# pAmgRelaxType:
-#   7 commonly used in the case files.
 pAmgRelaxType 7
-
-# pAmgKeepTranspose:
-#   0 = off
-#   1 = on; usually used.
 pAmgKeepTranspose 1
+pAmgRebuildEvery 1
 
-# pAmgRebuildEvery:
-#   1  = rebuild every SIMPLE iteration; robust but expensive.
-#   10 = useful cylinder/v1 comparison.
-#   500 = old generic case default, but may be less robust across changing matrices.
-pAmgRebuildEvery 10
+# ----------------------------------------------------------------------
+# [Poisson module options]
+# ----------------------------------------------------------------------
+# These are module-level options for Poisson/potential/scalar elliptic solves.
+# libpoisson supports selectable gradients:
+#   poissonGradientScheme gauss
+#   poissonGradientScheme lsq
+poissonGradientScheme gauss
+poissonLaplacianScheme nonorth
+poissonNonOrthCorr 2
 
+# ----------------------------------------------------------------------
+# [Scalar transport module options]
+# ----------------------------------------------------------------------
+# scalarEnable 0 keeps this as a pure flow run.
+# scalarEnable 1 solves a passive scalar after the flow solve by default.
+scalarEnable 0
+scalarSolveMode afterFlow
+scalarName T
 
-# ==============================================================================
-# 11. Runtime boundary conditions
-# ==============================================================================
-# Every actual polyMesh boundary patch should have one velocity and one pressure BC.
-#
-# Velocity BC forms used so far:
-#   velocity <patch> wall_noslip
-#   velocity <patch> fixed_normal_speed <speed>
-#   velocity <patch> zero_gradient
-#   velocity <patch> parabolic_box_inlet <H> <Umean> <coord1> <coord2> average_patch_normal
-#
-# Pressure BC forms used so far:
-#   pressure <patch> zero_gradient
-#   pressure <patch> fixed_value <value>
-#
-# Pipe / spiral normal-inlet example:
-#   velocity patch_0_0 wall_noslip
-#   velocity patch_1_0 fixed_normal_speed -1e-3
-#   velocity patch_2_0 zero_gradient
-#   pressure patch_0_0 zero_gradient
-#   pressure patch_1_0 zero_gradient
-#   pressure patch_2_0 fixed_value 0.0
-#
-# Cylinder example below assumes patch_3_0 exists and is the cylinder wall.
+# Scalar convection scheme exposed from libscalar:
+#   scalarConvectionScheme upwind
+#   scalarConvectionScheme central
+scalarConvectionScheme upwind
 
+scalarDiffusionScheme nonorth
+scalarGamma 1.0
+scalarRelax 1.0
+scalarNonOrthCorr 2
+scalarMaxit 4000
+scalarTol 1e-10
+scalarRelTol 0.0
+
+# Scalar BC syntax, used when scalarEnable 1:
+#   scalar patch_0_0 zero_gradient
+#   scalar patch_1_0 fixed_value 1.0
+#   scalar patch_2_0 zero_gradient
+
+# ----------------------------------------------------------------------
+# [velocity boundary conditions]
+# ----------------------------------------------------------------------
 velocity patch_0_0 wall_noslip
 velocity patch_3_0 wall_noslip
 velocity patch_1_0 parabolic_box_inlet 0.41 0.45 y z average_patch_normal
 velocity patch_2_0 zero_gradient
 
+# ----------------------------------------------------------------------
+# [pressure boundary conditions]
+# ----------------------------------------------------------------------
 pressure patch_0_0 zero_gradient
 pressure patch_3_0 zero_gradient
 pressure patch_1_0 zero_gradient
 pressure patch_2_0 fixed_value 0.0
 
-
-# ==============================================================================
-# 12. Force integration
-# ==============================================================================
-# forceEnable:
-#   0 = off
-#   1 = on
-forceEnable 1
-
-# forcePatch:
-#   Cylinder wall patch, commonly patch_3_0.
-#   For pipe/spiral cases without patch_3_0, either remove this section or set forceEnable 0.
+# ----------------------------------------------------------------------
+# [force postprocessing]
+# ----------------------------------------------------------------------
+# forceEnable 0 disables force output. Set 1 for cylinder/patch-force output.
+forceEnable 0
 forcePatch patch_3_0
-
-# forceNormalSign:
-#   +1 or -1 depending on force normal convention.
-#   Earlier cylinder cases used -1.
 forceNormalSign -1
+forceUref 0.2
+forceAreaRef 0.041
+forceDragDir 1,0,0
+forceLiftDir 0,0,1
+forceSpanDir 0,1,0
 
-
-# ==============================================================================
-# 13. Quick preset notes
-# ==============================================================================
-# V1-compatible cylinder preset:
-#   geomMethod legacy
-#   lsqStencil compact
-#   lsqWeightPower 2
-#   pDeltaMode legacy
-#   pMode pcorr
-#   rcMode old
-#   rAUMode relaxed
-#   momNonOrthScale 1
-#   pNonOrthScale 1
-#   nNonOrthCorr 1
-#   uRelax 0.5
-#   pRelax 0.3
-#
-# Robust complex-geometry preset:
-#   geomMethod robust
-#   lsqStencil compact
-#   lsqWeightPower 1
-#   pDeltaMode of
-#   pDeltaMinCos 0.05
-#   pMode absolute
-#   rcMode old or oflike
-#   rAUMode raw
-#   momNonOrthScale 0 or 1
-#   pNonOrthScale 0 or 1
-#   nNonOrthCorr 0 to 5
-#   uRelax 0.7 or 0.5
-#   pRelax 0.3 or 0.1
-#
-# Pipe/spiral low-speed preset:
-#   mu 1e5
-#   Umean 1.0e-3
-#   pipeD 0.05
-#   pipeL 0.5
-#   forceEnable 0
-#   Use only patches present in the current pipe/spiral mesh.
-# ==============================================================================
+# ----------------------------------------------------------------------
+# [diagnostics]
+# ----------------------------------------------------------------------
+badCellAuditEvery 0
+badCellAuditTop 15
+badCellAuditStart 1
+badCellAuditOnGrowth 0
+badCellAuditGrowthFactor 1.2
+badCellAuditMassFloor 1e-8
+badCellAuditWriteCsv 0
