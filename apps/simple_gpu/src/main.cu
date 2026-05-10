@@ -28,8 +28,14 @@ extern "C" {
 #include "HYPRE_IJ_mv.h"
 #include "HYPRE_parcsr_ls.h"
 #include "HYPRE_krylov.h"
+#include "HYPRE_utilities.h"
 #include "_hypre_parcsr_mv.h"
 }
+
+#ifdef ANABASIS_EXPECT_HYPRE_COMPLEX_BYTES
+static_assert(sizeof(HYPRE_Complex) == ANABASIS_EXPECT_HYPRE_COMPLEX_BYTES,
+              "HYPRE_Complex precision does not match this Anabasis build script");
+#endif
 
 #define CUDA_CALL(stmt) do { \
   cudaError_t _err = (stmt); \
@@ -57,7 +63,9 @@ extern "C" {
 } while (0)
 
 __device__ __forceinline__ void hypreAtomicAdd(HYPRE_Complex *addr, HYPRE_Complex val){
-  atomicAdd(reinterpret_cast<double*>(addr), static_cast<double>(val));
+  // HYPRE_Complex is double in the normal build and float in the single-HYPRE build.
+  // Use the native CUDA atomicAdd overload so both precision variants are valid.
+  atomicAdd(addr, val);
 }
 
 struct Params {
@@ -77,6 +85,16 @@ struct Params {
   int profileSteps=0;
   int pAmgRebuildEvery=1; // rebuild AMG hierarchy on outer iter 1 and then every N outer iterations
   int pAmgSetupScope=0;    // 0 = setup once per outer iteration, 1 = setup before every pressure solve
+
+  // Momentum linear solver selector:
+  //   0 = HYPRE BiCGSTAB
+  //   2 = GPU multi-color Gauss-Seidel defect smoother
+  //   3 = GPU fused multi-color Gauss-Seidel defect smoother for U/V/W
+  int velSolver=0;
+  int velSweeps=2;
+  double velSmootherOmega=0.8;
+  int velGsSymmetric=0;      // 0=forward color pass, 1=forward+backward color pass
+  int velCorrectionSolve=0;  // optional BiCGSTAB defect solve: A*dq = b - A*qOld
 
   // simple_gpu pressure-velocity coupling controls.
   // Defaults preserve the v1-style correction solve, while command-line options
@@ -323,6 +341,11 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
     {"velMaxit", "-vel-maxit"},
     {"velTol", "-vel-tol"},
     {"velRelTol", "-vel-reltol"},
+    {"velSolver", "-vel-solver"},
+    {"velSweeps", "-vel-sweeps"},
+    {"velSmootherOmega", "-vel-smoother-omega"},
+    {"velGsSymmetric", "-vel-gs-symmetric"},
+    {"velCorrectionSolve", "-vel-correction-solve"},
 
     {"nVelNonOrthCorr", "-nVelNonOrthCorr"},
     {"nNonOrthCorr", "-nNonOrthCorr"},
@@ -578,6 +601,19 @@ static void parse_args(int argc, char** argv, Params &par){
     else if(!std::strcmp(argv[i],"-vel-maxit")){need(argv[i]); par.velMaxit=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-vel-tol")){need(argv[i]); par.velTol=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-vel-reltol")){need(argv[i]); par.velRelTol=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-vel-solver")){
+      need(argv[i]);
+      std::string v=argv[++i];
+      for(char &c:v) c=(char)std::tolower((unsigned char)c);
+      if(v=="bicgstab" || v=="krylov") par.velSolver=0;
+      else if(v=="mcgs" || v=="colored-gs" || v=="multicolor-gs" || v=="multi-color-gs") { par.velSolver=2; par.velCorrectionSolve=1; }
+      else if(v=="mcgs-fused" || v=="mcgs_fused" || v=="fused-mcgs" || v=="fused-colored-gs") { par.velSolver=3; par.velCorrectionSolve=1; }
+      else { std::fprintf(stderr,"Unknown -vel-solver '%s'. Use bicgstab, mcgs, or mcgs-fused.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
+    }
+    else if(!std::strcmp(argv[i],"-vel-sweeps")){need(argv[i]); par.velSweeps=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-vel-smoother-omega")){need(argv[i]); par.velSmootherOmega=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-vel-gs-symmetric")){need(argv[i]); par.velGsSymmetric=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-vel-correction-solve")){need(argv[i]); par.velCorrectionSolve=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-nVelNonOrthCorr")){need(argv[i]); par.nVelNonOrthCorr=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-nNonOrthCorr")){need(argv[i]); par.nNonOrthCorr=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-nPressureCorr")){need(argv[i]); par.nPressureCorr=std::atoi(argv[++i]);}
@@ -2067,11 +2103,12 @@ struct GPUMomentumAssembler {
 struct GPUSimpleScratch {
   int nCells=0, nFaces=0;
   double *d_u=nullptr, *d_v=nullptr, *d_w=nullptr, *d_p=nullptr, *d_pCorr=nullptr;
+  double *d_uOld=nullptr, *d_vOld=nullptr, *d_wOld=nullptr, *d_pOld=nullptr;
   double *d_gradx=nullptr, *d_grady=nullptr, *d_gradz=nullptr;
   double *d_phiStar=nullptr, *d_phi=nullptr, *d_phiNonOrth=nullptr;
   double *d_divStar=nullptr, *d_divCorr=nullptr, *d_divNonOrth=nullptr;
   double *d_pCorrDelta=nullptr;
-  double *d_reduce=nullptr;
+  double *d_reduce=nullptr, *d_reduce2=nullptr;
   int reduceSize=0;
 };
 
@@ -2138,21 +2175,23 @@ static void init_simple_scratch(GPUSimpleScratch &ss, const Mesh &mesh){
   ss.nCells = mesh.nCells;
   ss.nFaces = mesh.nFaces;
   device_alloc(ss.d_u, mesh.nCells); device_alloc(ss.d_v, mesh.nCells); device_alloc(ss.d_w, mesh.nCells);
-  device_alloc(ss.d_p, mesh.nCells); device_alloc(ss.d_pCorr, mesh.nCells);
+  device_alloc(ss.d_uOld, mesh.nCells); device_alloc(ss.d_vOld, mesh.nCells); device_alloc(ss.d_wOld, mesh.nCells);
+  device_alloc(ss.d_p, mesh.nCells); device_alloc(ss.d_pOld, mesh.nCells); device_alloc(ss.d_pCorr, mesh.nCells);
   device_alloc(ss.d_gradx, mesh.nCells); device_alloc(ss.d_grady, mesh.nCells); device_alloc(ss.d_gradz, mesh.nCells);
   device_alloc(ss.d_phiStar, mesh.nFaces); device_alloc(ss.d_phi, mesh.nFaces); device_alloc(ss.d_phiNonOrth, mesh.nFaces);
   device_alloc(ss.d_divStar, mesh.nCells); device_alloc(ss.d_divCorr, mesh.nCells); device_alloc(ss.d_divNonOrth, mesh.nCells);
   device_alloc(ss.d_pCorrDelta, mesh.nCells);
   ss.reduceSize = std::max((mesh.nCells + 255)/256, 1);
-  device_alloc(ss.d_reduce, ss.reduceSize);
+  device_alloc(ss.d_reduce, ss.reduceSize); device_alloc(ss.d_reduce2, ss.reduceSize);
 }
 
 static void destroy_simple_scratch(GPUSimpleScratch &ss){
   device_free(ss.d_u); device_free(ss.d_v); device_free(ss.d_w); device_free(ss.d_p); device_free(ss.d_pCorr);
+  device_free(ss.d_uOld); device_free(ss.d_vOld); device_free(ss.d_wOld); device_free(ss.d_pOld);
   device_free(ss.d_gradx); device_free(ss.d_grady); device_free(ss.d_gradz);
   device_free(ss.d_phiStar); device_free(ss.d_phi); device_free(ss.d_phiNonOrth);
   device_free(ss.d_divStar); device_free(ss.d_divCorr); device_free(ss.d_divNonOrth);
-  device_free(ss.d_pCorrDelta); device_free(ss.d_reduce);
+  device_free(ss.d_pCorrDelta); device_free(ss.d_reduce); device_free(ss.d_reduce2);
   ss = GPUSimpleScratch{};
 }
 
@@ -2306,7 +2345,9 @@ __global__ static void kernel_apply_gauss_linear_gradient(
 
 __global__ static void kernel_add_scaled_inplace(int n, double *y, const double *x, double a);
 __global__ static void kernel_update_pressure_relax(int n, double *p, const double *pcorr, double pRelax);
+__global__ static void kernel_subtract_scalar_inplace(int n, double *x, double a);
 __global__ static void kernel_maxabs_reduce(int n, const double *x, double *blockMax);
+__global__ static void kernel_relchg_reduce(int n, const double *a, const double *b, double *blockNum, double *blockDen);
 
 static void continuity_residual_gpu(const DeviceMesh &dm, const double *d_phi, double *d_div){
   const int block = 256;
@@ -2366,6 +2407,24 @@ static double maxabs_device(const double *d_x, int n, double *d_reduce, int redu
   double m = 0.0;
   for(double v: h_reduce) m = std::max(m, std::fabs(v));
   return m;
+}
+
+static double relchg_device(const double *d_a, const double *d_b, int n, double *d_numReduce, double *d_denReduce, int reduceSize){
+  const int block = 256;
+  kernel_relchg_reduce<<<reduceSize, block, 2*block*sizeof(double)>>>(n, d_a, d_b, d_numReduce, d_denReduce);
+  CUDA_CHECK_LAST();
+
+  std::vector<double> h_num(reduceSize), h_den(reduceSize);
+  CUDA_CALL(cudaMemcpy(h_num.data(), d_numReduce, reduceSize*sizeof(double), cudaMemcpyDeviceToHost));
+  CUDA_CALL(cudaMemcpy(h_den.data(), d_denReduce, reduceSize*sizeof(double), cudaMemcpyDeviceToHost));
+
+  double num = 0.0;
+  double den = 1.0;
+  for(int i=0;i<reduceSize;++i){
+    num += h_num[i];
+    den += h_den[i];
+  }
+  return std::sqrt(num/den);
 }
 
 static MatrixPattern build_momentum_pattern(const Mesh &mesh){
@@ -2460,6 +2519,39 @@ __global__ static void kernel_fill_double(double *x, int n, double value){
   if(i < n) x[i] = value;
 }
 
+
+
+__global__ static void kernel_copy_double_to_hypre_complex(int n, const double *src, HYPRE_Complex *dst){
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i < n) dst[i] = (HYPRE_Complex)src[i];
+}
+
+__global__ static void kernel_copy_hypre_complex_to_double(int n, const HYPRE_Complex *src, double *dst){
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i < n) dst[i] = (double)src[i];
+}
+
+static inline void copy_double_device_to_hypre_device(int n, const double *src, HYPRE_Complex *dst){
+  if(sizeof(HYPRE_Complex) == sizeof(double)){
+    CUDA_CALL(cudaMemcpy(dst, src, n * sizeof(HYPRE_Complex), cudaMemcpyDeviceToDevice));
+  } else {
+    const int block = 256;
+    const int grid = (n + block - 1) / block;
+    kernel_copy_double_to_hypre_complex<<<grid, block>>>(n, src, dst);
+    CUDA_CHECK_LAST();
+  }
+}
+
+static inline void copy_hypre_device_to_double_device(int n, const HYPRE_Complex *src, double *dst){
+  if(sizeof(HYPRE_Complex) == sizeof(double)){
+    CUDA_CALL(cudaMemcpy(dst, src, n * sizeof(HYPRE_Complex), cudaMemcpyDeviceToDevice));
+  } else {
+    const int block = 256;
+    const int grid = (n + block - 1) / block;
+    kernel_copy_hypre_complex_to_double<<<grid, block>>>(n, src, dst);
+    CUDA_CHECK_LAST();
+  }
+}
 
 __global__ static void kernel_apply_lsq_gradient(
     int nCells, const int *offsets, const int *src, const int *face,
@@ -2563,6 +2655,46 @@ __global__ static void kernel_add_scaled_inplace(int n, double *y, const double 
 __global__ static void kernel_update_pressure_relax(int n, double *p, const double *pcorr, double pRelax){
   int i = blockIdx.x*blockDim.x + threadIdx.x;
   if(i<n) p[i] += pRelax*pcorr[i];
+}
+
+__global__ static void kernel_subtract_scalar_inplace(int n, double *x, double a){
+  int i = blockIdx.x*blockDim.x + threadIdx.x;
+  if(i<n) x[i] -= a;
+}
+
+__global__ static void kernel_relchg_reduce(int n, const double *a, const double *b, double *blockNum, double *blockDen){
+  extern __shared__ double sh[];
+  double *snum = sh;
+  double *sden = sh + blockDim.x;
+
+  int tid = threadIdx.x;
+  int i = blockIdx.x*blockDim.x + tid;
+
+  double num = 0.0;
+  double den = 0.0;
+  if(i < n){
+    const double av = a[i];
+    const double d = av - b[i];
+    num = d*d;
+    den = av*av;
+  }
+
+  snum[tid] = num;
+  sden[tid] = den;
+  __syncthreads();
+
+  for(int stride=blockDim.x/2; stride>0; stride>>=1){
+    if(tid < stride){
+      snum[tid] += snum[tid + stride];
+      sden[tid] += sden[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if(tid == 0){
+    blockNum[blockIdx.x] = snum[0];
+    blockDen[blockIdx.x] = sden[0];
+  }
 }
 
 __global__ static void kernel_maxabs_reduce(int n, const double *x, double *blockMax){
@@ -3226,7 +3358,9 @@ static void get_ij_vector_to_host(HYPRE_IJVector vij, std::vector<double> &x){
   HYPRE_CALL(HYPRE_IJVectorMigrate(vij, HYPRE_MEMORY_HOST));
   std::vector<HYPRE_BigInt> idx(x.size());
   for(std::size_t i=0;i<x.size();++i) idx[i]=(HYPRE_BigInt)i;
-  HYPRE_CALL(HYPRE_IJVectorGetValues(vij, (HYPRE_Int)x.size(), idx.data(), x.data()));
+  std::vector<HYPRE_Complex> hx(x.size());
+  HYPRE_CALL(HYPRE_IJVectorGetValues(vij, (HYPRE_Int)x.size(), idx.data(), hx.data()));
+  for(std::size_t i=0;i<x.size();++i) x[i] = (double)hx[i];
 }
 
 static void init_reusable_device_vectors(GPULinearSystem &sys){
@@ -3324,11 +3458,11 @@ static void copy_device_rhs_and_host_x0_into_hypre(GPULinearSystem &sys, const s
 
 static void copy_device_rhs_and_device_x0_into_hypre(GPULinearSystem &sys, const double *d_x0){
   CUDA_CALL(cudaMemcpy(sys.b_data_dev, sys.d_rhs, sys.n * sizeof(HYPRE_Complex), cudaMemcpyDeviceToDevice));
-  CUDA_CALL(cudaMemcpy(sys.x_data_dev, d_x0, sys.n * sizeof(HYPRE_Complex), cudaMemcpyDeviceToDevice));
+  copy_double_device_to_hypre_device(sys.n, d_x0, sys.x_data_dev);
 }
 
 static void copy_solution_from_hypre_to_device(GPULinearSystem &sys, double *d_xout){
-  CUDA_CALL(cudaMemcpy(d_xout, sys.x_data_dev, sys.n * sizeof(HYPRE_Complex), cudaMemcpyDeviceToDevice));
+  copy_hypre_device_to_double_device(sys.n, sys.x_data_dev, d_xout);
 }
 
 static void copy_host_rhs_and_host_x0_into_hypre(GPULinearSystem &sys, const std::vector<double> &rhs, const std::vector<double> &x0){
@@ -3524,10 +3658,10 @@ static void assemble_momentum_rhs_only_on_gpu(
 static void assemble_momentum_on_gpu_device_grad(
     const DeviceMesh &dm, const Mesh &mesh, GPUMomentumAssembler &mom,
     double rho, double mu, double /*unused_dt*/,
-    const std::vector<double> &qOld,
-    const std::vector<double> &uConv,
-    const std::vector<double> &vConv,
-    const std::vector<double> &wConv,
+    const double *d_qOld,
+    const double *d_uConv,
+    const double *d_vConv,
+    const double *d_wConv,
     const double *d_gradQx,
     const double *d_gradQy,
     const double *d_gradQz,
@@ -3538,10 +3672,7 @@ static void assemble_momentum_on_gpu_device_grad(
     const DeviceBC &bcW,
     double corrPsi, int momentumConvectionScheme)
 {
-  copy_vec_to_device(qOld, mom.d_qOld);
-  copy_vec_to_device(uConv, mom.d_uConv);
-  copy_vec_to_device(vConv, mom.d_vConv);
-  copy_vec_to_device(wConv, mom.d_wConv);
+  (void)d_qOld; // used later by relaxation, not needed during unrelaxed matrix assembly
 
   int block=256;
   int gridCells=(mesh.nCells + block - 1)/block;
@@ -3571,7 +3702,7 @@ static void assemble_momentum_on_gpu_device_grad(
       dm.d_sfx, dm.d_sfy, dm.d_sfz,
       dm.d_Af,
       d_gradQx, d_gradQy, d_gradQz,
-      mom.d_uConv, mom.d_vConv, mom.d_wConv,
+      d_uConv, d_vConv, d_wConv,
       rho, mu, corrPsi, momentumConvectionScheme,
       mom.lin.pat.d_facePP,
       mom.lin.pat.d_facePN,
@@ -3591,7 +3722,7 @@ static void assemble_momentum_on_gpu_device_grad(
       dm.d_sfx, dm.d_sfy, dm.d_sfz,
       dm.d_Af,
       d_gradQx, d_gradQy, d_gradQz,
-      mom.d_uConv, mom.d_vConv, mom.d_wConv,
+      d_uConv, d_vConv, d_wConv,
       bcQ.d_type, bcQ.d_faceValue,
       bcU.d_type, bcU.d_faceValue,
       bcV.d_type, bcV.d_faceValue,
@@ -3607,10 +3738,10 @@ static void assemble_momentum_on_gpu_device_grad(
 static void assemble_momentum_rhs_only_on_gpu_device_grad(
     const DeviceMesh &dm, const Mesh &mesh, GPUMomentumAssembler &mom,
     double rho, double mu,
-    const std::vector<double> &qOld,
-    const std::vector<double> &uConv,
-    const std::vector<double> &vConv,
-    const std::vector<double> &wConv,
+    const double *d_qOld,
+    const double *d_uConv,
+    const double *d_vConv,
+    const double *d_wConv,
     const double *d_gradQx,
     const double *d_gradQy,
     const double *d_gradQz,
@@ -3622,11 +3753,6 @@ static void assemble_momentum_rhs_only_on_gpu_device_grad(
     double corrPsi,
     double uRelax)
 {
-  copy_vec_to_device(qOld, mom.d_qOld);
-  copy_vec_to_device(uConv, mom.d_uConv);
-  copy_vec_to_device(vConv, mom.d_vConv);
-  copy_vec_to_device(wConv, mom.d_wConv);
-
   int block=256;
   int gridCells=(mesh.nCells + block - 1)/block;
   int gridFaces=(mesh.nInternalFaces + block - 1)/block;
@@ -3666,7 +3792,7 @@ static void assemble_momentum_rhs_only_on_gpu_device_grad(
       dm.d_sfx, dm.d_sfy, dm.d_sfz,
       dm.d_Af,
       d_gradQx, d_gradQy, d_gradQz,
-      mom.d_uConv, mom.d_vConv, mom.d_wConv,
+      d_uConv, d_vConv, d_wConv,
       bcQ.d_type, bcQ.d_faceValue,
       bcU.d_type, bcU.d_faceValue,
       bcV.d_type, bcV.d_faceValue,
@@ -3680,7 +3806,7 @@ static void assemble_momentum_rhs_only_on_gpu_device_grad(
         mom.lin.pat.d_diagPos,
         Avals,
         mom.lin.d_rhs,
-        mom.d_qOld,
+        d_qOld,
         uRelax);
   }
 
@@ -3697,12 +3823,12 @@ static void extract_rAU_from_momentum_matrix(const Mesh &mesh, const DeviceMesh 
   rAU_host.clear(); // device-resident rAU is used by pressure and Rhie-Chow; host copy is not needed in optimized path.
 }
 
-static void relax_momentum_system_on_gpu(const Mesh &mesh, GPUMomentumAssembler &mom, double uRelax){
+static void relax_momentum_system_on_gpu(const Mesh &mesh, GPUMomentumAssembler &mom, const double *d_qOld, double uRelax){
   if(uRelax >= 0.999999) return;
   int block=256;
   int gridCells=(mesh.nCells + block - 1)/block;
   HYPRE_Complex *Avals = matrix_values_ptr(mom.lin);
-  kernel_relax_momentum_system<<<gridCells, block>>>(mesh.nCells, mom.lin.pat.d_diagPos, Avals, mom.lin.d_rhs, mom.d_qOld, uRelax);
+  kernel_relax_momentum_system<<<gridCells, block>>>(mesh.nCells, mom.lin.pat.d_diagPos, Avals, mom.lin.d_rhs, d_qOld, uRelax);
   CUDA_CHECK_LAST();
 }
 
@@ -3729,6 +3855,747 @@ static void update_pressure_matrix_from_rAU(const Mesh &mesh, const DeviceMesh &
   tsetup += MPI_Wtime() - t0;
 }
 
+
+__global__ static void kernel_copy_plus_hypre_solution(
+    int n,
+    double *out,
+    const double *oldx,
+    const HYPRE_Complex *dx)
+{
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= n) return;
+  out[i] = oldx[i] + (double)dx[i];
+}
+
+static void handle_velocity_bicgstab_status(
+    const Params &par,
+    HYPRE_Int solveErr,
+    HYPRE_Int itsErr,
+    HYPRE_Int relErr,
+    HYPRE_Int &its,
+    double &relres)
+{
+  if(solveErr || itsErr || relErr){
+    if(solveErr == 256 || itsErr == 256 || relErr == 256){
+      // Intentional inexact BiCGSTAB smoother mode: HYPRE reports max-iteration
+      // nonconvergence as error 256. Accept it silently and report the requested
+      // fixed iteration count when HYPRE refuses to return one.
+      if(its <= 0) its = par.velMaxit;
+      HYPRE_ClearAllErrors();
+    } else {
+      std::fprintf(stderr,
+          "FATAL: velocity BiCGSTAB failed. "
+          "solveErr=%d itsErr=%d relErr=%d its=%d finalRel=%.6e.\n",
+          (int)solveErr, (int)itsErr, (int)relErr, (int)its, relres);
+      MPI_Abort(MPI_COMM_WORLD, solveErr ? solveErr : (itsErr ? itsErr : relErr));
+    }
+  }
+}
+
+static void solve_momentum_gpu_device_x0_xout(
+    GPUMomentumAssembler &mom,
+    const Params &par,
+    const double *d_x0,
+    double *d_xout,
+    HYPRE_Int &its,
+    double &relres,
+    double &tsetup,
+    double &tsolve,
+    bool doMatrixSetup)
+{
+  copy_device_rhs_and_device_x0_into_hypre(mom.lin, d_x0);
+
+  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetTol(mom.lin.solver, par.velRelTol));
+  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetAbsoluteTol(mom.lin.solver, par.velTol));
+  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetMaxIter(mom.lin.solver, par.velMaxit));
+  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetPrintLevel(mom.lin.solver, 0));
+  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetLogging(mom.lin.solver, 1));
+
+  if(doMatrixSetup || !mom.lin.is_setup){
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetPrecond(mom.lin.solver,
+        (HYPRE_PtrToParSolverFcn)HYPRE_ParCSRDiagScale,
+        (HYPRE_PtrToParSolverFcn)HYPRE_ParCSRDiagScaleSetup,
+        nullptr));
+    copy_matrix_values_into_hypre(mom.lin);
+    double t0=MPI_Wtime();
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetup(mom.lin.solver, mom.lin.Apar, mom.lin.bpar, mom.lin.xpar));
+    tsetup += MPI_Wtime()-t0;
+    mom.lin.is_setup = true;
+  }
+
+  double t0=MPI_Wtime();
+  HYPRE_Int solveErr = HYPRE_ParCSRBiCGSTABSolve(mom.lin.solver, mom.lin.Apar, mom.lin.bpar, mom.lin.xpar);
+  tsolve += MPI_Wtime()-t0;
+
+  its=-1; relres=0.0;
+  HYPRE_Int itsTmp=-1; HYPRE_Real relTmp = (HYPRE_Real)(0.0);
+  HYPRE_Int itsErr = HYPRE_ParCSRBiCGSTABGetNumIterations(mom.lin.solver,&itsTmp);
+  HYPRE_Int relErr = HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(mom.lin.solver,&relTmp);
+  if(itsErr == 0) its = itsTmp;
+  if(relErr == 0) relres = relTmp;
+  handle_velocity_bicgstab_status(par, solveErr, itsErr, relErr, its, relres);
+  copy_solution_from_hypre_to_device(mom.lin, d_xout);
+}
+
+static void solve_momentum_gpu_device_defect_x0_xout(
+    GPUMomentumAssembler &mom,
+    const Params &par,
+    const double *d_x0,
+    double *d_xout,
+    HYPRE_Int &its,
+    double &relres,
+    double &tsetup,
+    double &tsolve,
+    bool doMatrixSetup)
+{
+  const int n = mom.lin.n;
+  copy_matrix_values_into_hypre(mom.lin);
+
+  CUDA_CALL(cudaMemcpy(mom.lin.b_data_dev, mom.lin.d_rhs, n*sizeof(HYPRE_Complex), cudaMemcpyDeviceToDevice));
+  copy_double_device_to_hypre_device(n, d_x0, mom.lin.x_data_dev);
+  HYPRE_CALL(HYPRE_ParCSRMatrixMatvec((HYPRE_Complex)-1.0, mom.lin.Apar, mom.lin.xpar, (HYPRE_Complex)1.0, mom.lin.bpar));
+  CUDA_CALL(cudaMemset(mom.lin.x_data_dev, 0, n*sizeof(HYPRE_Complex)));
+
+  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetTol(mom.lin.solver, par.velRelTol));
+  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetAbsoluteTol(mom.lin.solver, par.velTol));
+  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetMaxIter(mom.lin.solver, par.velMaxit));
+  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetPrintLevel(mom.lin.solver, 0));
+  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetLogging(mom.lin.solver, 1));
+
+  if(doMatrixSetup || !mom.lin.is_setup){
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetPrecond(mom.lin.solver,
+        (HYPRE_PtrToParSolverFcn)HYPRE_ParCSRDiagScale,
+        (HYPRE_PtrToParSolverFcn)HYPRE_ParCSRDiagScaleSetup,
+        nullptr));
+    double t0=MPI_Wtime();
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetup(mom.lin.solver, mom.lin.Apar, mom.lin.bpar, mom.lin.xpar));
+    tsetup += MPI_Wtime()-t0;
+    mom.lin.is_setup = true;
+  }
+
+  double t0=MPI_Wtime();
+  HYPRE_Int solveErr = HYPRE_ParCSRBiCGSTABSolve(mom.lin.solver, mom.lin.Apar, mom.lin.bpar, mom.lin.xpar);
+  tsolve += MPI_Wtime()-t0;
+
+  its=-1; relres=0.0;
+  HYPRE_Int itsTmp=-1; HYPRE_Real relTmp = (HYPRE_Real)(0.0);
+  HYPRE_Int itsErr = HYPRE_ParCSRBiCGSTABGetNumIterations(mom.lin.solver,&itsTmp);
+  HYPRE_Int relErr = HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(mom.lin.solver,&relTmp);
+  if(itsErr == 0) its = itsTmp;
+  if(relErr == 0) relres = relTmp;
+  handle_velocity_bicgstab_status(par, solveErr, itsErr, relErr, its, relres);
+
+  const int block=256;
+  kernel_copy_plus_hypre_solution<<<(n + block - 1)/block, block>>>(n, d_xout, d_x0, mom.lin.x_data_dev);
+  CUDA_CHECK_LAST();
+}
+
+
+struct MCGSColoring {
+  bool built=false;
+  int n=0;
+  int nColors=0;
+  std::vector<int> colorOffsets;
+  std::vector<int> colorCells;
+  int *d_colorOffsets=nullptr;
+  int *d_colorCells=nullptr;
+};
+
+static MCGSColoring g_mcgs_coloring;
+
+static void build_mcgs_coloring_once(const MatrixPattern &pat)
+{
+  if(g_mcgs_coloring.built && g_mcgs_coloring.n == pat.nRows) return;
+
+  const int n = pat.nRows;
+  std::vector<int> color(n, -1);
+  std::vector<int> mark(64, -1);
+
+  int nColors = 0;
+  int tag = 1;
+
+  for(int i=0; i<n; ++i){
+    ++tag;
+    if(tag == 0x3fffffff){
+      std::fill(mark.begin(), mark.end(), -1);
+      tag = 1;
+    }
+
+    const int p0 = pat.rowOffsets[i];
+    const int p1 = pat.rowOffsets[i+1];
+
+    for(int p=p0; p<p1; ++p){
+      const int j = (int)pat.cols[p];
+      if(j < 0 || j >= n || j == i) continue;
+      const int cj = color[j];
+      if(cj >= 0){
+        if(cj >= (int)mark.size()) mark.resize(cj + 64, -1);
+        mark[cj] = tag;
+      }
+    }
+
+    int c = 0;
+    while(c < nColors){
+      if(c >= (int)mark.size()) mark.resize(c + 64, -1);
+      if(mark[c] != tag) break;
+      ++c;
+    }
+
+    color[i] = c;
+    if(c == nColors) ++nColors;
+  }
+
+  long long conflicts = 0;
+  long long graphEdges = 0;
+  int maxDegree = 0;
+
+  for(int i=0; i<n; ++i){
+    const int p0 = pat.rowOffsets[i];
+    const int p1 = pat.rowOffsets[i+1];
+    int deg = 0;
+
+    for(int p=p0; p<p1; ++p){
+      const int j = (int)pat.cols[p];
+      if(j < 0 || j >= n || j == i) continue;
+      ++deg;
+      if(color[i] == color[j]) ++conflicts;
+    }
+
+    maxDegree = std::max(maxDegree, deg);
+    graphEdges += deg;
+  }
+
+  if(conflicts != 0){
+    std::fprintf(stderr,
+                 "ERROR: MCGS coloring has %lld same-color adjacency conflicts.\n",
+                 conflicts);
+    MPI_Abort(MPI_COMM_WORLD, 3);
+  }
+
+  std::vector<int> counts(nColors, 0);
+  for(int i=0; i<n; ++i) counts[color[i]]++;
+
+  std::vector<int> offsets(nColors + 1, 0);
+  for(int c=0; c<nColors; ++c) offsets[c+1] = offsets[c] + counts[c];
+
+  std::vector<int> cursor = offsets;
+  std::vector<int> cells(n);
+  for(int i=0; i<n; ++i){
+    const int c = color[i];
+    cells[cursor[c]++] = i;
+  }
+
+  int minCount = n;
+  int maxCount = 0;
+  for(int c=0; c<nColors; ++c){
+    minCount = std::min(minCount, counts[c]);
+    maxCount = std::max(maxCount, counts[c]);
+  }
+
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if(rank == 0){
+    std::printf("MCGS coloring: nColors=%d, minCells/color=%d, maxCells/color=%d, avgCells/color=%.1f, maxDegree=%d, directedEdges=%lld\n",
+                nColors, minCount, maxCount, (double)n / std::max(1, nColors), maxDegree, graphEdges);
+  }
+
+  if(g_mcgs_coloring.d_colorOffsets) device_free(g_mcgs_coloring.d_colorOffsets);
+  if(g_mcgs_coloring.d_colorCells)   device_free(g_mcgs_coloring.d_colorCells);
+
+  g_mcgs_coloring.built = true;
+  g_mcgs_coloring.n = n;
+  g_mcgs_coloring.nColors = nColors;
+  g_mcgs_coloring.colorOffsets = std::move(offsets);
+  g_mcgs_coloring.colorCells = std::move(cells);
+
+  device_alloc(g_mcgs_coloring.d_colorOffsets, g_mcgs_coloring.colorOffsets.size());
+  copy_vec_to_device(g_mcgs_coloring.colorOffsets, g_mcgs_coloring.d_colorOffsets);
+
+  device_alloc(g_mcgs_coloring.d_colorCells, g_mcgs_coloring.colorCells.size());
+  copy_vec_to_device(g_mcgs_coloring.colorCells, g_mcgs_coloring.d_colorCells);
+}
+
+__global__ static void kernel_mcgs_color_sweep(
+    const int color,
+    const int *colorOffsets,
+    const int *colorCells,
+    const int *rowOffsets,
+    const HYPRE_BigInt *cols,
+    const HYPRE_Complex *Avals,
+    const int *permPatternToHypre,
+    int usePermutedHypreValues,
+    const HYPRE_Complex *rhs,
+    HYPRE_Complex *x,
+    double omega)
+{
+  const int start = colorOffsets[color];
+  const int end   = colorOffsets[color + 1];
+  const int k = start + blockIdx.x * blockDim.x + threadIdx.x;
+
+  if(k >= end) return;
+
+  const int i = colorCells[k];
+  const int p0 = rowOffsets[i];
+  const int p1 = rowOffsets[i+1];
+
+  double diag = 0.0;
+  double sumOff = 0.0;
+
+  for(int p=p0; p<p1; ++p){
+    const int j = (int)cols[p];
+
+    double a;
+    if(usePermutedHypreValues){
+      a = (double)Avals[permPatternToHypre[p]];
+    } else {
+      a = (double)Avals[p];
+    }
+
+    if(j == i){
+      diag = a;
+    } else {
+      sumOff += a * (double)x[j];
+    }
+  }
+
+  if(fabs(diag) > 1.0e-300){
+    const double gsVal = ((double)rhs[i] - sumOff) / diag;
+    x[i] = (HYPRE_Complex)((1.0 - omega) * (double)x[i] + omega * gsVal);
+  }
+}
+
+static void solve_momentum_gpu_device_mcgs_defect_x0_xout(
+    GPUMomentumAssembler &mom,
+    const Params &par,
+    const double *d_x0,
+    double *d_xout,
+    HYPRE_Int &its,
+    double &relres,
+    double &tsetup,
+    double &tsolve,
+    bool doMatrixSetup)
+{
+  (void)tsetup;
+
+  const int n = mom.lin.n;
+  const int block = 256;
+
+  if(par.velSweeps < 0){
+    std::fprintf(stderr, "ERROR: -vel-sweeps must be >= 0\n");
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+
+  if(par.velSmootherOmega <= 0.0){
+    std::fprintf(stderr, "ERROR: -vel-smoother-omega must be > 0\n");
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+
+  build_mcgs_coloring_once(mom.lin.pat);
+
+  double t0 = MPI_Wtime();
+
+  if(doMatrixSetup || !mom.lin.direct_matrix_values){
+    copy_matrix_values_into_hypre(mom.lin);
+  }
+
+  // Build defect RHS:
+  //   bpar = b
+  //   xpar = qOld
+  //   bpar = bpar - A*xpar
+  CUDA_CALL(cudaMemcpy(mom.lin.b_data_dev, mom.lin.d_rhs,
+                       n * sizeof(HYPRE_Complex),
+                       cudaMemcpyDeviceToDevice));
+  copy_double_device_to_hypre_device(n, d_x0, mom.lin.x_data_dev);
+
+  HYPRE_CALL(HYPRE_ParCSRMatrixMatvec(
+      (HYPRE_Complex)-1.0,
+      mom.lin.Apar,
+      mom.lin.xpar,
+      (HYPRE_Complex)1.0,
+      mom.lin.bpar));
+
+  // Correction starts from zero:
+  //   A*dq = defect
+  CUDA_CALL(cudaMemset(mom.lin.x_data_dev, 0, n * sizeof(HYPRE_Complex)));
+
+  const bool usePermutedHypreValues =
+      mom.lin.direct_matrix_values && !mom.lin.A_diag_identity_perm;
+
+  const HYPRE_Complex *Avals =
+      usePermutedHypreValues ? mom.lin.A_diag_data_dev : matrix_values_ptr(mom.lin);
+
+  for(int sweep=0; sweep<par.velSweeps; ++sweep){
+    for(int c=0; c<g_mcgs_coloring.nColors; ++c){
+      const int start = g_mcgs_coloring.colorOffsets[c];
+      const int end   = g_mcgs_coloring.colorOffsets[c+1];
+      const int nThis = end - start;
+      if(nThis <= 0) continue;
+
+      const int grid = (nThis + block - 1) / block;
+      kernel_mcgs_color_sweep<<<grid, block>>>(
+          c,
+          g_mcgs_coloring.d_colorOffsets,
+          g_mcgs_coloring.d_colorCells,
+          mom.lin.pat.d_rowOffsets,
+          mom.lin.pat.d_cols,
+          Avals,
+          mom.lin.A_diag_perm_d,
+          usePermutedHypreValues ? 1 : 0,
+          mom.lin.b_data_dev,
+          mom.lin.x_data_dev,
+          par.velSmootherOmega);
+      CUDA_CHECK_LAST();
+    }
+
+    if(par.velGsSymmetric){
+      for(int c=g_mcgs_coloring.nColors-1; c>=0; --c){
+        const int start = g_mcgs_coloring.colorOffsets[c];
+        const int end   = g_mcgs_coloring.colorOffsets[c+1];
+        const int nThis = end - start;
+        if(nThis <= 0) continue;
+
+        const int grid = (nThis + block - 1) / block;
+        kernel_mcgs_color_sweep<<<grid, block>>>(
+            c,
+            g_mcgs_coloring.d_colorOffsets,
+            g_mcgs_coloring.d_colorCells,
+            mom.lin.pat.d_rowOffsets,
+            mom.lin.pat.d_cols,
+            Avals,
+            mom.lin.A_diag_perm_d,
+            usePermutedHypreValues ? 1 : 0,
+            mom.lin.b_data_dev,
+            mom.lin.x_data_dev,
+            par.velSmootherOmega);
+        CUDA_CHECK_LAST();
+      }
+    }
+  }
+
+  // qNew = qOld + dq
+  kernel_copy_plus_hypre_solution<<<(n + block - 1) / block, block>>>(
+      n,
+      d_xout,
+      d_x0,
+      mom.lin.x_data_dev);
+  CUDA_CHECK_LAST();
+
+  tsolve += MPI_Wtime() - t0;
+
+  its = (HYPRE_Int)par.velSweeps;
+  relres = -1.0;
+}
+
+
+
+struct FusedMCGSScratch {
+  int n=0;
+  HYPRE_Complex *d_rhsU=nullptr, *d_rhsV=nullptr, *d_rhsW=nullptr;
+  HYPRE_Complex *d_du=nullptr,   *d_dv=nullptr,   *d_dw=nullptr;
+};
+
+static FusedMCGSScratch g_fused_mcgs;
+
+static void ensure_fused_mcgs_scratch(int n)
+{
+  if(g_fused_mcgs.n == n &&
+     g_fused_mcgs.d_rhsU && g_fused_mcgs.d_rhsV && g_fused_mcgs.d_rhsW &&
+     g_fused_mcgs.d_du   && g_fused_mcgs.d_dv   && g_fused_mcgs.d_dw) return;
+
+  device_free(g_fused_mcgs.d_rhsU);
+  device_free(g_fused_mcgs.d_rhsV);
+  device_free(g_fused_mcgs.d_rhsW);
+  device_free(g_fused_mcgs.d_du);
+  device_free(g_fused_mcgs.d_dv);
+  device_free(g_fused_mcgs.d_dw);
+
+  g_fused_mcgs.n = n;
+  device_alloc(g_fused_mcgs.d_rhsU, n);
+  device_alloc(g_fused_mcgs.d_rhsV, n);
+  device_alloc(g_fused_mcgs.d_rhsW, n);
+  device_alloc(g_fused_mcgs.d_du,   n);
+  device_alloc(g_fused_mcgs.d_dv,   n);
+  device_alloc(g_fused_mcgs.d_dw,   n);
+}
+
+__global__ static void kernel_fused_defect_zero(
+    int n,
+    const int *rowOffsets,
+    const HYPRE_BigInt *cols,
+    const HYPRE_Complex *Avals,
+    const int *permPatternToHypre,
+    int usePermutedHypreValues,
+    HYPRE_Complex *rhsU,
+    HYPRE_Complex *rhsV,
+    HYPRE_Complex *rhsW,
+    const double *uOld,
+    const double *vOld,
+    const double *wOld,
+    HYPRE_Complex *du,
+    HYPRE_Complex *dv,
+    HYPRE_Complex *dw)
+{
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= n) return;
+
+  double Au = 0.0;
+  double Av = 0.0;
+  double Aw = 0.0;
+
+  const int p0 = rowOffsets[i];
+  const int p1 = rowOffsets[i+1];
+
+  for(int p=p0; p<p1; ++p){
+    const int j = (int)cols[p];
+    double a;
+    if(usePermutedHypreValues){
+      a = (double)Avals[permPatternToHypre[p]];
+    } else {
+      a = (double)Avals[p];
+    }
+
+    Au += a * uOld[j];
+    Av += a * vOld[j];
+    Aw += a * wOld[j];
+  }
+
+  rhsU[i] = (HYPRE_Complex)((double)rhsU[i] - Au);
+  rhsV[i] = (HYPRE_Complex)((double)rhsV[i] - Av);
+  rhsW[i] = (HYPRE_Complex)((double)rhsW[i] - Aw);
+
+  du[i] = 0.0;
+  dv[i] = 0.0;
+  dw[i] = 0.0;
+}
+
+__global__ static void kernel_mcgs_color_sweep_fused(
+    const int color,
+    const int *colorOffsets,
+    const int *colorCells,
+    const int *rowOffsets,
+    const HYPRE_BigInt *cols,
+    const HYPRE_Complex *Avals,
+    const int *permPatternToHypre,
+    int usePermutedHypreValues,
+    const HYPRE_Complex *rhsU,
+    const HYPRE_Complex *rhsV,
+    const HYPRE_Complex *rhsW,
+    HYPRE_Complex *du,
+    HYPRE_Complex *dv,
+    HYPRE_Complex *dw,
+    double omega)
+{
+  const int start = colorOffsets[color];
+  const int end   = colorOffsets[color + 1];
+
+  const int k = start + blockIdx.x * blockDim.x + threadIdx.x;
+  if(k >= end) return;
+
+  const int i = colorCells[k];
+  const int p0 = rowOffsets[i];
+  const int p1 = rowOffsets[i+1];
+
+  double diag = 0.0;
+  double sumU = 0.0;
+  double sumV = 0.0;
+  double sumW = 0.0;
+
+  for(int p=p0; p<p1; ++p){
+    const int j = (int)cols[p];
+
+    double a;
+    if(usePermutedHypreValues){
+      a = (double)Avals[permPatternToHypre[p]];
+    } else {
+      a = (double)Avals[p];
+    }
+
+    if(j == i){
+      diag = a;
+    } else {
+      sumU += a * (double)du[j];
+      sumV += a * (double)dv[j];
+      sumW += a * (double)dw[j];
+    }
+  }
+
+  if(fabs(diag) > 1.0e-300){
+    const double newU = ((double)rhsU[i] - sumU) / diag;
+    const double newV = ((double)rhsV[i] - sumV) / diag;
+    const double newW = ((double)rhsW[i] - sumW) / diag;
+
+    du[i] = (HYPRE_Complex)((1.0 - omega) * (double)du[i] + omega * newU);
+    dv[i] = (HYPRE_Complex)((1.0 - omega) * (double)dv[i] + omega * newV);
+    dw[i] = (HYPRE_Complex)((1.0 - omega) * (double)dw[i] + omega * newW);
+  }
+}
+
+__global__ static void kernel_copy_plus3(
+    int n,
+    double *uOut,
+    double *vOut,
+    double *wOut,
+    const double *uOld,
+    const double *vOld,
+    const double *wOld,
+    const HYPRE_Complex *du,
+    const HYPRE_Complex *dv,
+    const HYPRE_Complex *dw)
+{
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= n) return;
+
+  uOut[i] = uOld[i] + (double)du[i];
+  vOut[i] = vOld[i] + (double)dv[i];
+  wOut[i] = wOld[i] + (double)dw[i];
+}
+
+static void solve_momentum_gpu_device_mcgs_fused_defect_x0_xout(
+    GPUMomentumAssembler &mom,
+    const Params &par,
+    const double *d_uOld,
+    const double *d_vOld,
+    const double *d_wOld,
+    double *d_uOut,
+    double *d_vOut,
+    double *d_wOut,
+    HYPRE_Int &itsU,
+    HYPRE_Int &itsV,
+    HYPRE_Int &itsW,
+    double &relU,
+    double &relV,
+    double &relW,
+    double &tsetup,
+    double &tsolve,
+    bool doMatrixSetup)
+{
+  (void)tsetup;
+
+  const int n = mom.lin.n;
+  const int block = 256;
+  const int gridCells = (n + block - 1) / block;
+
+  ensure_fused_mcgs_scratch(n);
+  build_mcgs_coloring_once(mom.lin.pat);
+
+  double t0 = MPI_Wtime();
+
+  if(doMatrixSetup || !mom.lin.direct_matrix_values){
+    copy_matrix_values_into_hypre(mom.lin);
+  }
+
+  const bool usePermutedHypreValues =
+      mom.lin.direct_matrix_values && !mom.lin.A_diag_identity_perm;
+
+  const HYPRE_Complex *Avals =
+      usePermutedHypreValues ? mom.lin.A_diag_data_dev : matrix_values_ptr(mom.lin);
+
+  // Convert full RHS vectors into true defect RHS:
+  //
+  //   rhsU = bU - A*uOld
+  //   rhsV = bV - A*vOld
+  //   rhsW = bW - A*wOld
+  //
+  // Also zero correction vectors.
+  kernel_fused_defect_zero<<<gridCells, block>>>(
+      n,
+      mom.lin.pat.d_rowOffsets,
+      mom.lin.pat.d_cols,
+      Avals,
+      mom.lin.A_diag_perm_d,
+      usePermutedHypreValues ? 1 : 0,
+      g_fused_mcgs.d_rhsU,
+      g_fused_mcgs.d_rhsV,
+      g_fused_mcgs.d_rhsW,
+      d_uOld,
+      d_vOld,
+      d_wOld,
+      g_fused_mcgs.d_du,
+      g_fused_mcgs.d_dv,
+      g_fused_mcgs.d_dw);
+  CUDA_CHECK_LAST();
+
+  for(int sweep=0; sweep<par.velSweeps; ++sweep){
+    for(int c=0; c<g_mcgs_coloring.nColors; ++c){
+      const int start = g_mcgs_coloring.colorOffsets[c];
+      const int end   = g_mcgs_coloring.colorOffsets[c+1];
+      const int nThis = end - start;
+      if(nThis <= 0) continue;
+
+      const int grid = (nThis + block - 1) / block;
+      kernel_mcgs_color_sweep_fused<<<grid, block>>>(
+          c,
+          g_mcgs_coloring.d_colorOffsets,
+          g_mcgs_coloring.d_colorCells,
+          mom.lin.pat.d_rowOffsets,
+          mom.lin.pat.d_cols,
+          Avals,
+          mom.lin.A_diag_perm_d,
+          usePermutedHypreValues ? 1 : 0,
+          g_fused_mcgs.d_rhsU,
+          g_fused_mcgs.d_rhsV,
+          g_fused_mcgs.d_rhsW,
+          g_fused_mcgs.d_du,
+          g_fused_mcgs.d_dv,
+          g_fused_mcgs.d_dw,
+          par.velSmootherOmega);
+      CUDA_CHECK_LAST();
+    }
+
+    if(par.velGsSymmetric){
+      for(int c=g_mcgs_coloring.nColors-1; c>=0; --c){
+        const int start = g_mcgs_coloring.colorOffsets[c];
+        const int end   = g_mcgs_coloring.colorOffsets[c+1];
+        const int nThis = end - start;
+        if(nThis <= 0) continue;
+
+        const int grid = (nThis + block - 1) / block;
+        kernel_mcgs_color_sweep_fused<<<grid, block>>>(
+            c,
+            g_mcgs_coloring.d_colorOffsets,
+            g_mcgs_coloring.d_colorCells,
+            mom.lin.pat.d_rowOffsets,
+            mom.lin.pat.d_cols,
+            Avals,
+            mom.lin.A_diag_perm_d,
+            usePermutedHypreValues ? 1 : 0,
+            g_fused_mcgs.d_rhsU,
+            g_fused_mcgs.d_rhsV,
+            g_fused_mcgs.d_rhsW,
+            g_fused_mcgs.d_du,
+            g_fused_mcgs.d_dv,
+            g_fused_mcgs.d_dw,
+            par.velSmootherOmega);
+        CUDA_CHECK_LAST();
+      }
+    }
+  }
+
+  kernel_copy_plus3<<<gridCells, block>>>(
+      n,
+      d_uOut,
+      d_vOut,
+      d_wOut,
+      d_uOld,
+      d_vOld,
+      d_wOld,
+      g_fused_mcgs.d_du,
+      g_fused_mcgs.d_dv,
+      g_fused_mcgs.d_dw);
+  CUDA_CHECK_LAST();
+
+  tsolve += MPI_Wtime() - t0;
+
+  itsU = (HYPRE_Int)par.velSweeps;
+  itsV = (HYPRE_Int)par.velSweeps;
+  itsW = (HYPRE_Int)par.velSweeps;
+  relU = -1.0;
+  relV = -1.0;
+  relW = -1.0;
+}
+
+
+
 static void solve_momentum_gpu(GPUMomentumAssembler &mom, const Params &par, const std::vector<double> &x0, std::vector<double> &xout, HYPRE_Int &its, double &relres, double &tsetup, double &tsolve, bool doMatrixSetup){
   copy_device_rhs_and_host_x0_into_hypre(mom.lin, x0);
 
@@ -3746,11 +4613,16 @@ static void solve_momentum_gpu(GPUMomentumAssembler &mom, const Params &par, con
     mom.lin.is_setup = true;
   }
   double t0=MPI_Wtime();
-  HYPRE_CALL(HYPRE_ParCSRBiCGSTABSolve(mom.lin.solver, mom.lin.Apar, mom.lin.bpar, mom.lin.xpar));
+  HYPRE_Int solveErr = HYPRE_ParCSRBiCGSTABSolve(mom.lin.solver, mom.lin.Apar, mom.lin.bpar, mom.lin.xpar);
   tsolve += MPI_Wtime()-t0;
-  its=0; relres=0.0;
-  HYPRE_CALL(HYPRE_ParCSRBiCGSTABGetNumIterations(mom.lin.solver,&its));
-  HYPRE_CALL(HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(mom.lin.solver,&relres));
+
+  its=-1; relres=0.0;
+  HYPRE_Int itsTmp=-1; HYPRE_Real relTmp = (HYPRE_Real)(0.0);
+  HYPRE_Int itsErr = HYPRE_ParCSRBiCGSTABGetNumIterations(mom.lin.solver,&itsTmp);
+  HYPRE_Int relErr = HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(mom.lin.solver,&relTmp);
+  if(itsErr == 0) its = itsTmp;
+  if(relErr == 0) relres = relTmp;
+  handle_velocity_bicgstab_status(par, solveErr, itsErr, relErr, its, relres);
   copy_solution_from_hypre(mom.lin, xout);
 }
 
@@ -3764,7 +4636,11 @@ static void solve_pressure_gpu(GPULinearSystem &ps, const std::vector<double> &r
   tsolve += MPI_Wtime()-t0;
   its=0; relres=0.0;
   HYPRE_CALL(HYPRE_ParCSRPCGGetNumIterations(ps.solver,&its));
-  HYPRE_CALL(HYPRE_ParCSRPCGGetFinalRelativeResidualNorm(ps.solver,&relres));
+  do {
+    HYPRE_Real relres_hypre_tmp = (HYPRE_Real)0.0;
+    HYPRE_CALL(HYPRE_ParCSRPCGGetFinalRelativeResidualNorm(ps.solver, &relres_hypre_tmp));
+    relres = (double)relres_hypre_tmp;
+  } while(0);
   copy_solution_from_hypre(ps, xout);
 }
 
@@ -3783,7 +4659,11 @@ static void solve_pressure_gpu_device_rhs(GPULinearSystem &ps, const std::vector
   tsolve += MPI_Wtime()-t0;
   its=0; relres=0.0;
   HYPRE_CALL(HYPRE_ParCSRPCGGetNumIterations(ps.solver,&its));
-  HYPRE_CALL(HYPRE_ParCSRPCGGetFinalRelativeResidualNorm(ps.solver,&relres));
+  do {
+    HYPRE_Real relres_hypre_tmp = (HYPRE_Real)0.0;
+    HYPRE_CALL(HYPRE_ParCSRPCGGetFinalRelativeResidualNorm(ps.solver, &relres_hypre_tmp));
+    relres = (double)relres_hypre_tmp;
+  } while(0);
   copy_solution_from_hypre(ps, xout);
 }
 
@@ -3824,7 +4704,7 @@ static void solve_pressure_gpu_device_rhs_device_x0(
   relres = 0.0;
 
   HYPRE_Int itsTmp = -1;
-  double relTmp = 0.0;
+  HYPRE_Real relTmp = (HYPRE_Real)0.0;
 
   HYPRE_Int itsErr = HYPRE_ParCSRPCGGetNumIterations(ps.solver, &itsTmp);
   HYPRE_Int relErr = HYPRE_ParCSRPCGGetFinalRelativeResidualNorm(ps.solver, &relTmp);
@@ -4309,7 +5189,7 @@ CUDA_CALL(cudaFree(0));
 
   if(rank==0){
     std::printf("============================================================\n");
-    std::printf("Anabasis simple_gpu v1.1: OpenFOAM polyMesh SIMPLE solver\n");
+    std::printf("Anabasis simple_gpu v1.1b: OpenFOAM polyMesh SIMPLE solver\n");
     std::printf("GPU linear-system assembly + GPU solve; U/V/W matrix reuse; GPU pressure RHS/flux/div/vel-correct; direct hypre matrix writes; GPU old-field LSQ gradients\n");
     std::printf("============================================================\n");
     std::printf("polyMeshDir : %s\n", par.polyMeshDir.c_str());
@@ -4322,7 +5202,13 @@ CUDA_CALL(cudaFree(0));
     std::printf("BBox           : [%g, %g] x [%g, %g] x [%g, %g]\n", xmin,xmax,ymin,ymax,zmin,zmax);
     std::printf("Volume min/max : %.8e / %.8e\n", vmin, vmax);
     std::printf("maxNonOrthDeg  : %.6f\n", mesh.maxNonOrthDeg);
-    std::printf("Momentum solve : ParCSR BiCGSTAB + DiagScale\n");
+    const char *velSolverName =
+        par.velSolver == 3 ? "fused multi-color GS defect smoother" :
+        (par.velSolver == 2 ? "multi-color GS defect smoother" : "ParCSR BiCGSTAB + DiagScale");
+    std::printf("Momentum solve : %s, mode=%s, sweeps=%d, omega=%.3g, symmetricGS=%d\n",
+                velSolverName,
+                (par.velSolver == 2 || par.velSolver == 3 || par.velCorrectionSolve) ? "defect-correction" : "field",
+                par.velSweeps, par.velSmootherOmega, par.velGsSymmetric);
     std::printf("Pressure solve : ParCSR PCG + %s\n", par.p_use_amg ? "BoomerAMG" : "DiagScale");
     std::printf("rho            : %.8g\n", par.rho);
     std::printf("rho in pEqn    : ON (pressure coeff/flux use rho*rAU)\n");
@@ -4379,7 +5265,19 @@ CUDA_CALL(cudaFree(0));
     std::printf("------------------------------------------------------------\n");
   }
 
+  // v1.1b default: standalone hypre 3.1 CUDA build with internal device SpGEMM.
+  // This is the robust path for large A100 meshes where vendor/cuSPARSE SpGEMM
+  // can fail during BoomerAMG setup with insufficient resources.
   HYPRE_CALL(HYPRE_Initialize());
+  HYPRE_CALL(HYPRE_DeviceInitialize());
+  {
+    HYPRE_Int spgemm_status = HYPRE_SetSpGemmUseVendor(0);
+    if(spgemm_status){
+      if(rank==0) std::printf("WARNING: HYPRE_SetSpGemmUseVendor(0) returned %d; continuing with default SpGEMM backend.\n", (int)spgemm_status);
+    } else {
+      if(rank==0) std::printf("HYPRE SpGEMM backend switch: forced internal SpGEMM via HYPRE_SetSpGemmUseVendor(0) [v1.1b default]\n");
+    }
+  }
   HYPRE_CALL(HYPRE_SetMemoryLocation(HYPRE_MEMORY_DEVICE));
   HYPRE_CALL(HYPRE_SetExecutionPolicy(HYPRE_EXEC_DEVICE));
 
@@ -4939,40 +5837,128 @@ CUDA_CALL(cudaFree(0));
   std::array<PhaseStats, PH_COUNT> prof{};
   int profStepsDone = 0;
 
-  auto solve_scalar_component_with_nonorth = [&](const std::vector<double> &qOld, const std::vector<double> &uConv, const std::vector<double> &vConv, const std::vector<double> &wConv, const double *d_gradPcomp, const std::vector<std::string> &bcQType, const std::vector<double> &bcQFaceVal, const DeviceBC &dbcQ, std::vector<double> &qOut, HYPRE_Int &itsOut, double &relOut, int &corrUsedOut, bool rebuildMomentumMatrix, bool extractRAU, PhaseStats &gradStats, PhaseStats &asmStats, PhaseStats &solveStats){
-    std::vector<double> qIter = qOld, qNew = qOld;
-    std::vector<std::array<double,3>> gradQ;
+  auto solve_scalar_component_with_nonorth = [&](
+      const double *d_qInitial,
+      const double *d_uConv,
+      const double *d_vConv,
+      const double *d_wConv,
+      const double *d_gradPcomp,
+      const DeviceBC &dbcQ,
+      double *d_qOut,
+      HYPRE_Int &itsOut,
+      double &relOut,
+      int &corrUsedOut,
+      bool rebuildMomentumMatrix,
+      bool extractRAU,
+      PhaseStats &gradStats,
+      PhaseStats &asmStats,
+      PhaseStats &solveStats)
+  {
     const int nVelSolves = std::max(par.nVelNonOrthCorr, 0) + 1;
     corrUsedOut = 0;
+
+    CUDA_CALL(cudaMemcpy(d_qOut, d_qInitial, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+
     for(int it=1; it<=nVelSolves; ++it){
       corrUsedOut = it - 1;
+
       PhaseMark pm_grad = profile_begin();
-      copy_vec_to_device(qIter, mom.d_qOld);
-      compute_lsq_gradient_gpu(gop, dmesh, dbcQ, mom.d_qOld,
+      compute_lsq_gradient_gpu(gop, dmesh, dbcQ, d_qOut,
                                mom.d_gradQx, mom.d_gradQy, mom.d_gradQz);
       profile_record(gradStats, pm_grad);
+
       const bool doMatrixSetup = rebuildMomentumMatrix && (it == 1);
       PhaseMark pm_asm = profile_begin();
       if(doMatrixSetup){
-        assemble_momentum_on_gpu_device_grad(dmesh, mesh, mom, par.rho, mu, 1.0, qIter, uConv, vConv, wConv, mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, d_gradPcomp, dbcQ, dbcU, dbcV, dbcW, par.momNonOrthScale, par.momentumConvectionScheme);
-        relax_momentum_system_on_gpu(mesh, mom, par.uRelax);
+        assemble_momentum_on_gpu_device_grad(
+            dmesh, mesh, mom, par.rho, mu, 1.0,
+            d_qOut, d_uConv, d_vConv, d_wConv,
+            mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, d_gradPcomp,
+            dbcQ, dbcU, dbcV, dbcW,
+            par.momNonOrthScale, par.momentumConvectionScheme);
+        relax_momentum_system_on_gpu(mesh, mom, d_qOut, par.uRelax);
         if(extractRAU) extract_rAU_from_momentum_matrix(mesh, dmesh, mom, par, rAU);
       } else {
-        assemble_momentum_rhs_only_on_gpu_device_grad(dmesh, mesh, mom, par.rho, mu, qIter, uConv, vConv, wConv, mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, d_gradPcomp, dbcQ, dbcU, dbcV, dbcW, par.momNonOrthScale, par.uRelax);
+        assemble_momentum_rhs_only_on_gpu_device_grad(
+            dmesh, mesh, mom, par.rho, mu,
+            d_qOut, d_uConv, d_vConv, d_wConv,
+            mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, d_gradPcomp,
+            dbcQ, dbcU, dbcV, dbcW,
+            par.momNonOrthScale, par.uRelax);
       }
       double dtAsm = MPI_Wtime()-pm_asm.t0;
       totalAssemble += dtAsm;
       profile_record(asmStats, pm_asm);
+
       PhaseMark pm_solve = profile_begin();
-      solve_momentum_gpu(mom, par, qIter, qNew, itsOut, relOut, totalSetup, totalSolve, doMatrixSetup);
+      if(par.velSolver == 2){
+        solve_momentum_gpu_device_mcgs_defect_x0_xout(
+            mom, par, d_qOut, d_qOut,
+            itsOut, relOut, totalSetup, totalSolve, doMatrixSetup);
+      } else if(par.velCorrectionSolve){
+        solve_momentum_gpu_device_defect_x0_xout(
+            mom, par, d_qOut, d_qOut,
+            itsOut, relOut, totalSetup, totalSolve, doMatrixSetup);
+      } else {
+        solve_momentum_gpu_device_x0_xout(
+            mom, par, d_qOut, d_qOut,
+            itsOut, relOut, totalSetup, totalSolve, doMatrixSetup);
+      }
       profile_record(solveStats, pm_solve);
-      double num=0.0, den=1.0;
-      for(int c=0;c<mesh.nCells;++c){ double d=qNew[c]-qIter[c]; num += d*d; den += qNew[c]*qNew[c]; }
-      double relchg = std::sqrt(num/den);
-      qIter.swap(qNew);
-      if(relchg < par.corrTol) break;
     }
-    qOut = qIter;
+  };
+
+  auto assemble_scalar_component_rhs_for_fused = [&](
+      const double *d_qInitial,
+      const double *d_uConv,
+      const double *d_vConv,
+      const double *d_wConv,
+      const double *d_gradPcomp,
+      const DeviceBC &dbcQ,
+      HYPRE_Complex *d_rhsSave,
+      bool rebuildMomentumMatrix,
+      bool extractRAU,
+      PhaseStats &gradStats,
+      PhaseStats &asmStats)
+  {
+    if(std::max(par.nVelNonOrthCorr, 0) != 0){
+      if(rank==0){
+        std::fprintf(stderr,
+            "ERROR: velSolver=mcgs-fused currently supports nVelNonOrthCorr=0 only. Use -nVelNonOrthCorr 0.\n");
+      }
+      MPI_Abort(MPI_COMM_WORLD, 4);
+    }
+
+    PhaseMark pm_grad = profile_begin();
+    compute_lsq_gradient_gpu(gop, dmesh, dbcQ, d_qInitial,
+                             mom.d_gradQx, mom.d_gradQy, mom.d_gradQz);
+    profile_record(gradStats, pm_grad);
+
+    PhaseMark pm_asm = profile_begin();
+    if(rebuildMomentumMatrix){
+      assemble_momentum_on_gpu_device_grad(
+          dmesh, mesh, mom, par.rho, mu, 1.0,
+          d_qInitial, d_uConv, d_vConv, d_wConv,
+          mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, d_gradPcomp,
+          dbcQ, dbcU, dbcV, dbcW,
+          par.momNonOrthScale, par.momentumConvectionScheme);
+      relax_momentum_system_on_gpu(mesh, mom, d_qInitial, par.uRelax);
+      if(extractRAU) extract_rAU_from_momentum_matrix(mesh, dmesh, mom, par, rAU);
+    } else {
+      assemble_momentum_rhs_only_on_gpu_device_grad(
+          dmesh, mesh, mom, par.rho, mu,
+          d_qInitial, d_uConv, d_vConv, d_wConv,
+          mom.d_gradQx, mom.d_gradQy, mom.d_gradQz, d_gradPcomp,
+          dbcQ, dbcU, dbcV, dbcW,
+          par.momNonOrthScale, par.uRelax);
+    }
+    double dtAsm = MPI_Wtime()-pm_asm.t0;
+    totalAssemble += dtAsm;
+    profile_record(asmStats, pm_asm);
+
+    CUDA_CALL(cudaMemcpy(d_rhsSave, mom.lin.d_rhs,
+                         mesh.nCells*sizeof(HYPRE_Complex),
+                         cudaMemcpyDeviceToDevice));
   };
 
   double runStart = MPI_Wtime();
@@ -4980,22 +5966,57 @@ CUDA_CALL(cudaFree(0));
   int maxSteps = (par.profileSteps>0 ? std::min(par.nsteps, par.profileSteps) : par.nsteps);
   for(int step=1; step<=maxSteps; ++step){
     double iterStart = MPI_Wtime();
-    uOld=u; vOld=v; wOld=w; pOld=p;
     std::fill(pCorr.begin(), pCorr.end(), 0.0);
 
+    // Preserve old SIMPLE fields on device. Momentum predictors overwrite ss.d_u/v/w,
+    // and pressure is updated in-place later in the iteration. Keep convergence checks
+    // device-resident rather than copying full fields back to host every step.
+    CUDA_CALL(cudaMemcpy(ss.d_uOld, ss.d_u, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+    CUDA_CALL(cudaMemcpy(ss.d_vOld, ss.d_v, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+    CUDA_CALL(cudaMemcpy(ss.d_wOld, ss.d_w, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+    CUDA_CALL(cudaMemcpy(ss.d_pOld, ss.d_p, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+
     PhaseMark pm_pgrad = profile_begin();
-    copy_vec_to_device(pOld, ss.d_p);
-    compute_lsq_gradient_gpu(gop, dmesh, dbcP, ss.d_p,
-                             ss.d_gradx, ss.d_grady, ss.d_gradz);
+    // ss.d_p already contains pOld from the previous pressure update / initial upload.
+    // Compute the selected pressure gradient once and reuse it for both momentum RHS and HbyA.
+    compute_pressure_gradient_gpu(par, gop, dmesh, dbcP, ss.d_p,
+                                  ss.d_gradx, ss.d_grady, ss.d_gradz);
     profile_record(prof[PH_PGRAD], pm_pgrad);
 
-    auto uConv = uOld, vConv = vOld, wConv = wOld;
-
     // The scalar momentum matrix is the same for Ux, Uy, Uz for this segregated equation.
-    // Build/copy/setup it once on Ux, then rebuild only the RHS for Uy/Uz and reuse the same BiCGSTAB setup.
-    solve_scalar_component_with_nonorth(uOld, uConv, vConv, wConv, ss.d_gradx, bcUType, uFaceBC, dbcU, uStar, lastItsU, lastRelU, corrUsedU, true,  true,  prof[PH_UGRAD], prof[PH_UASM], prof[PH_USOLVE]);
-    solve_scalar_component_with_nonorth(vOld, uConv, vConv, wConv, ss.d_grady, bcVType, vFaceBC, dbcV, vStar, lastItsV, lastRelV, corrUsedV, false, false, prof[PH_VGRAD], prof[PH_VASM], prof[PH_VSOLVE]);
-    solve_scalar_component_with_nonorth(wOld, uConv, vConv, wConv, ss.d_gradz, bcWType, wFaceBC, dbcW, wStar, lastItsW, lastRelW, corrUsedW, false, false, prof[PH_WGRAD], prof[PH_WASM], prof[PH_WSOLVE]);
+    // Use device-resident old fields and convection fields; avoid old host<->device copies.
+    if(par.velSolver == 3){
+      ensure_fused_mcgs_scratch(mesh.nCells);
+      corrUsedU = corrUsedV = corrUsedW = 0;
+
+      assemble_scalar_component_rhs_for_fused(
+          ss.d_uOld, ss.d_uOld, ss.d_vOld, ss.d_wOld,
+          ss.d_gradx, dbcU, g_fused_mcgs.d_rhsU,
+          true, true, prof[PH_UGRAD], prof[PH_UASM]);
+      assemble_scalar_component_rhs_for_fused(
+          ss.d_vOld, ss.d_uOld, ss.d_vOld, ss.d_wOld,
+          ss.d_grady, dbcV, g_fused_mcgs.d_rhsV,
+          false, false, prof[PH_VGRAD], prof[PH_VASM]);
+      assemble_scalar_component_rhs_for_fused(
+          ss.d_wOld, ss.d_uOld, ss.d_vOld, ss.d_wOld,
+          ss.d_gradz, dbcW, g_fused_mcgs.d_rhsW,
+          false, false, prof[PH_WGRAD], prof[PH_WASM]);
+
+      PhaseMark pm_solve = profile_begin();
+      solve_momentum_gpu_device_mcgs_fused_defect_x0_xout(
+          mom, par,
+          ss.d_uOld, ss.d_vOld, ss.d_wOld,
+          ss.d_u, ss.d_v, ss.d_w,
+          lastItsU, lastItsV, lastItsW,
+          lastRelU, lastRelV, lastRelW,
+          totalSetup, totalSolve,
+          true);
+      profile_record(prof[PH_USOLVE], pm_solve);
+    } else {
+      solve_scalar_component_with_nonorth(ss.d_uOld, ss.d_uOld, ss.d_vOld, ss.d_wOld, ss.d_gradx, dbcU, ss.d_u, lastItsU, lastRelU, corrUsedU, true,  true,  prof[PH_UGRAD], prof[PH_UASM], prof[PH_USOLVE]);
+      solve_scalar_component_with_nonorth(ss.d_vOld, ss.d_uOld, ss.d_vOld, ss.d_wOld, ss.d_grady, dbcV, ss.d_v, lastItsV, lastRelV, corrUsedV, false, false, prof[PH_VGRAD], prof[PH_VASM], prof[PH_VSOLVE]);
+      solve_scalar_component_with_nonorth(ss.d_wOld, ss.d_uOld, ss.d_vOld, ss.d_wOld, ss.d_gradz, dbcW, ss.d_w, lastItsW, lastRelW, corrUsedW, false, false, prof[PH_WGRAD], prof[PH_WASM], prof[PH_WSOLVE]);
+    }
 
     PhaseMark pm_psetup = profile_begin();
     double ps0 = pressureSetup;
@@ -5004,13 +6025,10 @@ CUDA_CALL(cudaFree(0));
     update_pressure_matrix_from_rAU(mesh, dmesh, pressureSys, dbcP, mom.d_rAU, par.rho, par.pCoeffScale, refCell, usePressureAnchor, doPressureSetup, pressureSetup);
     profile_record(prof[PH_PSETUP], pm_psetup);
 
-    u = uStar; v = vStar; w = wStar; p = pOld;
-    copy_vec_to_device(uStar, ss.d_u);
-    copy_vec_to_device(vStar, ss.d_v);
-    copy_vec_to_device(wStar, ss.d_w);
-    copy_vec_to_device(p, ss.d_p);
+    // ss.d_u/v/w already contain the device-resident momentum predictor fields.
+    // ss.d_p still contains pOld.
     if(par.pMode == 1 && par.pSolveMode == 1){
-      compute_pressure_gradient_gpu(par, gop, dmesh, dbcP, ss.d_p, ss.d_gradx, ss.d_grady, ss.d_gradz);
+      // Reuse pOld gradient computed at the start of the SIMPLE iteration.
     } else {
       compute_lsq_gradient_gpu(gop, dmesh, dbcP, ss.d_p, ss.d_gradx, ss.d_grady, ss.d_gradz);
     }
@@ -5177,7 +6195,6 @@ CUDA_CALL(cudaFree(0));
       profile_record(prof[PH_CONT_IN_P_LOOP], pm_contp);
     }
     massRes = maxabs_device(ss.d_divCorr, mesh.nCells, ss.d_reduce, ss.reduceSize);
-    copy_device_to_vec(ss.d_pCorr, pCorr);
     {
       const int block = 256;
       if(par.pMode == 1){
@@ -5186,9 +6203,13 @@ CUDA_CALL(cudaFree(0));
         kernel_update_pressure_relax<<<(mesh.nCells + block - 1)/block, block>>>(mesh.nCells, ss.d_p, ss.d_pCorr, par.pRelax);
       }
       CUDA_CHECK_LAST();
-      copy_device_to_vec(ss.d_p, p);
+      if(usePressureAnchor){
+        double pref = 0.0;
+        CUDA_CALL(cudaMemcpy(&pref, ss.d_p + refCell, sizeof(double), cudaMemcpyDeviceToHost));
+        kernel_subtract_scalar_inplace<<<(mesh.nCells + block - 1)/block, block>>>(mesh.nCells, ss.d_p, pref);
+        CUDA_CHECK_LAST();
+      }
     }
-    if(usePressureAnchor){ double pref = p[refCell]; for(double &pv : p) pv -= pref; }
 
     PhaseMark pm_pcorrg = profile_begin();
     if(par.pMode == 1){
@@ -5206,21 +6227,13 @@ CUDA_CALL(cudaFree(0));
           ss.d_gradx, ss.d_grady, ss.d_gradz,
           ss.d_u, ss.d_v, ss.d_w);
       CUDA_CHECK_LAST();
-      copy_device_to_vec(ss.d_u, u);
-      copy_device_to_vec(ss.d_v, v);
-      copy_device_to_vec(ss.d_w, w);
     }
     profile_record(prof[PH_VEL_CORRECT], pm_velcorr);
 
-    auto relchg_field = [&](const std::vector<double>& a, const std::vector<double>& b){
-      double num=0.0, den=1.0;
-      for(std::size_t i=0;i<a.size();++i){ double d=a[i]-b[i]; num+=d*d; den+=a[i]*a[i];}
-      return std::sqrt(num/den);
-    };
-    duRel = relchg_field(u, uOld);
-    dvRel = relchg_field(v, vOld);
-    dwRel = relchg_field(w, wOld);
-    dpRel = relchg_field(p, pOld);
+    duRel = relchg_device(ss.d_u, ss.d_uOld, mesh.nCells, ss.d_reduce, ss.d_reduce2, ss.reduceSize);
+    dvRel = relchg_device(ss.d_v, ss.d_vOld, mesh.nCells, ss.d_reduce, ss.d_reduce2, ss.reduceSize);
+    dwRel = relchg_device(ss.d_w, ss.d_wOld, mesh.nCells, ss.d_reduce, ss.d_reduce2, ss.reduceSize);
+    dpRel = relchg_device(ss.d_p, ss.d_pOld, mesh.nCells, ss.d_reduce, ss.d_reduce2, ss.reduceSize);
 
     if(rank == 0){
       bool doBadCellAudit = false;
@@ -5248,6 +6261,11 @@ CUDA_CALL(cudaFree(0));
         copy_device_to_vec(ss.d_phiStar, phiStarH);
         copy_device_to_vec(ss.d_phi, phiH);
         copy_device_to_vec(ss.d_phiNonOrth, phiNonOrthH);
+        copy_device_to_vec(ss.d_pCorr, pCorr);
+        copy_device_to_vec(ss.d_u, u);
+        copy_device_to_vec(ss.d_v, v);
+        copy_device_to_vec(ss.d_w, w);
+        uStar = u; vStar = v; wStar = w;
         run_bad_cell_audit(par, mesh, bcPType, step, badCellAuditReason,
             massRes, duRel, dvRel, dwRel, dpRel,
             pCorr, gradxH, gradyH, gradzH, rAUH, divCorrH,
@@ -5260,7 +6278,7 @@ CUDA_CALL(cudaFree(0));
     double totalWall = MPI_Wtime() - runStart;
 
     if(rank==0 && (step==1 || (par.printEvery>0 && step%par.printEvery==0))){
-      std::printf("iter %4d : massRes = %.3e, duRel = %.3e, dvRel = %.3e, dwRel = %.3e, dpRel = %.3e, bicgstab=[%d %d %d], pcgLast=%d, pcgTot=%d, iterWall = %.3e s, totalWall = %.3e s\n",
+      std::printf("iter %4d : massRes = %.3e, duRel = %.3e, dvRel = %.3e, dwRel = %.3e, dpRel = %.3e, velIts=[%d %d %d], pcgLast=%d, pcgTot=%d, iterWall = %.3e s, totalWall = %.3e s\n",
                   step, massRes, duRel, dvRel, dwRel, dpRel,
                   (int)lastItsU, (int)lastItsV, (int)lastItsW, (int)lastItsP, pcgTotalIts, iterWall, totalWall);
     }
@@ -5268,6 +6286,11 @@ CUDA_CALL(cudaFree(0));
     profStepsDone = step;
 
     if(par.writeEvery>0 && step%par.writeEvery==0 && par.write_vtu){
+      copy_device_to_vec(ss.d_p, p);
+      copy_device_to_vec(ss.d_u, u);
+      copy_device_to_vec(ss.d_v, v);
+      copy_device_to_vec(ss.d_w, w);
+      copy_device_to_vec(ss.d_divCorr, divCorr);
       std::vector<std::array<double,3>> Uvec(mesh.nCells);
       std::vector<double> umag(mesh.nCells);
       for(int c=0;c<mesh.nCells;++c){ Uvec[c]={u[c],v[c],w[c]}; umag[c]=std::sqrt(u[c]*u[c]+v[c]*v[c]+w[c]*w[c]); }
@@ -5289,6 +6312,14 @@ CUDA_CALL(cudaFree(0));
 
   double solveLoopWall = MPI_Wtime() - runStart;
 
+  // Bring final fields back to host once for final summaries, force postprocessing, scalar coupling, and VTU output.
+  copy_device_to_vec(ss.d_p, p);
+  copy_device_to_vec(ss.d_u, u);
+  copy_device_to_vec(ss.d_v, v);
+  copy_device_to_vec(ss.d_w, w);
+  copy_device_to_vec(ss.d_divCorr, divCorr);
+  copy_device_to_vec(ss.d_phi, phi);
+
   std::vector<std::array<double,3>> Uvec(mesh.nCells);
   std::vector<double> umag(mesh.nCells);
   double umax=0.0,vmaxf=0.0,wmaxf=0.0,pmax=0.0;
@@ -5300,8 +6331,6 @@ CUDA_CALL(cudaFree(0));
 
   std::vector<double> scalarField;
   if(par.scalarEnable != 0){
-    phi.assign(mesh.nFaces, 0.0);
-    copy_device_to_vec(ss.d_phi, phi);
     scalarField = solve_scalar_after_flow(par, mesh, phi, rank);
   }
 
@@ -5430,7 +6459,7 @@ CUDA_CALL(cudaFree(0));
       }
     }
 
-    std::printf("last bicgstab it = [%d %d %d]\n", (int)lastItsU, (int)lastItsV, (int)lastItsW);
+    std::printf("last velocity it = [%d %d %d]\n", (int)lastItsU, (int)lastItsV, (int)lastItsW);
     std::printf("last pcg it   = %d\n", (int)lastItsP);
     std::printf("assemble time : %.6e s\n", totalAssemble);
     std::printf("mom setup time: %.6e s\n", totalSetup);

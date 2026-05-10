@@ -147,3 +147,103 @@ rcMode old
 ```
 
 That combination was unstable in development because the old explicit Rhie-Chow pressure term conflicts with the OpenFOAM-style absolute pressure flux path.
+
+<!-- ANABASIS_V1_1B_BUILD_START -->
+
+## Anabasis v1.1b: hypre 3.1 CUDA builds
+
+v1.1b supports standalone **hypre 3.1.0 CUDA** builds with Umpire disabled and hypre internal SpGEMM forced by default. This avoids the large-mesh vendor-SpGEMM failure mode observed during BoomerAMG setup on A100-scale cases.
+
+### Double-precision HYPRE build
+
+Example local RTX 3060 build:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.2
+export HYPRE_ROOT=/opt/hypre-3.1.0-cuda-real
+export HYPRE_LIBRARY=$HYPRE_ROOT/lib/libHYPRE.a
+export SM_ARCH=sm_86
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+
+./build_simple_gpu_hypre31_double.sh
+```
+
+Example A100 build:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.8
+export HYPRE_ROOT=/opt/hypre-3.1.0-cuda-real
+export HYPRE_LIBRARY=$HYPRE_ROOT/lib/libHYPRE.a
+export SM_ARCH=sm_80
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+
+./build_simple_gpu_hypre31_double.sh
+```
+
+Output binary:
+
+```text
+./simple_gpu_dp
+```
+
+### Single-precision HYPRE build
+
+The source compiles against both double- and single-HYPRE. HYPRE residual-query calls use `HYPRE_Real` temporaries so the single-HYPRE API receives the correct pointer type.
+
+Example local RTX 3060 build:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.2
+export HYPRE_ROOT=/opt/hypre-3.1.0-cuda-single
+export HYPRE_LIBRARY=$HYPRE_ROOT/lib/libHYPRE.a
+export SM_ARCH=sm_86
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+
+./build_simple_gpu_hypre31_single.sh
+```
+
+Example A100 build:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.8
+export HYPRE_ROOT=/opt/hypre-3.1.0-cuda-single
+export HYPRE_LIBRARY=$HYPRE_ROOT/lib/libHYPRE.a
+export SM_ARCH=sm_80
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+
+./build_simple_gpu_hypre31_single.sh
+```
+
+Output binary:
+
+```text
+./simple_gpu_sp
+```
+
+For single-HYPRE runs, a practical pressure absolute tolerance is usually:
+
+```text
+pTol ≈ 1e-7
+```
+
+Use the double executable for tighter pressure solves such as `1e-10`.
+
+### A100 SP vs DP comparison
+
+The plots below compare v1.1b single-HYPRE and double-HYPRE A100 runs.
+
+![Total MIUPS overlay](docs/images/a100_sp_vs_dp_v1_1b/01_total_miups_overlay.png)
+
+![Component MIUPS overlay](docs/images/a100_sp_vs_dp_v1_1b/02_component_miups_overlay.png)
+
+![SP speedup over DP](docs/images/a100_sp_vs_dp_v1_1b/09_sp_speedup_over_dp.png)
+
+![Timing components grouped](docs/images/a100_sp_vs_dp_v1_1b/10_timing_components_grouped.png)
+
+Memory note: `/usr/bin/time -v` reports host process RSS, not GPU VRAM. GPU VRAM should be measured separately with `nvidia-smi` or explicit in-code GPU memory logging.
+
+<!-- ANABASIS_V1_1B_BUILD_END -->

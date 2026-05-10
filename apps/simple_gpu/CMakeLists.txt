@@ -1,3 +1,5 @@
+option(ANABASIS_USE_HYPRE_INTERNAL_SPGEMM "Force hypre internal device SpGEMM instead of vendor/cuSPARSE SpGEMM" OFF)
+
 add_executable(simple_gpu
   src/main.cu
   src/bc_specs.cu
@@ -30,7 +32,11 @@ if(MPI_CXX_LINK_FLAGS)
   target_link_options(simple_gpu PRIVATE ${_MPI_CXX_LINK_FLAGS_SIMPLE})
 endif()
 
+if(ANABASIS_USE_HYPRE_INTERNAL_SPGEMM)
+  target_compile_definitions(simple_gpu PRIVATE ANABASIS_USE_HYPRE_INTERNAL_SPGEMM=1)
+endif()
+
 set_target_properties(simple_gpu PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
-  CUDA_ARCHITECTURES 86
+  CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
 )
