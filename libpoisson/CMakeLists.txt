@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.21)
 find_package(MPI REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
+option(ANABASIS_HYPRE_STATIC_CUDA_DEPS "Link explicit CUDA libraries needed by static libHYPRE.a" OFF)
+
 set(HYPRE_ROOT "" CACHE PATH "Root of HYPRE install that contains include/ and lib/")
 
 find_path(HYPRE_INCLUDE_DIR
@@ -55,3 +57,17 @@ set_target_properties(libpoisson PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   CUDA_ARCHITECTURES native
 )
+
+
+# HYPRE static CUDA dependency link fix.
+# Needed when HYPRE_LIBRARY points to libHYPRE.a instead of libHYPRE.so.
+if(ANABASIS_HYPRE_STATIC_CUDA_DEPS)
+  target_link_libraries(libpoisson PUBLIC
+    CUDA::cusparse
+    CUDA::cublas
+    CUDA::cublasLt
+    CUDA::curand
+    CUDA::cusolver
+    dl
+  )
+endif()

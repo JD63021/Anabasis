@@ -15,3 +15,15 @@ runs/
 *.generated.bc
 __pycache__/
 .DS_Store
+
+# Anabasis generated outputs
+**/runs/
+*.pvd
+*.pvtu
+*.xdmf
+*.h5
+*.o
+simple_gpu
+simple_gpu_dp
+simple_gpu_sp
+cmake-build-*/

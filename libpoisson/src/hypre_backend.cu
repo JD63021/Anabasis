@@ -96,7 +96,11 @@ HypreSolveInfo solve_system_hypre_gpu(
 
   HypreSolveInfo info;
   HYPRE_CALL(HYPRE_PCGGetNumIterations(solver, &info.iterations));
-  HYPRE_CALL(HYPRE_PCGGetFinalRelativeResidualNorm(solver, &info.finalRelResNorm));
+  do {
+    HYPRE_Real finalRelResNorm_h = (HYPRE_Real)0.0;
+    HYPRE_CALL(HYPRE_PCGGetFinalRelativeResidualNorm(solver, &finalRelResNorm_h));
+    info.finalRelResNorm = (double)finalRelResNorm_h;
+  } while(0);
 
   HYPRE_CALL(HYPRE_IJVectorMigrate(xij, HYPRE_MEMORY_HOST));
   std::vector<HYPRE_Complex> xhost(pat.nRows, 0.0);
