@@ -1,0 +1,11 @@
+PRE3F1 momentum flux audit setup: ranks=2 globalRows=8890 globalNnz=116712
+rank 0/2 rows=[0,4444] nLocal=4445 nnz=58580 internalFaces=25071 procFaces=3993 boundaryFaces=3256
+rank 1/2 rows=[4445,8889] nLocal=4445 nnz=58132 internalFaces=24847 procFaces=3993 boundaryFaces=3087
+PRE3F1 solved-W flux audit: divInf=3.148412788286e-05 divL2=2.211395542419e-06 Wmin=2.869967165515e-23 Wmax=9.763710498810e-01 WvolAvg=1.633134527470e-02
+PRE3F1 vector halo / velocity correction bridge: globalMaxVecJump=5.871856212616e-01 globalMaxVelCorr=1.421732131810e+02 globalSumVelCorr=8.197904043139e+03
+PRE3F1 W halo/correction bridge: nProcFacesLocal=3993 globalMaxHaloJump=5.871856212616e-01 globalMaxFaceCorr=9.736598976754e-04 globalSumAbsFaceCorr=6.834629759990e-02
+PRE3F1 explicit flux correction report: maxInternal=1.927748704463e-03 sumInternal=6.022243320916e-01 maxBoundary=3.397327002965e-02 sumBoundary=1.716318283299e+00 maxProcessor=9.736598976754e-04 sumProcessor=6.834629759990e-02
+PRE3F1 GPU momentum residual: resInf=6.215365680462e-09 resL2=3.605050270457e-10 rhsInf=3.535447642207e-02 relInf=1.758013781978e-07
+PRE3F1 momentum residual summary: massBeforeInf=3.535447642207e-02 massAfterInf=6.215365680462e-09 reduction=1.758013781978e-07 improvement=5.688238e+06
+PRE3F1 momentum flux audit W-solve RESULT: solveErr=0 its=9 finalRel=1.220203671437e-07 wL2=8.761436605017e-02 wInf=9.763710498810e-01 wall=1.830027e-01 s
+PRE3F1 RESULT: PASS_RAN
