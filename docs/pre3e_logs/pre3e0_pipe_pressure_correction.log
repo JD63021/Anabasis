@@ -1,0 +1,8 @@
+rank 1/2 rows=[4445,8889] nLocal=4445 nnz=58132 internalFaces=24847 procFaces=3993 boundaryFaces=3087
+PRE3E0 pipe pressure correction setup: ranks=2 globalRows=8890 globalNnz=116712
+rank 0/2 rows=[0,4444] nLocal=4445 nnz=58580 internalFaces=25071 procFaces=3993 boundaryFaces=3256
+PRE3E0 vector halo / velocity correction bridge: globalMaxVecJump=4.285892216790e-01 globalMaxVelCorr=1.270636062304e-01 globalSumVelCorr=2.076779756421e+01
+PRE3E0 pCorr halo/correction bridge: nProcFacesLocal=3993 globalMaxHaloJump=5.555464304052e-04 globalMaxFaceCorr=1.689504933375e-06 globalSumAbsFaceCorr=1.893475472606e-04
+PRE3E0 GPU pressure-correction residual: resInf=8.960999614372e-09 resL2=7.907620177266e-10 rhsInf=1.828731546993e-05 relInf=4.900117586480e-04
+PRE3E0 pipe pressure correction solve RESULT: solveErr=0 its=4 finalRel=5.397453205660e-04 xL2=6.670429376492e-05 xInf=7.343725883402e-04 wall=1.626051e-01 s
+PRE3E0 RESULT: PASS_RAN
