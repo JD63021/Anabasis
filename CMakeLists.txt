@@ -11,3 +11,5 @@ find_package(MPI REQUIRED COMPONENTS CXX)
 add_subdirectory(libpoisson)
 add_subdirectory(libscalar)
 add_subdirectory(apps/simple_gpu)
+
+add_subdirectory(apps/pre3_poisson_local_mpi)
