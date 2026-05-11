@@ -31,3 +31,5 @@ add_subdirectory(apps/pre3_pipe_pressure_correction_gpu_mpi)
 add_subdirectory(apps/pre3_pipe_pressure_correction_report_gpu_mpi)
 
 add_subdirectory(apps/pre3_pipe_flux_correction_gpu_mpi)
+
+add_subdirectory(apps/pre3_pipe_momentum_predictor_gpu_mpi)
