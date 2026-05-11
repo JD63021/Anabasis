@@ -1,0 +1,8 @@
+PRE3D2 pressure correction skeleton setup: ranks=2 globalRows=8890 globalNnz=116712
+rank 0/2 rows=[0,4444] nLocal=4445 nnz=58580 internalFaces=25071 procFaces=3993 boundaryFaces=3256
+rank 1/2 rows=[4445,8889] nLocal=4445 nnz=58132 internalFaces=24847 procFaces=3993 boundaryFaces=3087
+PRE3D2 vector halo / velocity correction bridge: globalMaxVecJump=6.768416629881e-03 globalMaxVelCorr=1.662659418056e-01 globalSumVelCorr=2.680368855402e+02
+PRE3D2 pCorr halo/correction bridge: nProcFacesLocal=3993 globalMaxHaloJump=1.144803944044e-03 globalMaxFaceCorr=3.035690702178e-06 globalSumAbsFaceCorr=2.373479161526e-03
+PRE3D2 GPU pressure-correction residual: resInf=1.589837742196e-09 resL2=2.293975018666e-10 rhsInf=8.572572551202e-05 relInf=1.854563181239e-05
+PRE3D2 pressure correction skeleton pressure-solve RESULT: solveErr=0 its=6 finalRel=1.957770837180e-05 L2=1.805493898121e-05 Linf=1.018270641552e-04 wall=1.730217e-01 s
+PRE3D2 pressure correction residual skeleton RESULT: PASS_RAN
