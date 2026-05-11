@@ -1,0 +1,5 @@
+PRE3C1 distributed graph Poisson setup: ranks=2 globalRows=34423 globalNnz=493451
+rank 0/2 rows=[0,17211] nLocal=17212 localNnz=246655 internalContrib=225152 procContrib=4291 boundaryContrib=5625
+rank 1/2 rows=[17212,34422] nLocal=17211 localNnz=246796 internalContrib=225294 procContrib=4291 boundaryContrib=5523
+PRE3C1 distributed graph Poisson RESULT: solveErr=0 its=16 finalRel=2.944040844444e-11 L2=2.438250614788e-07 Linf=1.225417169293e-06 wall=5.830505e-02 s
+PRE3C1 RESULT: PASS
