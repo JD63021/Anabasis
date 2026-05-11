@@ -1,0 +1,7 @@
+rank 1/2 rows=[17212,34422] nLocal=17211 nnz=246796 internalFaces=112647 procFaces=4291 boundaryFaces=5523
+PRE3D1 pressure/velocity bridge setup: ranks=2 globalRows=34423 globalNnz=493451
+rank 0/2 rows=[0,17211] nLocal=17212 nnz=246655 internalFaces=112576 procFaces=4291 boundaryFaces=5625
+PRE3D1 vector halo / velocity correction bridge: globalMaxVecJump=3.814940300970e-05 globalMaxVelCorr=1.223466458339e-04 globalSumVelCorr=6.493695036720e-02
+PRE3D1 pCorr halo/correction bridge: nProcFacesLocal=4291 globalMaxHaloJump=3.507525825341e-09 globalMaxFaceCorr=3.483413310433e-14 globalSumAbsFaceCorr=2.253771549816e-11
+PRE3D1 pressure/velocity bridge pressure-solve RESULT: solveErr=0 its=1 finalRel=1.099294871092e-01 L2=5.132338205365e-10 Linf=4.474843696181e-09 wall=1.970398e-01 s
+PRE3D1 pressure/velocity bridge RESULT: PASS_RAN
