@@ -1,0 +1,10 @@
+PRE3F0 axial momentum predictor setup: ranks=2 globalRows=8890 globalNnz=116712
+rank 0/2 rows=[0,4444] nLocal=4445 nnz=58580 internalFaces=25071 procFaces=3993 boundaryFaces=3256
+rank 1/2 rows=[4445,8889] nLocal=4445 nnz=58132 internalFaces=24847 procFaces=3993 boundaryFaces=3087
+PRE3F0 vector halo / velocity correction bridge: globalMaxVecJump=4.285892216790e-01 globalMaxVelCorr=1.421732131810e+02 globalSumVelCorr=8.197903986683e+03
+PRE3F0 W halo/correction bridge: nProcFacesLocal=3993 globalMaxHaloJump=5.871856212616e-01 globalMaxFaceCorr=9.736598976754e-04 globalSumAbsFaceCorr=6.834629796972e-02
+PRE3F0 explicit flux correction report: maxInternal=1.927748756865e-03 sumInternal=6.022243341660e-01 maxBoundary=3.397327213694e-02 sumBoundary=1.716318296773e+00 maxProcessor=9.736598976754e-04 sumProcessor=6.834629796972e-02
+PRE3F0 GPU momentum residual: resInf=6.170645378348e-09 resL2=3.547748498384e-10 rhsInf=3.535447642207e-02 relInf=1.745364661799e-07
+PRE3F0 momentum residual summary: massBeforeInf=3.535447642207e-02 massAfterInf=6.170645378348e-09 reduction=1.745364661799e-07 improvement=5.729462e+06
+PRE3F0 axial momentum predictor W-solve RESULT: solveErr=0 its=9 finalRel=1.220203955654e-07 wL2=8.761436702287e-02 wInf=9.763710498810e-01 wall=1.849351e-01 s
+PRE3F0 RESULT: PASS_RAN
