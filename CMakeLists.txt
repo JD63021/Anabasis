@@ -15,3 +15,5 @@ add_subdirectory(apps/simple_gpu)
 add_subdirectory(apps/pre3_poisson_local_mpi)
 
 add_subdirectory(apps/pre3_poisson_dist_graph_mpi)
+
+add_subdirectory(apps/pre3_poisson_dist_geom_gpu_mpi)
