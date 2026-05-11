@@ -1,0 +1,449 @@
+ANABASIS v1.1 KNOWLEDGE TRANSFER
+===================================
+
+Purpose
+-------
+This document is a handoff note for another LLM/developer continuing work on Anabasis v1.1. It summarizes the current cleaned repository, the solver architecture, how the pieces connect, how to build/run, important numerical settings, and lessons learned from OpenFOAM comparisons.
+
+Current public version
+----------------------
+Version name:
+    Anabasis v1.1
+
+Main executable:
+    simple_gpu
+
+Main app folder:
+    apps/simple_gpu/
+
+Build script:
+    build_simple_gpu.sh
+
+Main public cases:
+    cases/cylinder.case
+    cases/reference.case
+
+Recommended baseline SIMPLE path:
+    pSolveMode ofAbsolute
+    rcMode oflike
+    pGradScheme gauss
+
+Dangerous pairing:
+    pSolveMode ofAbsolute
+    rcMode old
+
+High-level project goal
+-----------------------
+Anabasis is a journey towards a modular GPU finite-volume codebase for CFD and PDE solving on OpenFOAM polyMesh inputs.
+
+The current v1.1 release focuses on a GPU SIMPLE solver for steady incompressible laminar flow on polyhedral OpenFOAM meshes. It also includes modular foundations for Poisson/elliptic operators and passive scalar transport.
+
+Clean v1.1 repository layout
+----------------------------
+Important files/folders:
+
+    CMakeLists.txt
+    README.md
+    LICENSE
+    .gitignore
+    build_simple_gpu.sh
+
+    apps/simple_gpu/
+        CMakeLists.txt
+        README.md
+        src/main.cu
+        src/bc_specs.h
+        src/bc_specs.cu
+        src/bc_runtime_config.h
+        src/bc_runtime_config.cu
+        src/patch_geometry.h
+        src/patch_geometry.cu
+        src/velocity_bc_eval.h
+        src/velocity_bc_eval.cu
+
+    libpoisson/
+        CMakeLists.txt
+        include/bc.h
+        include/common.h
+        include/field.h
+        include/gradient.h
+        include/hypre_backend.h
+        include/mesh.h
+        include/mms.h
+        include/poisson_library.h
+        include/scalar_elliptic.h
+        src/bc.cu
+        src/gradient.cu
+        src/hypre_backend.cu
+        src/mesh.cu
+        src/poisson_library.cu
+        src/scalar_elliptic.cu
+
+    libscalar/
+        CMakeLists.txt
+        include/scalar_transport_library.h
+        src/scalar_transport_library.cu
+
+    cases/
+        cylinder.case
+        reference.case
+
+    docs/
+        INSTALL.md
+        RUN_CYLINDER.md
+
+Files intentionally removed from public v1.1:
+    old generic_simple_v1/generic_simple_v2/generic_simple_v2_1 development apps
+    old simple/cylinder_simple/stokes_mms_simple apps
+    MMS/example/debug meshes and generated run outputs
+    long development patch bundles, logs, VTUs, CSVs, generated BC sidecars
+    compiled binaries
+
+Build system and file connections
+---------------------------------
+Top-level CMakeLists.txt:
+    Includes libpoisson, libscalar, and apps/simple_gpu. It should not reference legacy app folders.
+
+build_simple_gpu.sh:
+    Direct CUDA/C++ build script. It creates ./simple_gpu. Use this rather than plain make.
+
+apps/simple_gpu/src/main.cu:
+    Main SIMPLE solver. It parses command-line/case options, reads OpenFOAM polyMesh, builds mesh geometry, parses runtime BCs, allocates/upload fields to GPU, assembles momentum/pressure systems, calls HYPRE solvers, runs SIMPLE iterations, optionally runs scalar transport, optionally computes forces, and writes VTU.
+
+apps/simple_gpu/src/bc_specs.*:
+    Defines runtime BC specification objects and supported BC names, for example wall_noslip, fixed_normal_speed, parabolic_box_inlet, zero_gradient, fixed_value.
+
+apps/simple_gpu/src/bc_runtime_config.*:
+    Reads runtime BC entries from the .case file and/or a .generated.bc sidecar.
+
+    Important debugging note:
+        If the log prints
+            BC config source : cases/<case>.generated.bc
+        then a sidecar is being used. Remove/rename it when testing inline BC changes:
+            mv cases/<case>.generated.bc cases/<case>.generated.bc.off
+
+apps/simple_gpu/src/velocity_bc_eval.*:
+    Evaluates velocity BCs on patch faces. This is where fixed normal speed and inlet profiles become face values/fluxes.
+
+apps/simple_gpu/src/patch_geometry.*:
+    Computes patch summaries and runtime inlet audit data. The log prints patch area, centroid, average normal, planarity, inlet velocity min/max/avg, inward flow rate, and face flux diagnostics. These are critical for comparing with OpenFOAM.
+
+libpoisson:
+    Modular Poisson/elliptic component. Current gradient options:
+        poissonGradientScheme lsq
+        poissonGradientScheme gauss
+
+    The Gauss/Green-Gauss gradient was added into libpoisson as a modular gradient choice. This is separate from SIMPLE's app-level pGradScheme.
+
+libscalar:
+    Passive scalar transport module. Current convection options:
+        scalarConvectionScheme central
+        scalarConvectionScheme upwind
+
+    These control scalar transport only, not momentum convection.
+
+cases/cylinder.case:
+    Main public test case. Expected patches:
+        patch_0_0 = channel walls
+        patch_1_0 = inlet
+        patch_2_0 = outlet
+        patch_3_0 = cylinder wall / force patch
+
+    Important dimensions:
+        pipeD 0.1
+        pipeL 2.5
+
+    The names are historical but pipeD is used as the reference cylinder diameter for force coefficient normalization.
+
+cases/reference.case:
+    Verbose reference file documenting most options: momentumConvectionScheme, scalarConvectionScheme, poissonGradientScheme, pGradScheme, pSolveMode, diagnostics, force options, etc.
+
+Core SIMPLE algorithm
+---------------------
+The recommended robust path is OpenFOAM-like absolute pressure correction:
+
+    pMode absolute
+    pSolveMode ofAbsolute
+    rcMode oflike
+    pGradScheme gauss
+
+Conceptual loop:
+    1. Solve momentum predictor.
+    2. Build HbyA-like predictor flux.
+    3. Solve absolute pressure equation.
+    4. Correct flux: phi = phiHbyA - pEqnFlux.
+    5. Relax pressure: p = pOld + pRelax*(pNew - pOld).
+    6. Assign velocity: U = HbyA - rAU*grad(p).
+
+Important discovery:
+    Do not combine pSolveMode ofAbsolute with rcMode old. The old explicit Rhie-Chow feedback conflicts with the OpenFOAM-style absolute pressure path and can blow up.
+
+Older correction-compatible mode:
+    pSolveMode correction
+    rcMode old
+    pGradScheme lsq
+
+Scheme options
+--------------
+SIMPLE pressure gradient:
+    pGradScheme gauss
+    pGradScheme lsq
+
+    This affects the pressure-gradient path used in SIMPLE, especially final U = HbyA - rAU*grad(p). It does not convert the whole solver to Gauss gradients.
+
+Momentum convection:
+    momentumConvectionScheme central
+    momentumConvectionScheme upwind
+
+    This controls SIMPLE momentum convection. Upwind wiring was added after scalar upwind already existed.
+
+Scalar convection:
+    scalarConvectionScheme central
+    scalarConvectionScheme upwind
+
+    This controls passive scalar transport in libscalar.
+
+Poisson gradient:
+    poissonGradientScheme lsq
+    poissonGradientScheme gauss
+
+    This controls the modular Poisson library gradient path.
+
+Pressure delta:
+    pDeltaMode of
+    pDeltaMinCos 0.05
+
+    This mimics OpenFOAM's guarded non-orthogonal delta coefficient, approximately 1/max(n.d, 0.05*|d|). Recommended for complex meshes.
+
+Non-orthogonal correction notes:
+    momNonOrthScale controls explicit momentum cross-diffusion amplitude.
+    pNonOrthScale controls explicit pressure nonorth correction amplitude.
+    nVelNonOrthCorr repeats velocity correction passes; too many can destabilize difficult cases.
+    nNonOrthCorr is the pressure non-orthogonal loop count.
+
+rho robustness
+--------------
+The solver now prints:
+    rho in pEqn : ON (pressure coeff/flux use rho*rAU)
+
+This means pressure matrix coefficients and pressure flux corrections use rho*rAU instead of only rAU. This was added because early testing mostly used rho=1.
+
+Suggested rho test:
+    Run cylinder with rho=1, mu=0.001.
+    Run cylinder with rho=10, mu=0.01.
+    Since rho and mu are both scaled by 10, Re is unchanged. Velocity field and coefficients should be close; raw pressure/force scales accordingly.
+
+Force postprocessing
+--------------------
+Controlled by:
+    forceEnable 0/1
+
+Typical cylinder force settings:
+    forceEnable 1
+    forcePatch patch_3_0
+    forceNormalSign -1
+    forceUref 0.2
+    forceAreaRef 0.041
+    forceDragDir 1,0,0
+    forceLiftDir 0,0,1
+    forceSpanDir 0,1,0
+
+If forceEnable 1, both cylinder-specific and generic patch-force blocks may print. This is acceptable for v1.1. A future option forceMode cylinder|generic|both could clean this up.
+
+Build instructions
+------------------
+RTX 3060:
+    cd ~/anabasis_v0
+    export PETSC_DIR=$HOME/src/petsc
+    export PETSC_ARCH=arch-linux-cuda-opt
+    export LD_LIBRARY_PATH="$PETSC_DIR/$PETSC_ARCH/lib:${LD_LIBRARY_PATH:-}"
+    SM_ARCH=sm_86 ./build_simple_gpu.sh
+
+A100:
+    cd ~/anabasis_v0
+    export PETSC_DIR=$HOME/src/petsc
+    export PETSC_ARCH=arch-linux-cuda-opt
+    export LD_LIBRARY_PATH="$PETSC_DIR/$PETSC_ARCH/lib:${LD_LIBRARY_PATH:-}"
+    SM_ARCH=sm_80 ./build_simple_gpu.sh
+
+Expected:
+    Built successfully: ./simple_gpu
+
+Unused variable/function warnings are currently normal.
+
+Cylinder run command
+--------------------
+    cd ~/anabasis_v0
+    mkdir -p runs/cylinder
+    mpirun -n 1 ./simple_gpu \
+      -case-config cases/cylinder.case \
+      -out-prefix runs/cylinder/case \
+      2>&1 | tee runs/cylinder/run.log
+
+Check results:
+    grep -E "Ubar, D, H|CD_vector|CL_y_vector|CL_z_vector|Wrote VTU" \
+      runs/cylinder/run.log
+
+Known cylinder sanity output
+----------------------------
+A final public check built and ran successfully. One mesh/settings example gave approximately:
+    CD_vector   ~ 6.00
+    CL_z_vector ~ 7.6e-03
+
+Earlier meshes/settings gave CL_z closer to ~1e-2. The lift is mesh/settings sensitive; drag around 6 is the main sanity check.
+
+Force normalization should show:
+    Ubar, D, H = 0.2, 0.1, 0.41
+    coeff denom = rho*Ubar^2*D*H = 1.64e-03
+
+OpenFOAM comparison lessons
+---------------------------
+1. Compare actual flow rate Q, not just nominal inlet velocity.
+
+    Anabasis log prints:
+        inward flow rate
+
+    OpenFOAM comparison should use:
+        sum(phi) on inlet patch
+
+2. Beware sidecar generated BC files.
+
+    If log says BC config source is a .generated.bc file, inline BC edits may not be used as expected.
+
+3. Boundary condition mismatch can cause large pressure-drop differences.
+
+    In a shell/heat-exchanger comparison, OpenFOAM used:
+        inlet fixedNormalInletOutletVelocity
+        outlet pressureInletOutletVelocity
+        defaultFaces slip
+        p outlet totalPressure p0 0
+
+    Anabasis used:
+        patch_0_0 wall_noslip
+        patch_1_0 fixed_normal_speed
+        patch_2_0 zero_gradient velocity / fixed_value pressure
+
+    This is not the same physical problem. Slip vs no-slip on a large shell patch can easily create ~2x pressure drop changes.
+
+4. Meshes/patch names may differ.
+
+    OpenFOAM may use patch names inlet/outlet/defaultFaces, while Anabasis polyMesh may use patch_0_0/patch_1_0/patch_2_0. Check boundary files.
+
+5. OpenFOAM audit dictionaries require a FoamFile header.
+
+OpenFOAM audit dictionary example
+---------------------------------
+Use this to audit inlet/outlet phi and average p/U in OpenFOAM:
+
+    cd /tmp/case
+    cat > system/anabasisAudit <<'DICT'
+    FoamFile
+    {
+        version     2.0;
+        format      ascii;
+        class       dictionary;
+        object      anabasisAudit;
+    }
+
+    functions
+    {
+        inletPhi
+        {
+            type            surfaceFieldValue;
+            libs            ("libfieldFunctionObjects.so");
+            log             true;
+            regionType      patch;
+            name            inlet;
+            operation       sum;
+            fields          (phi);
+        }
+
+        outletPhi
+        {
+            type            surfaceFieldValue;
+            libs            ("libfieldFunctionObjects.so");
+            log             true;
+            regionType      patch;
+            name            outlet;
+            operation       sum;
+            fields          (phi);
+        }
+
+        inletAvg
+        {
+            type            surfaceFieldValue;
+            libs            ("libfieldFunctionObjects.so");
+            log             true;
+            regionType      patch;
+            name            inlet;
+            operation       areaAverage;
+            fields          (p U);
+        }
+
+        outletAvg
+        {
+            type            surfaceFieldValue;
+            libs            ("libfieldFunctionObjects.so");
+            log             true;
+            regionType      patch;
+            name            outlet;
+            operation       areaAverage;
+            fields          (p U);
+        }
+    }
+    DICT
+
+    NP=$(find . -maxdepth 1 -type d -name 'processor[0-9]*' | wc -l)
+    mpirun -np "$NP" foamPostProcess -parallel -latestTime -dict system/anabasisAudit \
+      2>&1 | tee log.anabasisAudit
+
+    find postProcessing -type f | sort | while read f; do
+        echo "----- $f -----"
+        cat "$f"
+    done
+
+Current limitations / future work
+---------------------------------
+1. Slip wall BC support:
+    Anabasis currently uses wall_noslip for solid walls. Some OpenFOAM cases use slip/free-slip on defaultFaces. True slip should impose U.n = 0 and zero normal gradient for tangential velocity.
+
+2. Force output mode:
+    Add forceMode cylinder|generic|both.
+
+3. Unified gradient module:
+    pGradScheme gauss is app-level for SIMPLE; poissonGradientScheme gauss is libpoisson-level. A future cleanup could unify these.
+
+4. Scalar coupling:
+    Scalar is currently passive and can be solved after flow convergence. Future versions may support coupled outer iteration.
+
+5. More OpenFOAM-like outlet BCs:
+    Add totalPressure, pressureInletOutletVelocity style options for closer matching of CfdOF cases.
+
+Useful GitHub/release checks
+----------------------------
+Before commit:
+    git --no-pager diff --cached --name-only | grep -E '(^runs/|^build/|\.vtu$|\.vtp$|\.csv$|\.log$|^simple_gpu$)' || true
+    git --no-pager diff --cached --check
+
+These should be clean.
+
+Most important settings to remember
+-----------------------------------
+Recommended robust SIMPLE baseline:
+    pMode absolute
+    pSolveMode ofAbsolute
+    rcMode oflike
+    pGradScheme gauss
+    rAUMode raw
+    pDeltaMode of
+    pDeltaMinCos 0.05
+
+Modular scheme knobs:
+    momentumConvectionScheme central/upwind
+    scalarConvectionScheme central/upwind
+    poissonGradientScheme lsq/gauss
+
+Dangerous:
+    pSolveMode ofAbsolute + rcMode old
+
+End of Anabasis v1.1 knowledge transfer.

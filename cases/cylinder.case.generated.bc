@@ -1,0 +1,9 @@
+# Auto-generated from cases/cylinder.case
+velocity patch_0_0 wall_noslip
+velocity patch_3_0 wall_noslip
+velocity patch_1_0 parabolic_box_inlet 0.41 0.45 y z average_patch_normal
+velocity patch_2_0 zero_gradient
+pressure patch_0_0 zero_gradient
+pressure patch_3_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0

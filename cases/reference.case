@@ -1,0 +1,244 @@
+# ======================================================================
+# Anabasis v1.1 reference case file
+# ======================================================================
+# The parser uses a flat key/value format. The bracketed headings are only
+# organization for humans and for the future modular PDE solver layout.
+#
+# Recommended robust SIMPLE pair:
+#   pSolveMode ofAbsolute
+#   rcMode oflike
+#   pGradScheme gauss
+#
+# Avoid:
+#   pSolveMode ofAbsolute
+#   rcMode old
+# ======================================================================
+
+# ----------------------------------------------------------------------
+# [mesh/output]
+# ----------------------------------------------------------------------
+# OpenFOAM polyMesh directory.
+polyMeshDir /tmp/meshCase/constant/polyMesh
+
+# Output prefix. Final VTU becomes <outPrefix>_final.vtu.
+outPrefix runs/reference/case
+
+# CUDA device id.
+device 0
+
+# Output and profiling.
+writeVtu 1
+writeEvery 0
+monitor 1
+profileSteps 0
+
+# ----------------------------------------------------------------------
+# [physics/fluid]
+# ----------------------------------------------------------------------
+rho 1.0
+mu 0.001
+Umean 0.45
+
+# Characteristic dimensions. These are harmless for generic cases and are
+# used by pipe/cylinder postprocessing when enabled.
+pipeD 0.1
+pipeL 2.5
+
+# ----------------------------------------------------------------------
+# [patch aliases]
+# ----------------------------------------------------------------------
+# These are summary/helper aliases. The actual runtime BC lines below are
+# the decisive boundary conditions.
+wallPatch patch_0_0
+inletPatch patch_1_0
+outletPatch patch_2_0
+
+# ----------------------------------------------------------------------
+# [SIMPLE outer loop]
+# ----------------------------------------------------------------------
+nsteps 500
+printEvery 10
+corrTol 1e-10
+tolMass 1e-3
+tolVel 1e-3
+
+uRelax 0.7
+pRelax 0.3
+
+# ----------------------------------------------------------------------
+# [geometry / reconstruction]
+# ----------------------------------------------------------------------
+# geomMethod:
+#   robust = robust triangulated polygon/cell geometry path
+#   legacy = older geometry path
+geomMethod robust
+
+# LSQ settings used by old-field gradient/reconstruction paths.
+# lsqStencil extended may be accepted for compatibility, but compact is the
+# normal path in this public solver.
+lsqStencil compact
+lsqWeightPower 1
+
+# ----------------------------------------------------------------------
+# [pressure-velocity coupling]
+# ----------------------------------------------------------------------
+# pMode:
+#   absolute = absolute pressure mode
+#   pcorr    = correction mode
+pMode absolute
+
+# pSolveMode:
+#   ofAbsolute = OpenFOAM-like HbyA/absolute-pressure path
+#   correction = older correction-style path
+pSolveMode ofAbsolute
+
+# rcMode:
+#   oflike = no old explicit RC term in predictor flux; use with ofAbsolute
+#   old    = old explicit pressure-consistency term; use only with correction mode
+rcMode oflike
+
+# pGradScheme controls the SIMPLE pressure-gradient path:
+#   gauss = Gauss/Green-Gauss pressure gradient, robust OpenFOAM-like default
+#   lsq   = least-squares pressure gradient, useful for comparison
+pGradScheme gauss
+
+# rAU mode:
+#   raw     = V/aP_raw
+#   relaxed = V/aP_relaxed
+rAUMode raw
+pCoeffScale 1
+
+# pDeltaMode:
+#   of     = OpenFOAM-style 1/max(n.d, pDeltaMinCos*|d|)
+#   legacy = older/v1-style delta behavior
+pDeltaMode of
+pDeltaMinCos 0.05
+
+# ----------------------------------------------------------------------
+# [momentum / pressure discretization]
+# ----------------------------------------------------------------------
+# momNonOrthScale controls explicit momentum cross-diffusion correction.
+# 0 is robust/orthogonal-only; 0.3/0.5/1 can be tested for pressure-drop match.
+momNonOrthScale 0
+
+# Momentum convection scheme:
+#   central = central/linear face value
+#   upwind  = first-order upwind using the current face flux sign
+momentumConvectionScheme central
+
+# Pressure non-orthogonal explicit correction amplitude.
+pNonOrthScale 0
+
+# Repeated correction loops.
+nVelNonOrthCorr 0
+nNonOrthCorr 0
+nPressureCorr 0
+
+# ----------------------------------------------------------------------
+# [initialization]
+# ----------------------------------------------------------------------
+# initMode:
+#   uniform   = uniform inlet-average startup
+#   potential = potential/projection startup when enabled in the app
+initMode uniform
+potentialInitRAU 1.0
+potentialInitMaxit 4000
+potentialInitTol 1e-10
+potentialInitRelTol 0.0
+potentialInitWrite 0
+
+# ----------------------------------------------------------------------
+# [linear solvers]
+# ----------------------------------------------------------------------
+velMaxit 2000
+velTol 0
+velRelTol 1e-10
+
+pUseAmg 1
+pMaxit 4000
+pTol 1e-12
+pRelTol 0.0
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgRelaxType 7
+pAmgKeepTranspose 1
+pAmgRebuildEvery 1
+
+# ----------------------------------------------------------------------
+# [Poisson module options]
+# ----------------------------------------------------------------------
+# These are module-level options for Poisson/potential/scalar elliptic solves.
+# libpoisson supports selectable gradients:
+#   poissonGradientScheme gauss
+#   poissonGradientScheme lsq
+poissonGradientScheme gauss
+poissonLaplacianScheme nonorth
+poissonNonOrthCorr 2
+
+# ----------------------------------------------------------------------
+# [Scalar transport module options]
+# ----------------------------------------------------------------------
+# scalarEnable 0 keeps this as a pure flow run.
+# scalarEnable 1 solves a passive scalar after the flow solve by default.
+scalarEnable 0
+scalarSolveMode afterFlow
+scalarName T
+
+# Scalar convection scheme exposed from libscalar:
+#   scalarConvectionScheme upwind
+#   scalarConvectionScheme central
+scalarConvectionScheme upwind
+
+scalarDiffusionScheme nonorth
+scalarGamma 1.0
+scalarRelax 1.0
+scalarNonOrthCorr 2
+scalarMaxit 4000
+scalarTol 1e-10
+scalarRelTol 0.0
+
+# Scalar BC syntax, used when scalarEnable 1:
+#   scalar patch_0_0 zero_gradient
+#   scalar patch_1_0 fixed_value 1.0
+#   scalar patch_2_0 zero_gradient
+
+# ----------------------------------------------------------------------
+# [velocity boundary conditions]
+# ----------------------------------------------------------------------
+velocity patch_0_0 wall_noslip
+velocity patch_3_0 wall_noslip
+velocity patch_1_0 parabolic_box_inlet 0.41 0.45 y z average_patch_normal
+velocity patch_2_0 zero_gradient
+
+# ----------------------------------------------------------------------
+# [pressure boundary conditions]
+# ----------------------------------------------------------------------
+pressure patch_0_0 zero_gradient
+pressure patch_3_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0
+
+# ----------------------------------------------------------------------
+# [force postprocessing]
+# ----------------------------------------------------------------------
+# forceEnable 0 disables force output. Set 1 for cylinder/patch-force output.
+forceEnable 0
+forcePatch patch_3_0
+forceNormalSign -1
+forceUref 0.2
+forceAreaRef 0.041
+forceDragDir 1,0,0
+forceLiftDir 0,0,1
+forceSpanDir 0,1,0
+
+# ----------------------------------------------------------------------
+# [diagnostics]
+# ----------------------------------------------------------------------
+badCellAuditEvery 0
+badCellAuditTop 15
+badCellAuditStart 1
+badCellAuditOnGrowth 0
+badCellAuditGrowthFactor 1.2
+badCellAuditMassFloor 1e-8
+badCellAuditWriteCsv 0

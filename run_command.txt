@@ -1,0 +1,2 @@
+mpirun -n 1 ./simple_gpu   -case-config cases/test.case   -out-prefix runs/cylinder/case   2>&1 | tee runs/cylinder/run.log
+

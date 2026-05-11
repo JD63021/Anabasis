@@ -1,0 +1,48 @@
+Anabasis v1.1a mcgs/gpu-residency patch
+=========================================
+
+This patch keeps the repository/folder name as anabasis_v1_1a.
+It does not modify anabasis_v1_1.
+
+Main changes in apps/simple_gpu/src/main.cu
+------------------------------------------
+1. Device-resident velocity BiCGSTAB path:
+   - Old SIMPLE fields are preserved on device as d_uOld/d_vOld/d_wOld.
+   - Momentum assembly now accepts device pointers for qOld/uConv/vConv/wConv.
+   - Velocity solve can write directly back to device predictor fields.
+   - This reduces repeated host<->device copies in the SIMPLE momentum loop.
+
+2. Added optional velocity solver choices:
+   -vel-solver bicgstab     : device-resident HYPRE BiCGSTAB field solve.
+   -vel-solver mcgs         : scalar multi-color Gauss-Seidel defect smoother.
+   -vel-solver mcgs-fused   : fused U/V/W multi-color Gauss-Seidel defect smoother.
+
+3. Added fixed-sweep controls:
+   -vel-sweeps <int>
+   -vel-smoother-omega <float>
+   -vel-gs-symmetric 0|1
+   -vel-correction-solve 0|1
+
+4. Tolerance naming was not changed:
+   velTol    remains HYPRE absolute tolerance.
+   velRelTol remains HYPRE relative tolerance.
+   pTol      remains HYPRE absolute tolerance.
+   pRelTol   remains HYPRE relative tolerance.
+
+Notes and limitations
+---------------------
+- The fused MCGS path currently supports nVelNonOrthCorr=0 only.
+  Use: -vel-solver mcgs-fused -nVelNonOrthCorr 0
+
+- The scalar MCGS path supports the existing nVelNonOrthCorr loop.
+
+- This patch was prepared in an environment without CUDA/NVCC, MPI, PETSc, or HYPRE,
+  so the first build on the target machine is the compile validation.
+
+Suggested first build
+---------------------
+export PETSC_DIR=$HOME/src/petsc
+export PETSC_ARCH=arch-linux-cuda-opt
+export LD_LIBRARY_PATH="$PETSC_DIR/$PETSC_ARCH/lib:${LD_LIBRARY_PATH:-}"
+SM_ARCH=sm_86 ./build_simple_gpu.sh 2>&1 | tee build_simple_gpu_mcgsgpu.log
+
