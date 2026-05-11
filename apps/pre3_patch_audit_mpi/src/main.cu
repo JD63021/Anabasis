@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 #include "mesh.h"
@@ -13,6 +14,34 @@
 static double audit_norm3(const std::array<double,3> &a)
 {
   return std::sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+}
+
+
+static void repair_patch_ranges(Mesh &mesh)
+{
+  if(mesh.patchStartFace.size() == mesh.patchNames.size() &&
+     mesh.patchNFaces.size() == mesh.patchNames.size()) {
+    return;
+  }
+
+  const int nPatches = (int)mesh.patchNames.size();
+  mesh.patchStartFace.assign(nPatches, -1);
+  mesh.patchNFaces.assign(nPatches, 0);
+
+  for(int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
+    const int raw = mesh.bPatch[f];
+    const int pidx = raw - 1;
+
+    if(pidx < 0 || pidx >= nPatches) {
+      throw std::runtime_error("Bad bPatch index while repairing patch ranges");
+    }
+
+    if(mesh.patchNFaces[pidx] == 0) {
+      mesh.patchStartFace[pidx] = f;
+    }
+
+    mesh.patchNFaces[pidx]++;
+  }
 }
 
 int main(int argc, char **argv)
@@ -37,6 +66,7 @@ int main(int argc, char **argv)
       caseRoot + "/processor" + std::to_string(rank) + "/constant/polyMesh";
 
     Mesh mesh = read_openfoam_polymesh(polyMeshDir);
+    repair_patch_ranges(mesh);
 
     MPI_Barrier(MPI_COMM_WORLD);
 
