@@ -1,5 +1,0 @@
-PRE3C2 GPU geometric Poisson setup: ranks=2 globalRows=34423 globalNnz=493451
-rank 0/2 rows=[0,17211] nLocal=17212 nnz=246655 internalFaces=112576 procFaces=4291 boundaryFaces=5625
-rank 1/2 rows=[17212,34422] nLocal=17211 nnz=246796 internalFaces=112647 procFaces=4291 boundaryFaces=5523
-PRE3C2 GPU geometric Poisson RESULT: solveErr=0 its=1 finalRel=1.099294871092e-01 L2=5.132336243576e-10 Linf=4.474843696181e-09 wall=2.044656e-01 s
-PRE3C2 RESULT: PASS_RAN

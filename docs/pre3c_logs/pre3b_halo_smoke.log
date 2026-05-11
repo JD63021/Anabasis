@@ -1,7 +1,0 @@
-rank 1 patch=procBoundary1to0 neigh=0 nFaces=4291 recvN=4291 sameOrderFaceIds=4291 remoteOwnerGlobal[min,max]=[288,34421]
-  first local original face IDs : 1563 1569 1572 1573 1741 1747 1750 1918 
-  first remote original face IDs: 1563 1569 1572 1573 1741 1747 1750 1918 
-rank 0 patch=procBoundary0to1 neigh=1 nFaces=4291 recvN=4291 sameOrderFaceIds=4291 remoteOwnerGlobal[min,max]=[289,34412]
-  first local original face IDs : 1563 1569 1572 1573 1741 1747 1750 1918 
-  first remote original face IDs: 1563 1569 1572 1573 1741 1747 1750 1918 
-PRE3B HALO SMOKE RESULT: PASS
