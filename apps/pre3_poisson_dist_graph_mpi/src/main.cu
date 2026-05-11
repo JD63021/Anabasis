@@ -315,7 +315,10 @@ int main(int argc, char **argv)
 
     HYPRE_CALL(HYPRE_Initialize());
 #if defined(HYPRE_USING_GPU)
-    HYPRE_CALL(HYPRE_DeviceInitialize());
+    // pre3c1 is a domain-decomposition correctness test.
+    // Keep HYPRE host-side for the distributed graph solve first.
+    // Device distributed HYPRE will be tested only after host off-rank
+    // connectivity is proven.
     HYPRE_CALL(HYPRE_SetMemoryLocation(HYPRE_MEMORY_HOST));
     HYPRE_CALL(HYPRE_SetExecutionPolicy(HYPRE_EXEC_HOST));
 #endif
@@ -349,7 +352,6 @@ int main(int argc, char **argv)
     HYPRE_CALL(HYPRE_IJMatrixSetValues(Aij, pat.nRows, pat.ncols.data(),
                                        pat.rows.data(), pat.cols.data(), values.data()));
     HYPRE_CALL(HYPRE_IJMatrixAssemble(Aij));
-    HYPRE_CALL(HYPRE_IJMatrixMigrate(Aij, HYPRE_MEMORY_DEVICE));
     HYPRE_CALL(HYPRE_IJMatrixGetObject(Aij, (void**)&A));
 
     std::vector<HYPRE_Complex> x0(nLocal, 0.0);
@@ -360,7 +362,6 @@ int main(int argc, char **argv)
     HYPRE_CALL(HYPRE_IJVectorInitialize_v2(bij, HYPRE_MEMORY_HOST));
     HYPRE_CALL(HYPRE_IJVectorSetValues(bij, nLocal, pat.rows.data(), rhs.data()));
     HYPRE_CALL(HYPRE_IJVectorAssemble(bij));
-    HYPRE_CALL(HYPRE_IJVectorMigrate(bij, HYPRE_MEMORY_DEVICE));
     HYPRE_CALL(HYPRE_IJVectorGetObject(bij, (void**)&bpar));
 
     HYPRE_CALL(HYPRE_IJVectorCreate(MPI_COMM_WORLD, ilower, iupper, &xij));
@@ -368,7 +369,6 @@ int main(int argc, char **argv)
     HYPRE_CALL(HYPRE_IJVectorInitialize_v2(xij, HYPRE_MEMORY_HOST));
     HYPRE_CALL(HYPRE_IJVectorSetValues(xij, nLocal, pat.rows.data(), x0.data()));
     HYPRE_CALL(HYPRE_IJVectorAssemble(xij));
-    HYPRE_CALL(HYPRE_IJVectorMigrate(xij, HYPRE_MEMORY_DEVICE));
     HYPRE_CALL(HYPRE_IJVectorGetObject(xij, (void**)&xpar));
 
     HYPRE_CALL(HYPRE_ParCSRPCGCreate(MPI_COMM_WORLD, &solver));
@@ -410,7 +410,6 @@ int main(int argc, char **argv)
     HYPRE_CALL(HYPRE_PCGGetNumIterations(solver, &its));
     HYPRE_CALL(HYPRE_PCGGetFinalRelativeResidualNorm(solver, &rel));
 
-    HYPRE_CALL(HYPRE_IJVectorMigrate(xij, HYPRE_MEMORY_HOST));
     HYPRE_CALL(HYPRE_IJVectorGetValues(xij, nLocal, pat.rows.data(), xhost.data()));
 
     double localL2 = 0.0;
