@@ -26,6 +26,11 @@ struct HypreSolveInfo {
   double finalRelResNorm = 0.0;
 };
 
+// pre3: allow libpoisson HYPRE solves to use MPI_COMM_SELF for
+// per-rank local decomposed-mesh tests, or MPI_COMM_WORLD for normal use.
+void libpoisson_set_hypre_comm(MPI_Comm comm);
+MPI_Comm libpoisson_get_hypre_comm();
+
 HypreSolveInfo solve_system_hypre_gpu(
     const CSRPattern& pat,
     const std::vector<HYPRE_Complex>& values,

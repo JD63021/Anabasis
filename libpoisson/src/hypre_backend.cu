@@ -1,5 +1,17 @@
 #include "hypre_backend.h"
 
+namespace {
+MPI_Comm g_libpoisson_hypre_comm = MPI_COMM_WORLD;
+}
+
+void libpoisson_set_hypre_comm(MPI_Comm comm) {
+  g_libpoisson_hypre_comm = comm;
+}
+
+MPI_Comm libpoisson_get_hypre_comm() {
+  return g_libpoisson_hypre_comm;
+}
+
 HypreSolveInfo solve_system_hypre_gpu(
     const CSRPattern& pat,
     const std::vector<HYPRE_Complex>& values,
@@ -16,7 +28,7 @@ HypreSolveInfo solve_system_hypre_gpu(
   HYPRE_ParVector bpar = nullptr, xpar = nullptr;
   HYPRE_Solver solver = nullptr, prec = nullptr;
 
-  HYPRE_CALL(HYPRE_IJMatrixCreate(MPI_COMM_WORLD, ilower, iupper, ilower, iupper, &Aij));
+  HYPRE_CALL(HYPRE_IJMatrixCreate(libpoisson_get_hypre_comm(), ilower, iupper, ilower, iupper, &Aij));
   HYPRE_CALL(HYPRE_IJMatrixSetObjectType(Aij, HYPRE_PARCSR));
   HYPRE_CALL(HYPRE_IJMatrixSetRowSizes(Aij, const_cast<HYPRE_Int*>(pat.ncols.data())));
   HYPRE_CALL(HYPRE_IJMatrixInitialize_v2(Aij, HYPRE_MEMORY_HOST));
@@ -35,7 +47,7 @@ HypreSolveInfo solve_system_hypre_gpu(
   std::vector<HYPRE_Complex> x0(pat.nRows, 0.0);
   for (int i = 0; i < pat.nRows; ++i) idx[i] = static_cast<HYPRE_BigInt>(i);
 
-  HYPRE_CALL(HYPRE_IJVectorCreate(MPI_COMM_WORLD, ilower, iupper, &bij));
+  HYPRE_CALL(HYPRE_IJVectorCreate(libpoisson_get_hypre_comm(), ilower, iupper, &bij));
   HYPRE_CALL(HYPRE_IJVectorSetObjectType(bij, HYPRE_PARCSR));
   HYPRE_CALL(HYPRE_IJVectorInitialize_v2(bij, HYPRE_MEMORY_HOST));
   HYPRE_CALL(HYPRE_IJVectorSetValues(bij, pat.nRows, idx.data(), const_cast<HYPRE_Complex*>(rhs.data())));
@@ -43,7 +55,7 @@ HypreSolveInfo solve_system_hypre_gpu(
   HYPRE_CALL(HYPRE_IJVectorMigrate(bij, HYPRE_MEMORY_DEVICE));
   HYPRE_CALL(HYPRE_IJVectorGetObject(bij, reinterpret_cast<void**>(&bpar)));
 
-  HYPRE_CALL(HYPRE_IJVectorCreate(MPI_COMM_WORLD, ilower, iupper, &xij));
+  HYPRE_CALL(HYPRE_IJVectorCreate(libpoisson_get_hypre_comm(), ilower, iupper, &xij));
   HYPRE_CALL(HYPRE_IJVectorSetObjectType(xij, HYPRE_PARCSR));
   HYPRE_CALL(HYPRE_IJVectorInitialize_v2(xij, HYPRE_MEMORY_HOST));
   HYPRE_CALL(HYPRE_IJVectorSetValues(xij, pat.nRows, idx.data(), x0.data()));
@@ -51,7 +63,7 @@ HypreSolveInfo solve_system_hypre_gpu(
   HYPRE_CALL(HYPRE_IJVectorMigrate(xij, HYPRE_MEMORY_DEVICE));
   HYPRE_CALL(HYPRE_IJVectorGetObject(xij, reinterpret_cast<void**>(&xpar)));
 
-  HYPRE_CALL(HYPRE_ParCSRPCGCreate(MPI_COMM_WORLD, &solver));
+  HYPRE_CALL(HYPRE_ParCSRPCGCreate(libpoisson_get_hypre_comm(), &solver));
   const double pcgRelTol = std::max(opt.relTol, 0.0);
   const double pcgAbsTol = (opt.absTol >= 0.0) ? opt.absTol
                            : ((opt.tol >= 0.0) ? opt.tol : 0.0);
@@ -179,7 +191,7 @@ void init_reusable_hypre_system_gpu(
   const HYPRE_BigInt ilower = 0;
   const HYPRE_BigInt iupper = static_cast<HYPRE_BigInt>(sys.nRows - 1);
 
-  HYPRE_CALL(HYPRE_IJMatrixCreate(MPI_COMM_WORLD, ilower, iupper, ilower, iupper, &sys.Aij));
+  HYPRE_CALL(HYPRE_IJMatrixCreate(libpoisson_get_hypre_comm(), ilower, iupper, ilower, iupper, &sys.Aij));
   HYPRE_CALL(HYPRE_IJMatrixSetObjectType(sys.Aij, HYPRE_PARCSR));
   HYPRE_CALL(HYPRE_IJMatrixSetRowSizes(sys.Aij, sys.ncols.data()));
   HYPRE_CALL(HYPRE_IJMatrixInitialize(sys.Aij));
@@ -195,7 +207,7 @@ void init_reusable_hypre_system_gpu(
   HYPRE_CALL(HYPRE_IJMatrixAssemble(sys.Aij));
   HYPRE_CALL(HYPRE_IJMatrixGetObject(sys.Aij, reinterpret_cast<void**>(&sys.Apar)));
 
-  HYPRE_CALL(HYPRE_IJVectorCreate(MPI_COMM_WORLD, ilower, iupper, &sys.bij));
+  HYPRE_CALL(HYPRE_IJVectorCreate(libpoisson_get_hypre_comm(), ilower, iupper, &sys.bij));
   HYPRE_CALL(HYPRE_IJVectorSetObjectType(sys.bij, HYPRE_PARCSR));
   HYPRE_CALL(HYPRE_IJVectorInitialize(sys.bij));
   std::vector<HYPRE_Complex> zeroB(sys.nRows, 0.0);
@@ -203,7 +215,7 @@ void init_reusable_hypre_system_gpu(
   HYPRE_CALL(HYPRE_IJVectorAssemble(sys.bij));
   HYPRE_CALL(HYPRE_IJVectorGetObject(sys.bij, reinterpret_cast<void**>(&sys.bpar)));
 
-  HYPRE_CALL(HYPRE_IJVectorCreate(MPI_COMM_WORLD, ilower, iupper, &sys.xij));
+  HYPRE_CALL(HYPRE_IJVectorCreate(libpoisson_get_hypre_comm(), ilower, iupper, &sys.xij));
   HYPRE_CALL(HYPRE_IJVectorSetObjectType(sys.xij, HYPRE_PARCSR));
   HYPRE_CALL(HYPRE_IJVectorInitialize(sys.xij));
   std::vector<HYPRE_Complex> zeroX(sys.nRows, 0.0);
@@ -211,7 +223,7 @@ void init_reusable_hypre_system_gpu(
   HYPRE_CALL(HYPRE_IJVectorAssemble(sys.xij));
   HYPRE_CALL(HYPRE_IJVectorGetObject(sys.xij, reinterpret_cast<void**>(&sys.xpar)));
 
-  HYPRE_CALL(HYPRE_ParCSRPCGCreate(MPI_COMM_WORLD, &sys.solver));
+  HYPRE_CALL(HYPRE_ParCSRPCGCreate(libpoisson_get_hypre_comm(), &sys.solver));
   HYPRE_CALL(HYPRE_BoomerAMGCreate(&sys.prec));
   apply_reusable_hypre_options(sys);
 
