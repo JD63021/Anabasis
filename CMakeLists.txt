@@ -23,3 +23,5 @@ add_subdirectory(apps/pre3_pressure_bridge_gpu_mpi)
 add_subdirectory(apps/pre3_pressure_velocity_bridge_gpu_mpi)
 
 add_subdirectory(apps/pre3_pressure_correction_skeleton_gpu_mpi)
+
+add_subdirectory(apps/pre3_patch_audit_mpi)
