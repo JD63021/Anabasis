@@ -10,7 +10,7 @@
 
 #include "mesh.h"
 
-static double norm3(const std::array<double,3> &a)
+static double audit_norm3(const std::array<double,3> &a)
 {
   return std::sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
 }
@@ -63,7 +63,7 @@ int main(int argc, char **argv)
 
           for(int i = 0; i < nFaces; ++i) {
             const int f = start + i;
-            const double a = norm3(mesh.Sf[f]);
+            const double a = audit_norm3(mesh.Sf[f]);
             area += a;
 
             for(int d = 0; d < 3; ++d) {
