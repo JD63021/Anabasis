@@ -1,0 +1,6 @@
+PRE3D0 pressure bridge setup: ranks=2 globalRows=34423 globalNnz=493451
+rank 0/2 rows=[0,17211] nLocal=17212 nnz=246655 internalFaces=112576 procFaces=4291 boundaryFaces=5625
+rank 1/2 rows=[17212,34422] nLocal=17211 nnz=246796 internalFaces=112647 procFaces=4291 boundaryFaces=5523
+PRE3D0 pCorr halo/correction bridge: nProcFacesLocal=4291 globalMaxHaloJump=3.507525825341e-09 globalMaxFaceCorr=3.483413310433e-14 globalSumAbsFaceCorr=2.253771924092e-11
+PRE3D0 pressure bridge pressure-solve RESULT: solveErr=0 its=1 finalRel=1.099294945598e-01 L2=5.132336901882e-10 Linf=4.474841919824e-09 wall=1.967200e-01 s
+PRE3D0 pressure solve RESULT: PASS_RAN
