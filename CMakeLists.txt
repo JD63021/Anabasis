@@ -19,3 +19,5 @@ add_subdirectory(apps/pre3_poisson_dist_graph_mpi)
 add_subdirectory(apps/pre3_poisson_dist_geom_gpu_mpi)
 
 add_subdirectory(apps/pre3_pressure_bridge_gpu_mpi)
+
+add_subdirectory(apps/pre3_pressure_velocity_bridge_gpu_mpi)
