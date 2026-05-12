@@ -41,3 +41,7 @@ add_subdirectory(apps/pre3_pipe_momentum_flux_audit_gpu_mpi)
 add_subdirectory(apps/poisson_mms_decomp_gpu_mpi)
 
 add_subdirectory(apps/scalar_transport_mms_decomp_gpu_mpi)
+
+add_subdirectory(apps/stokes_mms_simple_decomp_gpu_mpi)
+
+add_subdirectory(apps/simple_gpu_mpi_port)

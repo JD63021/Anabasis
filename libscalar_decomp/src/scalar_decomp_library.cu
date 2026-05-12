@@ -539,12 +539,42 @@ DistSolverInfoLocal solve_bicgstab_jacobi_decomp(
       nullptr));
 
   HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetup(solver, Apar, bpar, xpar));
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSolve(solver, Apar, bpar, xpar));
+  HYPRE_Int solveIerr = HYPRE_ParCSRBiCGSTABSolve(solver, Apar, bpar, xpar);
+  if (solveIerr) {
+    int wrank = 0;
+    MPI_Comm_rank(dm.comm, &wrank);
+    std::fprintf(stderr,
+                 "[%d] WARNING: HYPRE_ParCSRBiCGSTABSolve returned code=%d; "
+                 "continuing to inspect iterations/residual and current iterate.\n",
+                 wrank, (int)solveIerr);
+  }
 
   HYPRE_Int its = 0;
   HYPRE_Real rel = 0.0;
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABGetNumIterations(solver, &its));
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(solver, &rel));
+
+  HYPRE_Int itsIerr = HYPRE_ParCSRBiCGSTABGetNumIterations(solver, &its);
+  if (itsIerr) {
+    int wrank = 0;
+    MPI_Comm_rank(dm.comm, &wrank);
+    std::fprintf(stderr,
+                 "[%d] WARNING: HYPRE_ParCSRBiCGSTABGetNumIterations returned code=%d; "
+                 "setting iterations=-1 and continuing.\n",
+                 wrank, (int)itsIerr);
+    its = -1;
+    HYPRE_ClearAllErrors();
+  }
+
+  HYPRE_Int relIerr = HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(solver, &rel);
+  if (relIerr) {
+    int wrank = 0;
+    MPI_Comm_rank(dm.comm, &wrank);
+    std::fprintf(stderr,
+                 "[%d] WARNING: HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm returned code=%d; "
+                 "setting rel=1e300 and continuing.\n",
+                 wrank, (int)relIerr);
+    rel = 1.0e300;
+    HYPRE_ClearAllErrors();
+  }
 
 #if defined(HYPRE_USING_GPU)
   HYPRE_CALL_SCALAR_DECOMP(HYPRE_IJVectorMigrate(xij, HYPRE_MEMORY_HOST));
