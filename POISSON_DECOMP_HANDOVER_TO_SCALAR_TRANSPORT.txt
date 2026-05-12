@@ -1,0 +1,494 @@
+# Anabasis v1.1c / pre4 Poisson-Decomp Handover
+Date context: May 2026
+Checkpoint purpose: reusable MPI-decomposed Poisson/elliptic library before scalar-transport port.
+
+================================================================================
+0. Status summary
+================================================================================
+
+This checkpoint creates a reusable decomposed Poisson/elliptic library:
+
+  libpoisson_decomp/
+
+and a validation app:
+
+  apps/poisson_mms_decomp_gpu_mpi/
+
+This replaces the earlier one-off PRE3C/PRE3D distributed Poisson proof apps with a more modular library that mirrors the original serial libpoisson structure, while adding OpenFOAM processor-patch MPI support.
+
+Important: this is a correctness/modularity checkpoint, not final performance tuning. The HYPRE IJ matrix path in libpoisson_decomp currently uses host-side SetValues then migrates to device. Earlier prototype apps also proved device IJ insertion can work. Later optimization can move assembly/insertion fully back to device.
+
+================================================================================
+1. Main repo/folder
+================================================================================
+
+Current working folder:
+
+  ~/anabasis_v1_1c_pre4_poisson_decomp
+
+Important added source paths:
+
+  libpoisson_decomp/include/poisson_decomp_library.h
+  libpoisson_decomp/src/poisson_decomp_library.cu
+  libpoisson_decomp/CMakeLists.txt
+
+  apps/poisson_mms_decomp_gpu_mpi/src/main.cu
+  apps/poisson_mms_decomp_gpu_mpi/CMakeLists.txt
+
+Top-level CMakeLists.txt was modified to add:
+
+  add_subdirectory(libpoisson_decomp)
+  add_subdirectory(apps/poisson_mms_decomp_gpu_mpi)
+
+The old proof app still exists:
+
+  apps/pre3_poisson_dist_geom_gpu_mpi/
+
+but the next development should use libpoisson_decomp, not patch the old proof app.
+
+================================================================================
+2. What libpoisson_decomp currently supports
+================================================================================
+
+Core capabilities:
+
+  1. OpenFOAM decomposed case reading:
+       caseRoot/processor<rank>/constant/polyMesh
+
+  2. MPI rank ownership:
+       dm.ilower, dm.iupper, dm.globalN
+
+  3. Processor patch detection from OpenFOAM boundary files:
+       type processor
+       myProcNo
+       neighbProcNo
+       startFace
+       nFaces
+
+  4. Processor-face remote metadata exchange:
+       remote global row for off-rank column
+       remote cell center for processor face geometry
+
+  5. Distributed scalar CSR pattern:
+       local diagonal columns
+       local internal owner-neighbour couplings
+       off-rank processor-face columns
+
+  6. Scalar halo exchange:
+       exchange_proc_face_scalar_owner_values()
+
+  7. Vector/gradient halo exchange:
+       exchange_proc_face_vector_owner_values()
+
+  8. Physical boundary BCs through original modular ScalarBCSet:
+       Dirichlet
+       Neumann
+
+  9. MMS app can read pressure BC config from simple_gpu modular BC parser:
+       pressure patch_0_0 fixed_value 0.0
+
+  10. Variable gammaFace:
+       solve_scalar_elliptic_decomp(dm, gammaFace, cellSource, bcSet, opts)
+
+  11. Cell source term:
+       cellSource[c] integrated as source * cellVolume
+
+  12. Gradient options:
+       gradScheme = lsq
+       gradScheme = gauss
+
+  13. Laplacian options:
+       laplacianScheme = orth
+       laplacianScheme = nonorth
+
+  14. Non-orthogonal correction loop:
+       nOuter = nNonOrthCorr + 1 for nonorth
+       nOuter = 1 for orth
+
+  15. Reference-cell option for pure Neumann cases:
+       opts.useReferenceCell
+       opts.referenceGlobalCell
+       opts.referenceValue
+
+  16. HYPRE distributed PCG + BoomerAMG solve through MPI_COMM_WORLD.
+
+================================================================================
+3. Main public API
+================================================================================
+
+Header:
+
+  libpoisson_decomp/include/poisson_decomp_library.h
+
+Main objects:
+
+  struct DecompMesh
+  struct DistCSRPattern
+  struct DistEllipticOptions
+  struct DistEllipticResult
+
+Main functions:
+
+  DecompMesh read_decomposed_openfoam_case(
+      const std::string& caseRoot,
+      MPI_Comm comm = MPI_COMM_WORLD);
+
+  DistCSRPattern build_decomp_scalar_pattern(const DecompMesh& dm);
+
+  DistEllipticResult solve_scalar_elliptic_decomp(
+      const DecompMesh& dm,
+      const std::vector<double>& gammaFace,
+      const std::vector<double>& cellSource,
+      const ScalarBCSet& bcSet,
+      const DistEllipticOptions& opts);
+
+  DistEllipticResult solve_poisson_decomp(
+      const DecompMesh& dm,
+      const std::vector<double>& cellSource,
+      const ScalarBCSet& bcSet,
+      const DistEllipticOptions& opts);
+
+  std::vector<double> exchange_proc_face_scalar_owner_values(
+      const DecompMesh& dm,
+      const std::vector<double>& phi);
+
+  std::vector<std::array<double,3>> exchange_proc_face_vector_owner_values(
+      const DecompMesh& dm,
+      const std::vector<std::array<double,3>>& vec);
+
+================================================================================
+4. Build environment
+================================================================================
+
+Main machine:
+
+  hostname: jd-MS-7E51
+  CUDA: /usr/local/cuda-12.2
+  GPU arch: sm_86
+  HYPRE single build: /opt/hypre-3.1.0-cuda-single
+
+Build commands:
+
+  cd ~/anabasis_v1_1c_pre4_poisson_decomp
+
+  export CUDA_HOME=/usr/local/cuda-12.2
+  export HYPRE_ROOT=/opt/hypre-3.1.0-cuda-single
+  export HYPRE_LIBRARY=$HYPRE_ROOT/lib/libHYPRE.a
+  export PATH=$CUDA_HOME/bin:$PATH
+  export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+
+  cmake -S . -B build_pre4_poisson_decomp \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_ARCHITECTURES=86 \
+    -DHYPRE_ROOT=$HYPRE_ROOT \
+    -DANABASIS_HYPRE_STATIC_CUDA_DEPS=ON
+
+  cmake --build build_pre4_poisson_decomp -j"$(nproc)" --target poisson_mms_decomp_gpu_mpi
+
+Executable:
+
+  ./build_pre4_poisson_decomp/apps/poisson_mms_decomp_gpu_mpi/poisson_mms_decomp_gpu_mpi
+
+================================================================================
+5. MMS equation and BC
+================================================================================
+
+Current MMS app solves:
+
+  -laplacian(phi) = f
+
+with:
+
+  phi = sin(pi x) sin(pi y) sin(pi z)
+  f   = 3 pi^2 phi
+
+For the unit cube [0,1]^3, the exact boundary value is zero on all six faces.
+
+Therefore the modular BC file is:
+
+  /tmp/poisson_mms_cube.bc
+
+with content:
+
+  pressure patch_0_0 fixed_value 0.0
+
+The app intentionally maps pressure patch BC specs to scalar Poisson BCs for testing compatibility with the original simple_gpu BC parser.
+
+Wrong-BC sanity test:
+
+  pressure patch_0_0 fixed_value 1.0
+
+This gives L2 ~ 1, proving that the BC config is actually used.
+
+================================================================================
+6. Test cases used
+================================================================================
+
+Original mesh folders:
+
+  ~/Desktop/0.05mm/meshCase
+  ~/Desktop/0.04mm/meshCase
+  ~/Desktop/0.03mm/meshCase
+
+These are 1 mm^3 boxes. For MMS, copied cases were scaled by 1000 to become unit cubes.
+
+Prepared cases:
+
+  /tmp/case_cube_0p05mm
+  /tmp/case_cube_0p04mm
+  /tmp/case_cube_0p03mm
+
+Each case was decomposed with OpenFOAM decomposePar into:
+
+  processor0/constant/polyMesh
+  processor1/constant/polyMesh
+
+decomposeParDict used:
+
+  numberOfSubdomains 2;
+  method simple;
+  simpleCoeffs
+  {
+      n       (2 1 1);
+      delta   0.001;
+  }
+
+The physical boundary patch for MMS is:
+
+  patch_0_0
+
+Processor patches are generated by decomposePar.
+
+================================================================================
+7. Validated command
+================================================================================
+
+BC file:
+
+  cat > /tmp/poisson_mms_cube.bc <<'BC'
+  pressure patch_0_0 fixed_value 0.0
+  BC
+
+Run command template:
+
+  cd ~/anabasis_v1_1c_pre4_poisson_decomp
+
+  EXE=./build_pre4_poisson_decomp/apps/poisson_mms_decomp_gpu_mpi/poisson_mms_decomp_gpu_mpi
+  BC=/tmp/poisson_mms_cube.bc
+
+  CUDA_VISIBLE_DEVICES=0 \
+  mpirun -np 2 --bind-to none \
+    "$EXE" \
+    -case-root /tmp/case_cube_0p03mm \
+    -bc-config "$BC" \
+    -tol 1e-8 \
+    -maxit 1000 \
+    -grad-scheme lsq \
+    -laplacian-scheme nonorth \
+    -nNonOrthCorr 4
+
+================================================================================
+8. Validation results
+================================================================================
+
+Three-mesh LSQ nonorth4 MMS sequence:
+
+  case_cube_0p05mm:
+    globalRows=7546
+    globalNnz=102822
+    maxNonOrth=50.652 deg
+    L2   = 2.688880865771e-03
+    Linf = 1.158191078986e-02
+    PASS_RAN
+
+  case_cube_0p04mm:
+    globalRows=14450
+    globalNnz=200980
+    maxNonOrth=47.790 deg
+    L2   = 1.565043689867e-03
+    Linf = 6.595429597413e-03
+    PASS_RAN
+
+  case_cube_0p03mm:
+    globalRows=34374
+    globalNnz=492708
+    maxNonOrth=50.286 deg
+    L2   = 5.950388324975e-04
+    Linf = 2.750364302009e-03
+    PASS_RAN
+
+Observed behavior:
+  L2 and Linf decrease strongly with refinement.
+  Conservative interpretation: at least second-order-like behavior on this smooth MMS sequence.
+
+Orth vs nonorth comparison on 0.03 mm:
+
+  lsq + orth:
+    L2   = 1.637447790117e-02
+    Linf = 4.769845673021e-02
+
+  lsq + nonorth nNonOrthCorr=4:
+    L2   = 5.950388324975e-04
+    Linf = 2.750364302009e-03
+
+Conclusion:
+  nonorth correction is essential on these ~50 degree non-orthogonal poly meshes.
+
+Gradient comparison on 0.03 mm:
+
+  gauss + nonorth4:
+    L2   = 9.276770600521e-04
+    Linf = 4.202086641009e-03
+
+  lsq + nonorth4:
+    L2   = 5.950388324975e-04
+    Linf = 2.750364302009e-03
+
+Conclusion:
+  both gradient paths run; LSQ is more accurate on this mesh.
+
+Wrong BC sanity check on 0.03 mm:
+
+  pressure patch_0_0 fixed_value 1.0
+
+Result:
+    L2   = 1.000417701888e+00
+    Linf = 1.002747980116e+00
+
+Conclusion:
+  modular BC config is active and controls the physical boundary.
+
+================================================================================
+9. Relation to earlier MPI proof work
+================================================================================
+
+Earlier pre3 apps proved:
+
+  - OpenFOAM processor meshes can be read.
+  - Processor patch off-rank columns work.
+  - Distributed HYPRE solve works.
+  - Pressure correction skeletons work.
+  - Pipe W momentum predictor proof works.
+  - simple_gpu_mpi has one-shot U/V/W + pressure correction plumbing.
+
+This pre4 checkpoint moves the Poisson part out of proof apps into reusable library form.
+
+Next code should prefer:
+
+  libpoisson_decomp
+
+instead of copying logic from:
+
+  apps/pre3_poisson_dist_geom_gpu_mpi
+
+================================================================================
+10. Current caveats
+================================================================================
+
+1. HYPRE IJ insertion path:
+   Current libpoisson_decomp uses host IJ SetValues and then migrates to device.
+   This is acceptable for correctness/modularity now.
+   Later performance work should move assembly/insertion back to device, following the old PRE3C2 device-IJ proof.
+
+2. Multiple processor patches:
+   Code supports a vector of processor patches and loops over them, but the validation so far is mainly 2 ranks / 1 proc patch per rank.
+   Scalar transport and SIMPLE should keep this generalized structure.
+
+3. GPU assembly:
+   Current library assembly/gradient path is mostly host-side modular code.
+   This is deliberate for closing correctness quickly.
+   Later SIMPLE performance path should use GPU kernels once formulas are stable.
+
+4. Boundary config:
+   MMS app maps pressure BC config to scalar Poisson BCs.
+   For scalar transport, use scalar-specific BCs or define transport BC parsing cleanly instead of abusing pressure names forever.
+
+================================================================================
+11. Next task: scalar transport decomp
+================================================================================
+
+Next layer should be:
+
+  libscalar_decomp/
+
+Goal:
+  Use DecompMesh and processor-face halo infrastructure from libpoisson_decomp.
+  Add convection/diffusion scalar transport with MMS.
+
+Recommended structure:
+
+  libscalar_decomp/include/scalar_decomp_library.h
+  libscalar_decomp/src/scalar_decomp_library.cu
+
+  apps/scalar_transport_mms_decomp_gpu_mpi/src/main.cu
+
+Equation target:
+
+  div(u phi) - div(Gamma grad(phi)) = S
+
+Use MMS:
+  phi_exact = sin(pi x) sin(pi y) sin(pi z)
+
+Choose a simple divergence-free velocity for first test:
+  u = (1, 0, 0) constant
+or:
+  u = (1, 1, 1) constant
+
+Then source:
+  S = u dot grad(phi) - Gamma laplacian(phi)
+
+For phi = sin(pi x) sin(pi y) sin(pi z):
+
+  grad(phi) =
+    [pi cos(pi x) sin(pi y) sin(pi z),
+     pi sin(pi x) cos(pi y) sin(pi z),
+     pi sin(pi x) sin(pi y) cos(pi z)]
+
+  laplacian(phi) = -3 pi^2 phi
+
+So:
+
+  S = u dot grad(phi) + 3 Gamma pi^2 phi
+
+First scalar transport options:
+  Gamma constant
+  upwind convection
+  central diffusion
+  LSQ nonorth diffusion correction reused from libpoisson_decomp
+  fixed_value Dirichlet on patch_0_0 for MMS exact boundary
+
+Processor-face scalar transport requirements:
+  - processor-face remote phi halo
+  - processor-face remote grad halo
+  - processor-face remote cell center
+  - processor-face flux F_f = u_f dot S_f
+  - upwind:
+      if F_f >= 0: use local owner phi
+      else: use remote halo phi
+  - diffusion:
+      same off-rank column treatment as libpoisson_decomp
+  - nonorth correction:
+      same gradient halo treatment as libpoisson_decomp
+
+Use libpoisson_decomp pieces directly where possible:
+  DecompMesh
+  build_decomp_scalar_pattern
+  exchange_proc_face_scalar_owner_values
+  exchange_proc_face_vector_owner_values
+
+================================================================================
+12. Do not do next
+================================================================================
+
+Do not return to two-machine testing unless:
+  - MPI halo exchange changes,
+  - build/deployment assumptions change,
+  - processor-face generalization changes,
+  - or final scalar/SIMPLE MPI correctness needs a proof.
+
+Do not patch simple_gpu_mpi again yet.
+The correct next step is scalar transport decomp as a library, then vector momentum, then SIMPLE.
+
+================================================================================
+End of handover.
+================================================================================

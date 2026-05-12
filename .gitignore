@@ -15,3 +15,11 @@ simple_gpu
 *.generated.bc
 __pycache__/
 .DS_Store
+
+# local build/output/checkpoint noise
+build*/
+runs/
+*.log
+*.vtu
+*.pvtu
+__pycache__/
