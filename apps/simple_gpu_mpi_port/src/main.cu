@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,7 +28,18 @@ static void cuda_check(cudaError_t e, const char* what) {
   }
 }
 
+static double dot3_local(const std::array<double,3>& a, const std::array<double,3>& b) {
+  return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
 
+static std::array<double,3> sub3_local(const std::array<double,3>& a,
+                                       const std::array<double,3>& b) {
+  return {a[0]-b[0], a[1]-b[1], a[2]-b[2]};
+}
+
+static std::array<double,3> mul3_local(double s, const std::array<double,3>& a) {
+  return {s*a[0], s*a[1], s*a[2]};
+}
 
 struct BasicPatchInfoLocal {
   std::string name;
@@ -38,15 +50,13 @@ struct BasicPatchInfoLocal {
 
 static std::string read_text_file_local(const std::string& path) {
   std::ifstream in(path);
-  if (!in) {
-    throw std::runtime_error("Could not open " + path);
-  }
+  if (!in) throw std::runtime_error("Could not open " + path);
   std::ostringstream ss;
   ss << in.rdbuf();
   return ss.str();
 }
 
-static int find_int_entry_local(const std::string& body, const std::string& key, int def = -1) {
+static int find_int_entry_local(const std::string& body, const std::string& key, int def=-1) {
   std::regex re("\\b" + key + R"(\s+([-+]?[0-9]+)\s*;)");
   std::smatch m;
   if (std::regex_search(body, m, re)) return std::stoi(m[1].str());
@@ -62,7 +72,6 @@ static std::string find_word_entry_local(const std::string& body, const std::str
 
 static std::vector<BasicPatchInfoLocal> read_basic_patch_table_local(const std::string& boundaryPath) {
   const std::string txt = read_text_file_local(boundaryPath);
-
   std::vector<BasicPatchInfoLocal> out;
 
   std::regex blockRe(R"(([A-Za-z0-9_]+)\s*\{([^{}]*)\})");
@@ -73,26 +82,18 @@ static std::vector<BasicPatchInfoLocal> read_basic_patch_table_local(const std::
     BasicPatchInfoLocal p;
     p.name = (*it)[1].str();
     const std::string body = (*it)[2].str();
-
     p.type = find_word_entry_local(body, "type");
     p.nFaces = find_int_entry_local(body, "nFaces");
     p.startFace = find_int_entry_local(body, "startFace");
-
-    if (p.nFaces >= 0 && p.startFace >= 0) {
-      out.push_back(p);
-    }
+    if (p.nFaces >= 0 && p.startFace >= 0) out.push_back(p);
   }
 
-  if (out.empty()) {
-    throw std::runtime_error("No patch table entries found in " + boundaryPath);
-  }
-
+  if (out.empty()) throw std::runtime_error("No patch table entries found in " + boundaryPath);
   return out;
 }
 
-
-static double dot3_local(const std::array<double,3>& a, const std::array<double,3>& b) {
-  return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+static bool is_proc_patch_name(const std::set<std::string>& procNames, const std::string& name) {
+  return procNames.find(name) != procNames.end();
 }
 
 static int find_patch_index_local(const std::vector<std::string>& names, const std::string& name) {
@@ -100,6 +101,86 @@ static int find_patch_index_local(const std::vector<std::string>& names, const s
     if (names[i] == name) return i;
   }
   return -1;
+}
+
+static int patch_index_for_face_mpi_port(const Mesh& meshBC, int f) {
+  for (int ip = 0; ip < static_cast<int>(meshBC.patchNames.size()); ++ip) {
+    const int start = meshBC.patchStartFace[ip];
+    const int end = start + meshBC.patchNFaces[ip];
+    if (f >= start && f < end) return ip;
+  }
+  return -1;
+}
+
+static double face_lambda_local_mpi_port(const Mesh& mesh, int f) {
+  const int P = mesh.owner[f];
+  const int N = mesh.neigh[f];
+
+  const auto d = sub3_local(mesh.cc[N], mesh.cc[P]);
+  const auto dx = sub3_local(mesh.xf[f], mesh.cc[P]);
+
+  const double lam = dot3_local(dx, d) / std::max(dot3_local(d, d), 1.0e-300);
+  return std::min(1.0, std::max(0.0, lam));
+}
+
+static double face_lambda_proc_mpi_port(const DecompMesh& dm, int f) {
+  const Mesh& mesh = dm.mesh;
+  const int P = mesh.owner[f];
+
+  const auto d = sub3_local(dm.remoteCCForFace[f], mesh.cc[P]);
+  const auto dx = sub3_local(mesh.xf[f], mesh.cc[P]);
+
+  const double lam = dot3_local(dx, d) / std::max(dot3_local(d, d), 1.0e-300);
+  return std::min(1.0, std::max(0.0, lam));
+}
+
+static std::vector<double> compute_cell_div_sum_mpi_port(
+    const DecompMesh& dm,
+    const std::vector<double>& phi)
+{
+  const Mesh& mesh = dm.mesh;
+  std::vector<double> div(mesh.nCells, 0.0);
+
+  for (int f = 0; f < mesh.nInternalFaces; ++f) {
+    const int P = mesh.owner[f];
+    const int N = mesh.neigh[f];
+    div[P] += phi[f];
+    div[N] -= phi[f];
+  }
+
+  for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
+    const int P = mesh.owner[f];
+    div[P] += phi[f];
+  }
+
+  return div;
+}
+
+static double global_max_abs_vec_mpi_port(const std::vector<double>& a, MPI_Comm comm) {
+  double local = 0.0;
+  for (double v : a) local = std::max(local, std::abs(v));
+
+  double global = 0.0;
+  MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_MAX, comm);
+  return global;
+}
+
+static double global_sum_vec_mpi_port(const std::vector<double>& a, MPI_Comm comm) {
+  double local = 0.0;
+  for (double v : a) local += v;
+
+  double global = 0.0;
+  MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_SUM, comm);
+  return global;
+}
+
+static double global_l1_vec_mpi_port(const std::vector<double>& a, MPI_Comm comm) {
+  double local = 0.0;
+  for (double v : a) local += std::abs(v);
+
+  double global = 0.0;
+  MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_SUM, comm);
+  return global;
 }
 
 static void print_patch_audit_rank0(
@@ -120,7 +201,6 @@ static void print_patch_audit_rank0(
   double localUMin = 1.0e300;
   double localUMax = -1.0e300;
   double localUSumA = 0.0;
-
   int localFaces = 0;
 
   if (pidx >= 0) {
@@ -159,7 +239,6 @@ static void print_patch_audit_rank0(
 
   if (rank == 0) {
     const double avgU = globalUSumA / std::max(globalArea, 1.0e-300);
-
     std::printf("Runtime BC patch audit [%s]\n", patchName.c_str());
     std::printf("  global faces       : %d\n", globalFaces);
     std::printf("  global area        : %.15e\n", globalArea);
@@ -173,59 +252,6 @@ static void print_patch_audit_rank0(
       std::printf("  rank0 type U/P     : patch not present on rank0\n");
     }
   }
-}
-
-
-
-static double face_lambda_local_mpi_port(const Mesh& mesh, int f) {
-  const int P = mesh.owner[f];
-  const int N = mesh.neigh[f];
-
-  const auto d = std::array<double,3>{
-      mesh.cc[N][0] - mesh.cc[P][0],
-      mesh.cc[N][1] - mesh.cc[P][1],
-      mesh.cc[N][2] - mesh.cc[P][2]
-  };
-
-  const auto dx = std::array<double,3>{
-      mesh.xf[f][0] - mesh.cc[P][0],
-      mesh.xf[f][1] - mesh.cc[P][1],
-      mesh.xf[f][2] - mesh.cc[P][2]
-  };
-
-  const double dd = dot3_local(d, d);
-  const double lam = dot3_local(dx, d) / std::max(dd, 1.0e-300);
-  return std::min(1.0, std::max(0.0, lam));
-}
-
-static double face_lambda_proc_mpi_port(const DecompMesh& dm, int f) {
-  const Mesh& mesh = dm.mesh;
-  const int P = mesh.owner[f];
-
-  const auto d = std::array<double,3>{
-      dm.remoteCCForFace[f][0] - mesh.cc[P][0],
-      dm.remoteCCForFace[f][1] - mesh.cc[P][1],
-      dm.remoteCCForFace[f][2] - mesh.cc[P][2]
-  };
-
-  const auto dx = std::array<double,3>{
-      mesh.xf[f][0] - mesh.cc[P][0],
-      mesh.xf[f][1] - mesh.cc[P][1],
-      mesh.xf[f][2] - mesh.cc[P][2]
-  };
-
-  const double dd = dot3_local(d, d);
-  const double lam = dot3_local(dx, d) / std::max(dd, 1.0e-300);
-  return std::min(1.0, std::max(0.0, lam));
-}
-
-static int patch_index_for_face_mpi_port(const Mesh& meshBC, int f) {
-  for (int ip = 0; ip < static_cast<int>(meshBC.patchNames.size()); ++ip) {
-    const int start = meshBC.patchStartFace[ip];
-    const int end = start + meshBC.patchNFaces[ip];
-    if (f >= start && f < end) return ip;
-  }
-  return -1;
 }
 
 static std::vector<double> build_face_flux_mpi_port(
@@ -291,93 +317,219 @@ static std::vector<double> build_face_flux_mpi_port(
   return phi;
 }
 
-static std::vector<double> compute_cell_div_sum_mpi_port(
+struct PressureBCFaceData {
+  std::vector<ScalarBCType> type;
+  std::vector<double> value;
+};
+
+
+static std::vector<double> build_rhiechow_phi_star_mpi_port(
     const DecompMesh& dm,
-    const std::vector<double>& phi)
+    const Mesh& meshBC,
+    const std::vector<std::string>& bcUType,
+    const std::vector<std::string>& bcVType,
+    const std::vector<std::string>& bcWType,
+    const std::vector<double>& U,
+    const std::vector<double>& V,
+    const std::vector<double>& W,
+    const std::vector<double>& pField,
+    const std::vector<std::array<double,3>>& gradP,
+    const std::vector<double>& rAU,
+    const std::vector<double>& uFaceBC,
+    const std::vector<double>& vFaceBC,
+    const std::vector<double>& wFaceBC,
+    double rho)
 {
   const Mesh& mesh = dm.mesh;
-  std::vector<double> div(mesh.nCells, 0.0);
+
+  const auto rU = exchange_proc_face_scalar_owner_values(dm, U);
+  const auto rV = exchange_proc_face_scalar_owner_values(dm, V);
+  const auto rW = exchange_proc_face_scalar_owner_values(dm, W);
+  const auto rP = exchange_proc_face_scalar_owner_values(dm, pField);
+  const auto rRAU = exchange_proc_face_scalar_owner_values(dm, rAU);
+  const auto rGradP = exchange_proc_face_vector_owner_values(dm, gradP);
+
+  std::vector<double> phiStar(mesh.nFaces, 0.0);
 
   for (int f = 0; f < mesh.nInternalFaces; ++f) {
     const int P = mesh.owner[f];
     const int N = mesh.neigh[f];
 
-    div[P] += phi[f];
-    div[N] -= phi[f];
+    const auto d = sub3_local(mesh.cc[N], mesh.cc[P]);
+    const double dpn = dot3_local(mesh.nf[f], d);
+    const double lam = face_lambda_local_mpi_port(mesh, f);
+
+    const double uf = (1.0 - lam) * U[P] + lam * U[N];
+    const double vf = (1.0 - lam) * V[P] + lam * V[N];
+    const double wf = (1.0 - lam) * W[P] + lam * W[N];
+
+    const std::array<double,3> gradpf = {
+      (1.0 - lam) * gradP[P][0] + lam * gradP[N][0],
+      (1.0 - lam) * gradP[P][1] + lam * gradP[N][1],
+      (1.0 - lam) * gradP[P][2] + lam * gradP[N][2]
+    };
+
+    const double rAUf = (1.0 - lam) * rAU[P] + lam * rAU[N];
+
+    const double phiInterp =
+        rho * mesh.Af[f] *
+        (uf * mesh.nf[f][0] + vf * mesh.nf[f][1] + wf * mesh.nf[f][2]);
+
+    const double rc =
+        rho * mesh.Af[f] * rAUf / std::max(std::fabs(dpn), 1.0e-300) *
+        ((pField[N] - pField[P]) - dot3_local(gradpf, d));
+
+    phiStar[f] = phiInterp - rc;
   }
 
   for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
     const int P = mesh.owner[f];
-    div[P] += phi[f];
-  }
 
-  return div;
-}
-
-static void print_flux_divergence_audit_rank0(
-    int rank,
-    const DecompMesh& dm,
-    const std::vector<double>& phi,
-    MPI_Comm comm)
-{
-  const Mesh& mesh = dm.mesh;
-
-  double localPhysicalFlux = 0.0;
-  double localProcFlux = 0.0;
-  double localAbsPhysicalFlux = 0.0;
-  double localAbsProcFlux = 0.0;
-
-  for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
     if (dm.isProcFace[f]) {
-      localProcFlux += phi[f];
-      localAbsProcFlux += std::abs(phi[f]);
+      const double lam = face_lambda_proc_mpi_port(dm, f);
+
+      const double uf = (1.0 - lam) * U[P] + lam * rU[f];
+      const double vf = (1.0 - lam) * V[P] + lam * rV[f];
+      const double wf = (1.0 - lam) * W[P] + lam * rW[f];
+
+      const std::array<double,3> gradpf = {
+        (1.0 - lam) * gradP[P][0] + lam * rGradP[f][0],
+        (1.0 - lam) * gradP[P][1] + lam * rGradP[f][1],
+        (1.0 - lam) * gradP[P][2] + lam * rGradP[f][2]
+      };
+
+      const auto d = sub3_local(dm.remoteCCForFace[f], mesh.cc[P]);
+      const double dpn = dot3_local(mesh.nf[f], d);
+      const double rAUf = (1.0 - lam) * rAU[P] + lam * rRAU[f];
+
+      const double phiInterp =
+          rho * mesh.Af[f] *
+          (uf * mesh.nf[f][0] + vf * mesh.nf[f][1] + wf * mesh.nf[f][2]);
+
+      const double rc =
+          rho * mesh.Af[f] * rAUf / std::max(std::fabs(dpn), 1.0e-300) *
+          ((rP[f] - pField[P]) - dot3_local(gradpf, d));
+
+      phiStar[f] = phiInterp - rc;
     } else {
-      localPhysicalFlux += phi[f];
-      localAbsPhysicalFlux += std::abs(phi[f]);
+      const int ip = patch_index_for_face_mpi_port(meshBC, f);
+
+      double uf = U[P];
+      double vf = V[P];
+      double wf = W[P];
+
+      if (ip >= 0 && ip < static_cast<int>(bcUType.size()) && bcUType[ip] == "Dirichlet") {
+        uf = uFaceBC[f];
+      }
+      if (ip >= 0 && ip < static_cast<int>(bcVType.size()) && bcVType[ip] == "Dirichlet") {
+        vf = vFaceBC[f];
+      }
+      if (ip >= 0 && ip < static_cast<int>(bcWType.size()) && bcWType[ip] == "Dirichlet") {
+        wf = wFaceBC[f];
+      }
+
+      // Serial boundary treatment: no Rhie-Chow term on physical boundary faces.
+      phiStar[f] =
+          rho * mesh.Af[f] *
+          (uf * mesh.nf[f][0] + vf * mesh.nf[f][1] + wf * mesh.nf[f][2]);
     }
   }
 
-  const auto div = compute_cell_div_sum_mpi_port(dm, phi);
-
-  double localDivLinf = 0.0;
-  double localDivL1 = 0.0;
-  double localDivSum = 0.0;
-
-  for (double d : div) {
-    localDivLinf = std::max(localDivLinf, std::abs(d));
-    localDivL1 += std::abs(d);
-    localDivSum += d;
-  }
-
-  double globalPhysicalFlux = 0.0;
-  double globalProcFlux = 0.0;
-  double globalAbsPhysicalFlux = 0.0;
-  double globalAbsProcFlux = 0.0;
-  double globalDivLinf = 0.0;
-  double globalDivL1 = 0.0;
-  double globalDivSum = 0.0;
-
-  MPI_Reduce(&localPhysicalFlux, &globalPhysicalFlux, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-  MPI_Reduce(&localProcFlux, &globalProcFlux, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-  MPI_Reduce(&localAbsPhysicalFlux, &globalAbsPhysicalFlux, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-  MPI_Reduce(&localAbsProcFlux, &globalAbsProcFlux, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-  MPI_Reduce(&localDivLinf, &globalDivLinf, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-  MPI_Reduce(&localDivL1, &globalDivL1, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-  MPI_Reduce(&localDivSum, &globalDivSum, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-
-  if (rank == 0) {
-    std::printf("Initial flux/divergence audit\n");
-    std::printf("  physical boundary net flux      : %.15e\n", globalPhysicalFlux);
-    std::printf("  physical boundary abs flux sum  : %.15e\n", globalAbsPhysicalFlux);
-    std::printf("  processor boundary net flux     : %.15e\n", globalProcFlux);
-    std::printf("  processor boundary abs flux sum : %.15e\n", globalAbsProcFlux);
-    std::printf("  cell divergence sum             : %.15e\n", globalDivSum);
-    std::printf("  cell divergence L1              : %.15e\n", globalDivL1);
-    std::printf("  cell divergence Linf            : %.15e\n", globalDivLinf);
-  }
+  return phiStar;
 }
 
+static PressureBCFaceData build_pressure_bc_face_data_mpi_port(
+    const DecompMesh& dm,
+    const Mesh& meshBC,
+    const std::vector<std::string>& bcPType,
+    const std::vector<double>& pFaceBC)
+{
+  const Mesh& mesh = dm.mesh;
+  PressureBCFaceData out;
+  out.type.assign(mesh.nFaces, ScalarBCType::Neumann);
+  out.value.assign(mesh.nFaces, 0.0);
 
+  for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
+    if (dm.isProcFace[f]) continue;
+
+    const int ip = patch_index_for_face_mpi_port(meshBC, f);
+    if (ip >= 0 && ip < static_cast<int>(bcPType.size()) && bcPType[ip] == "Dirichlet") {
+      out.type[f] = ScalarBCType::Dirichlet;
+      out.value[f] = pFaceBC[f];
+    } else {
+      out.type[f] = ScalarBCType::Neumann;
+      out.value[f] = 0.0;
+    }
+  }
+
+  return out;
+}
+
+static void compute_lsq_gradient_scalar_mpi_port(
+    const DecompMesh& dm,
+    const std::vector<double>& field,
+    const PressureBCFaceData& bc,
+    std::vector<std::array<double,3>>& grad)
+{
+  const Mesh& mesh = dm.mesh;
+  const auto remoteField = exchange_proc_face_scalar_owner_values(dm, field);
+
+  grad.assign(mesh.nCells, {0.0, 0.0, 0.0});
+
+  for (int P = 0; P < mesh.nCells; ++P) {
+    const auto xP = mesh.cc[P];
+    const double phiP = field[P];
+
+    double M[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
+    double rhs[3] = {0,0,0};
+
+    auto add_constraint = [&](const std::array<double,3>& r, double dphi) {
+      const double w = 1.0 / std::max(dot3_local(r, r), 1.0e-300);
+      for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) M[i][j] += w * r[i] * r[j];
+        rhs[i] += w * r[i] * dphi;
+      }
+    };
+
+    for (int N : mesh.cellNbrs[P]) {
+      add_constraint(sub3_local(mesh.cc[N], xP), field[N] - phiP);
+    }
+
+    for (int f : mesh.cellBFace[P]) {
+      if (dm.isProcFace[f]) {
+        add_constraint(sub3_local(dm.remoteCCForFace[f], xP), remoteField[f] - phiP);
+      } else {
+        const auto rcf = sub3_local(mesh.xf[f], xP);
+
+        if (bc.type[f] == ScalarBCType::Dirichlet) {
+          add_constraint(rcf, bc.value[f] - phiP);
+        } else {
+          const double dn = std::max(dot3_local(rcf, mesh.nf[f]), 1.0e-300);
+          add_constraint(mul3_local(dn, mesh.nf[f]), bc.value[f] * dn);
+        }
+      }
+    }
+
+    const double a=M[0][0], b=M[0][1], c=M[0][2];
+    const double d=M[1][0], e=M[1][1], f=M[1][2];
+    const double g=M[2][0], h=M[2][1], k=M[2][2];
+
+    const double det = a*(e*k-f*h) - b*(d*k-f*g) + c*(d*h-e*g);
+
+    if (std::fabs(det) > 1.0e-20) {
+      double inv[3][3];
+      inv[0][0]=(e*k-f*h)/det; inv[0][1]=(c*h-b*k)/det; inv[0][2]=(b*f-c*e)/det;
+      inv[1][0]=(f*g-d*k)/det; inv[1][1]=(a*k-c*g)/det; inv[1][2]=(c*d-a*f)/det;
+      inv[2][0]=(d*h-e*g)/det; inv[2][1]=(b*g-a*h)/det; inv[2][2]=(a*e-b*d)/det;
+
+      grad[P] = {
+        inv[0][0]*rhs[0] + inv[0][1]*rhs[1] + inv[0][2]*rhs[2],
+        inv[1][0]*rhs[0] + inv[1][1]*rhs[1] + inv[1][2]*rhs[2],
+        inv[2][0]*rhs[0] + inv[2][1]*rhs[1] + inv[2][2]*rhs[2]
+      };
+    }
+  }
+}
 
 static ScalarBCSet make_component_scalar_bc_from_legacy_mpi_port(
     const Mesh& meshBC,
@@ -392,24 +544,19 @@ static ScalarBCSet make_component_scalar_bc_from_legacy_mpi_port(
 
   for (int ip = 0; ip < static_cast<int>(meshBC.patchNames.size()); ++ip) {
     const std::string& name = meshBC.patchNames[ip];
-
-    if (procPatchNames.find(name) != procPatchNames.end()) {
-      continue;
-    }
+    if (procPatchNames.find(name) != procPatchNames.end()) continue;
 
     const int start = meshBC.patchStartFace[ip];
     const int nFaces = meshBC.patchNFaces[ip];
 
     if (ip < static_cast<int>(bcUType.size()) && bcUType[ip] == "Dirichlet") {
-      double sumA = 0.0;
-      double sumVA = 0.0;
+      double sumA = 0.0, sumVA = 0.0;
 
       for (int i = 0; i < nFaces; ++i) {
         const int f = start + i;
         const double val = (comp == 0) ? uFaceBC[f] :
                            (comp == 1) ? vFaceBC[f] :
                                          wFaceBC[f];
-
         sumA += meshBC.Af[f];
         sumVA += val * meshBC.Af[f];
       }
@@ -417,7 +564,6 @@ static ScalarBCSet make_component_scalar_bc_from_legacy_mpi_port(
       const double avg = sumVA / std::max(sumA, 1.0e-300);
       bc.patches.push_back(make_dirichlet_constant_bc(name, avg));
     } else {
-      // Zero-gradient velocity outlet / open style.
       bc.patches.push_back(make_neumann_constant_bc(name, 0.0));
     }
   }
@@ -425,72 +571,12 @@ static ScalarBCSet make_component_scalar_bc_from_legacy_mpi_port(
   return bc;
 }
 
-static double global_max_abs_vec_mpi_port(
-    const std::vector<double>& a,
-    MPI_Comm comm)
-{
-  double local = 0.0;
-  for (double v : a) local = std::max(local, std::abs(v));
-
-  double global = 0.0;
-  MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_MAX, comm);
-  return global;
-}
-
-static void print_velocity_predictor_audit_rank0(
-    int rank,
+static double momentum_diag_cell_mpi_port(
     const DecompMesh& dm,
-    const std::vector<double>& U,
-    const std::vector<double>& V,
-    const std::vector<double>& W,
-    const std::vector<double>& phiPred,
-    int uIts,
-    int vIts,
-    int wIts,
-    double uRel,
-    double vRel,
-    double wRel,
-    MPI_Comm comm)
-{
-  const auto div = compute_cell_div_sum_mpi_port(dm, phiPred);
-
-  double localDivInf = 0.0;
-  double localDivL1 = 0.0;
-  double localDivSum = 0.0;
-
-  for (double d : div) {
-    localDivInf = std::max(localDivInf, std::abs(d));
-    localDivL1 += std::abs(d);
-    localDivSum += d;
-  }
-
-  double globalDivInf = 0.0;
-  double globalDivL1 = 0.0;
-  double globalDivSum = 0.0;
-
-  MPI_Reduce(&localDivInf, &globalDivInf, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-  MPI_Reduce(&localDivL1, &globalDivL1, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-  MPI_Reduce(&localDivSum, &globalDivSum, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-
-  const double Umax = global_max_abs_vec_mpi_port(U, comm);
-  const double Vmax = global_max_abs_vec_mpi_port(V, comm);
-  const double Wmax = global_max_abs_vec_mpi_port(W, comm);
-
-  if (rank == 0) {
-    std::printf("First distributed momentum predictor audit\n");
-    std::printf("  U/V/W max          : %.15e %.15e %.15e\n", Umax, Vmax, Wmax);
-    std::printf("  velocity iterations: [%d %d %d]\n", uIts, vIts, wIts);
-    std::printf("  velocity finalRel  : %.15e %.15e %.15e\n", uRel, vRel, wRel);
-    std::printf("  predictor div sum  : %.15e\n", globalDivSum);
-    std::printf("  predictor div L1   : %.15e\n", globalDivL1);
-    std::printf("  predictor div Linf : %.15e\n", globalDivInf);
-  }
-}
-
-
-
-static double momentum_diag_diffusion_cell_mpi_port(
-    const DecompMesh& dm,
+    const Mesh& meshBC,
+    const std::vector<std::string>& bcUType,
+    const std::vector<double>& faceFlux,
+    double rho,
     double mu,
     int P)
 {
@@ -498,55 +584,68 @@ static double momentum_diag_diffusion_cell_mpi_port(
   double diag = 0.0;
 
   for (int f = 0; f < mesh.nInternalFaces; ++f) {
-    if (mesh.owner[f] != P && mesh.neigh[f] != P) continue;
+    const int owner = mesh.owner[f];
+    const int neigh = mesh.neigh[f];
 
-    const int C0 = mesh.owner[f];
-    const int C1 = mesh.neigh[f];
+    if (owner != P && neigh != P) continue;
 
-    const auto d = std::array<double,3>{
-      mesh.cc[C1][0] - mesh.cc[C0][0],
-      mesh.cc[C1][1] - mesh.cc[C0][1],
-      mesh.cc[C1][2] - mesh.cc[C0][2]
-    };
-
+    const auto d = sub3_local(mesh.cc[neigh], mesh.cc[owner]);
     const double dDotS = dot3_local(d, mesh.Sf[f]);
     const double D = mu * dot3_local(mesh.Sf[f], mesh.Sf[f]) / std::max(dDotS, 1.0e-300);
+
     diag += D;
+
+    const double F = rho * faceFlux[f];
+
+    if (owner == P) {
+      diag += std::max(F, 0.0);
+    } else {
+      diag += std::max(-F, 0.0);
+    }
   }
 
   for (int f : mesh.cellBFace[P]) {
     std::array<double,3> d;
 
     if (dm.isProcFace[f]) {
-      d = {
-        dm.remoteCCForFace[f][0] - mesh.cc[P][0],
-        dm.remoteCCForFace[f][1] - mesh.cc[P][1],
-        dm.remoteCCForFace[f][2] - mesh.cc[P][2]
-      };
+      d = sub3_local(dm.remoteCCForFace[f], mesh.cc[P]);
     } else {
-      d = {
-        mesh.xf[f][0] - mesh.cc[P][0],
-        mesh.xf[f][1] - mesh.cc[P][1],
-        mesh.xf[f][2] - mesh.cc[P][2]
-      };
+      d = sub3_local(mesh.xf[f], mesh.cc[P]);
     }
 
     const double dDotS = dot3_local(d, mesh.Sf[f]);
     const double D = mu * dot3_local(mesh.Sf[f], mesh.Sf[f]) / std::max(dDotS, 1.0e-300);
+
     diag += D;
+
+    const double F = rho * faceFlux[f];
+
+    if (dm.isProcFace[f]) {
+      diag += std::max(F, 0.0);
+    } else {
+      const int ip = patch_index_for_face_mpi_port(meshBC, f);
+      const bool dirichletU = (ip >= 0 &&
+                               ip < static_cast<int>(bcUType.size()) &&
+                               bcUType[ip] == "Dirichlet");
+      if (!dirichletU) diag += F;
+    }
   }
 
   return std::max(diag, 1.0e-300);
 }
 
-static std::vector<double> build_rAU_diffusion_mpi_port(
+static std::vector<double> build_rAU_mpi_port(
     const DecompMesh& dm,
+    const Mesh& meshBC,
+    const std::vector<std::string>& bcUType,
+    const std::vector<double>& faceFlux,
+    double rho,
     double mu)
 {
   std::vector<double> rAU(dm.mesh.nCells, 0.0);
 
   for (int c = 0; c < dm.mesh.nCells; ++c) {
-    rAU[c] = 1.0 / momentum_diag_diffusion_cell_mpi_port(dm, mu, c);
+    rAU[c] = 1.0 / momentum_diag_cell_mpi_port(dm, meshBC, bcUType, faceFlux, rho, mu, c);
   }
 
   return rAU;
@@ -554,7 +653,9 @@ static std::vector<double> build_rAU_diffusion_mpi_port(
 
 static std::vector<double> build_pressure_gamma_faces_mpi_port(
     const DecompMesh& dm,
-    const std::vector<double>& rAU)
+    const std::vector<double>& rAU,
+    double rho,
+    double pCoeffScale)
 {
   const Mesh& mesh = dm.mesh;
   const auto rRAU = exchange_proc_face_scalar_owner_values(dm, rAU);
@@ -565,7 +666,12 @@ static std::vector<double> build_pressure_gamma_faces_mpi_port(
     const int P = mesh.owner[f];
     const int N = mesh.neigh[f];
     const double lam = face_lambda_local_mpi_port(mesh, f);
-    gamma[f] = (1.0 - lam) * rAU[P] + lam * rAU[N];
+    const double rAUf = (1.0 - lam) * rAU[P] + lam * rAU[N];
+
+    // Serial pressure coefficient:
+    // coeff = pCoeffScale * rho * Af * rAUf * deltaCoeff.
+    // libpoisson_decomp with gammaFace gives coeff = gammaFace * Af * deltaCoeff.
+    gamma[f] = rho * pCoeffScale * rAUf;
   }
 
   for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
@@ -573,9 +679,10 @@ static std::vector<double> build_pressure_gamma_faces_mpi_port(
 
     if (dm.isProcFace[f]) {
       const double lam = face_lambda_proc_mpi_port(dm, f);
-      gamma[f] = (1.0 - lam) * rAU[P] + lam * rRAU[f];
+      const double rAUf = (1.0 - lam) * rAU[P] + lam * rRAU[f];
+      gamma[f] = rho * pCoeffScale * rAUf;
     } else {
-      gamma[f] = rAU[P];
+      gamma[f] = rho * pCoeffScale * rAU[P];
     }
   }
 
@@ -592,15 +699,11 @@ static ScalarBCSet make_pcorr_bc_from_legacy_pressure_mpi_port(
   for (int ip = 0; ip < static_cast<int>(meshBC.patchNames.size()); ++ip) {
     const std::string& name = meshBC.patchNames[ip];
 
-    if (procPatchNames.find(name) != procPatchNames.end()) {
-      continue;
-    }
+    if (procPatchNames.find(name) != procPatchNames.end()) continue;
 
     if (ip < static_cast<int>(bcPType.size()) && bcPType[ip] == "Dirichlet") {
-      // Fixed pressure outlet => pCorr = 0.
       bc.patches.push_back(make_dirichlet_constant_bc(name, 0.0));
     } else {
-      // Pressure zeroGradient patches => pCorr zeroGradient.
       bc.patches.push_back(make_neumann_constant_bc(name, 0.0));
     }
   }
@@ -617,7 +720,6 @@ static std::vector<double> correct_flux_orthogonal_pcorr_mpi_port(
     const std::vector<double>& gammaFace)
 {
   const Mesh& mesh = dm.mesh;
-
   const auto rPCorr = exchange_proc_face_scalar_owner_values(dm, pCorr);
 
   std::vector<double> phi = phiPred;
@@ -626,12 +728,7 @@ static std::vector<double> correct_flux_orthogonal_pcorr_mpi_port(
     const int P = mesh.owner[f];
     const int N = mesh.neigh[f];
 
-    const auto d = std::array<double,3>{
-      mesh.cc[N][0] - mesh.cc[P][0],
-      mesh.cc[N][1] - mesh.cc[P][1],
-      mesh.cc[N][2] - mesh.cc[P][2]
-    };
-
+    const auto d = sub3_local(mesh.cc[N], mesh.cc[P]);
     const double dDotS = dot3_local(d, mesh.Sf[f]);
     const double D = gammaFace[f] * dot3_local(mesh.Sf[f], mesh.Sf[f]) / std::max(dDotS, 1.0e-300);
 
@@ -640,122 +737,93 @@ static std::vector<double> correct_flux_orthogonal_pcorr_mpi_port(
   }
 
   for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
-    if (!dm.isProcFace[f]) continue;
+    if (dm.isProcFace[f]) {
+      const int P = mesh.owner[f];
 
-    const int P = mesh.owner[f];
+      const auto d = sub3_local(dm.remoteCCForFace[f], mesh.cc[P]);
+      const double dDotS = dot3_local(d, mesh.Sf[f]);
+      const double D = gammaFace[f] * dot3_local(mesh.Sf[f], mesh.Sf[f]) / std::max(dDotS, 1.0e-300);
 
-    const auto d = std::array<double,3>{
-      dm.remoteCCForFace[f][0] - mesh.cc[P][0],
-      dm.remoteCCForFace[f][1] - mesh.cc[P][1],
-      dm.remoteCCForFace[f][2] - mesh.cc[P][2]
-    };
+      const double q = D * (rPCorr[f] - pCorr[P]);
+      phi[f] -= q;
+    } else {
+      const int ip = patch_index_for_face_mpi_port(meshBC, f);
+      const bool fixedPressure = (ip >= 0 &&
+                                  ip < static_cast<int>(bcPType.size()) &&
+                                  bcPType[ip] == "Dirichlet");
+      if (!fixedPressure) continue;
 
-    const double dDotS = dot3_local(d, mesh.Sf[f]);
-    const double D = gammaFace[f] * dot3_local(mesh.Sf[f], mesh.Sf[f]) / std::max(dDotS, 1.0e-300);
+      const int P = mesh.owner[f];
 
-    const double q = D * (rPCorr[f] - pCorr[P]);
-    phi[f] -= q;
-  }
+      const auto d = sub3_local(mesh.xf[f], mesh.cc[P]);
+      const double dDotS = dot3_local(d, mesh.Sf[f]);
+      const double D = gammaFace[f] * dot3_local(mesh.Sf[f], mesh.Sf[f]) / std::max(dDotS, 1.0e-300);
 
-  // Physical pCorr boundaries: fixed pressure gives pCorr=0 but no flux correction
-  // through the physical boundary in this first checkpoint. Inlet/wall are zeroGradient.
-  // Physical fixed-pressure boundaries also need a pressure-correction
-  // flux update. For fixed pressure, pCorr_B = 0, but grad(pCorr) at the
-  // outlet face is generally nonzero. Without this, the outlet cannot adjust
-  // to balance inlet mass flux.
-  for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
-    if (dm.isProcFace[f]) continue;
-
-    const int ip = patch_index_for_face_mpi_port(meshBC, f);
-
-    const bool fixedPressure =
-        (ip >= 0 &&
-         ip < static_cast<int>(bcPType.size()) &&
-         bcPType[ip] == "Dirichlet");
-
-    if (!fixedPressure) continue;
-
-    const int P = mesh.owner[f];
-
-    const std::array<double,3> d = {
-      mesh.xf[f][0] - mesh.cc[P][0],
-      mesh.xf[f][1] - mesh.cc[P][1],
-      mesh.xf[f][2] - mesh.cc[P][2]
-    };
-
-    const double dDotS = dot3_local(d, mesh.Sf[f]);
-    const double D = gammaFace[f] * dot3_local(mesh.Sf[f], mesh.Sf[f]) / std::max(dDotS, 1.0e-300);
-
-    const double pCorrB = 0.0;
-    const double q = D * (pCorrB - pCorr[P]);
-
-    phi[f] -= q;
+      const double pCorrB = 0.0;
+      const double q = D * (pCorrB - pCorr[P]);
+      phi[f] -= q;
+    }
   }
 
   return phi;
 }
 
-static void print_pressure_correction_audit_rank0(
+static void print_div_metrics_rank0(
     int rank,
+    const std::string& label,
+    const DecompMesh& dm,
+    const std::vector<double>& phi,
+    MPI_Comm comm)
+{
+  const auto div = compute_cell_div_sum_mpi_port(dm, phi);
+
+  const double divSum = global_sum_vec_mpi_port(div, comm);
+  const double divL1 = global_l1_vec_mpi_port(div, comm);
+  const double divInf = global_max_abs_vec_mpi_port(div, comm);
+
+  if (rank == 0) {
+    std::printf("%s div sum/L1/Linf : %.15e %.15e %.15e\n",
+                label.c_str(), divSum, divL1, divInf);
+  }
+}
+
+static void print_outer_iter_rank0(
+    int rank,
+    int iter,
     const DecompMesh& dm,
     const std::vector<double>& phiPred,
     const std::vector<double>& phiCorr,
+    const std::vector<double>& U,
+    const std::vector<double>& V,
+    const std::vector<double>& W,
     const std::vector<double>& pCorr,
-    int pIts,
-    double pRel,
+    int uIts, int vIts, int wIts,
+    double uRel, double vRel, double wRel,
+    int pIts, double pRel,
     MPI_Comm comm)
 {
   const auto divPred = compute_cell_div_sum_mpi_port(dm, phiPred);
   const auto divCorr = compute_cell_div_sum_mpi_port(dm, phiCorr);
 
-  double localPredInf = 0.0, localCorrInf = 0.0;
-  double localPredL1 = 0.0, localCorrL1 = 0.0;
-  double localPredSum = 0.0, localCorrSum = 0.0;
-  double localPCorrMax = 0.0;
+  const double predInf = global_max_abs_vec_mpi_port(divPred, comm);
+  const double corrInf = global_max_abs_vec_mpi_port(divCorr, comm);
+  const double corrL1 = global_l1_vec_mpi_port(divCorr, comm);
+  const double corrSum = global_sum_vec_mpi_port(divCorr, comm);
 
-  for (double d : divPred) {
-    localPredInf = std::max(localPredInf, std::abs(d));
-    localPredL1 += std::abs(d);
-    localPredSum += d;
-  }
-
-  for (double d : divCorr) {
-    localCorrInf = std::max(localCorrInf, std::abs(d));
-    localCorrL1 += std::abs(d);
-    localCorrSum += d;
-  }
-
-  for (double v : pCorr) {
-    localPCorrMax = std::max(localPCorrMax, std::abs(v));
-  }
-
-  double predInf = 0.0, corrInf = 0.0;
-  double predL1 = 0.0, corrL1 = 0.0;
-  double predSum = 0.0, corrSum = 0.0;
-  double pCorrMax = 0.0;
-
-  MPI_Reduce(&localPredInf, &predInf, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-  MPI_Reduce(&localCorrInf, &corrInf, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-  MPI_Reduce(&localPredL1, &predL1, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-  MPI_Reduce(&localCorrL1, &corrL1, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-  MPI_Reduce(&localPredSum, &predSum, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-  MPI_Reduce(&localCorrSum, &corrSum, 1, MPI_DOUBLE, MPI_SUM, 0, comm);
-  MPI_Reduce(&localPCorrMax, &pCorrMax, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+  const double Umax = global_max_abs_vec_mpi_port(U, comm);
+  const double Vmax = global_max_abs_vec_mpi_port(V, comm);
+  const double Wmax = global_max_abs_vec_mpi_port(W, comm);
+  const double pCorrMax = global_max_abs_vec_mpi_port(pCorr, comm);
 
   if (rank == 0) {
-    std::printf("First distributed pressure correction audit\n");
-    std::printf("  pCorr max abs       : %.15e\n", pCorrMax);
-    std::printf("  pressure iterations : %d\n", pIts);
-    std::printf("  pressure finalRel   : %.15e\n", pRel);
-    std::printf("  div before sum/L1/Linf : %.15e %.15e %.15e\n", predSum, predL1, predInf);
-    std::printf("  div after  sum/L1/Linf : %.15e %.15e %.15e\n", corrSum, corrL1, corrInf);
-    std::printf("  div Linf reduction     : %.15e\n", predInf / std::max(corrInf, 1.0e-300));
+    std::printf("iter %4d : divPredInf=%.12e divCorrInf=%.12e divCorrL1=%.12e divCorrSum=%.12e "
+                "pCorrMax=%.12e Umax/Vmax/Wmax=%.6e %.6e %.6e "
+                "velIts=[%d %d %d] velSolveRel=[%.3e %.3e %.3e] pIts=%d pRel=%.3e\n",
+                iter, predInf, corrInf, corrL1, corrSum,
+                pCorrMax, Umax, Vmax, Wmax,
+                uIts, vIts, wIts, uRel, vRel, wRel,
+                pIts, pRel);
   }
-}
-
-
-static bool is_proc_patch_name(const std::set<std::string>& procNames, const std::string& name) {
-  return procNames.find(name) != procNames.end();
 }
 
 int main(int argc, char** argv) {
@@ -767,17 +835,32 @@ int main(int argc, char** argv) {
 
   try {
     std::string caseRoot = "/tmp/case";
-    std::string bcConfigPath;
+    std::string bcConfigPath = "/tmp/case/anabasis_pipe.bc";
     int device = rank;
 
-    // Keep common serial-style options accepted even if unused in this checkpoint.
     std::string wallPatch = "patch_0_0";
     std::string inletPatch = "patch_2_0";
     std::string outletPatch = "patch_1_0";
+
     double rho = 1.0;
     double mu = 0.05;
     double uMean = 1.0;
-    int nsteps = 1;
+    double uRelax = 0.7;
+    double pRelax = 0.3;
+    double pCoeffScale = 1.0;
+
+    int nsteps = 50;
+    int minSteps = 5;
+    int printEvery = 1;
+    double tolMass = 1.0e-8;
+    double tolVel = 1.0e-6;
+
+    int velMaxit = 500;
+    double velAbsTol = 1.0e-7;
+    double velRelTol = 1.0e-5;
+
+    int pMaxit = 1000;
+    double pAbsTol = 1.0e-9;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -819,18 +902,52 @@ int main(int argc, char** argv) {
       } else if (a == "-nsteps") {
         need("-nsteps");
         nsteps = std::atoi(argv[++i]);
+      } else if (a == "-min-steps") {
+        need("-min-steps");
+        minSteps = std::atoi(argv[++i]);
+      } else if (a == "-print-every") {
+        need("-print-every");
+        printEvery = std::atoi(argv[++i]);
+      } else if (a == "-u-relax") {
+        need("-u-relax");
+        uRelax = std::atof(argv[++i]);
+      } else if (a == "-p-relax") {
+        need("-p-relax");
+        pRelax = std::atof(argv[++i]);
+      } else if (a == "-p-coeff-scale" || a == "-pCoeffScale") {
+        need(a.c_str());
+        pCoeffScale = std::atof(argv[++i]);
+      } else if (a == "-tolMass") {
+        need("-tolMass");
+        tolMass = std::atof(argv[++i]);
+      } else if (a == "-tolVel") {
+        need("-tolVel");
+        tolVel = std::atof(argv[++i]);
+      } else if (a == "-vel-maxit") {
+        need("-vel-maxit");
+        velMaxit = std::atoi(argv[++i]);
+      } else if (a == "-vel-tol") {
+        need("-vel-tol");
+        velAbsTol = std::atof(argv[++i]);
+      } else if (a == "-vel-reltol") {
+        need("-vel-reltol");
+        velRelTol = std::atof(argv[++i]);
+      } else if (a == "-p-maxit") {
+        need("-p-maxit");
+        pMaxit = std::atoi(argv[++i]);
+      } else if (a == "-p-tol") {
+        need("-p-tol");
+        pAbsTol = std::atof(argv[++i]);
       } else {
         if (rank == 0) {
-          std::printf("simple_gpu_mpi_port checkpoint: ignoring unimplemented option %s\n", a.c_str());
+          std::printf("simple_gpu_mpi_port: ignoring unimplemented option %s\n", a.c_str());
         }
       }
     }
 
     int devCount = 0;
     cuda_check(cudaGetDeviceCount(&devCount), "cudaGetDeviceCount");
-    if (devCount > 0) {
-      cuda_check(cudaSetDevice(device % devCount), "cudaSetDevice");
-    }
+    if (devCount > 0) cuda_check(cudaSetDevice(device % devCount), "cudaSetDevice");
 
     cudaDeviceProp prop{};
     if (devCount > 0) {
@@ -842,16 +959,11 @@ int main(int argc, char** argv) {
 
     const std::string localBoundaryPath =
         caseRoot + "/processor" + std::to_string(rank) + "/constant/polyMesh/boundary";
-
     const auto basicPatchTable = read_basic_patch_table_local(localBoundaryPath);
 
     std::vector<std::string> patchNamesForBC;
     std::vector<int> patchStartFaceForBC;
     std::vector<int> patchNFacesForBC;
-
-    patchNamesForBC.reserve(basicPatchTable.size());
-    patchStartFaceForBC.reserve(basicPatchTable.size());
-    patchNFacesForBC.reserve(basicPatchTable.size());
 
     for (const auto& p : basicPatchTable) {
       patchNamesForBC.push_back(p.name);
@@ -859,36 +971,22 @@ int main(int argc, char** argv) {
       patchNFacesForBC.push_back(p.nFaces);
     }
 
-    // Serial BC helpers require a Mesh-like view with populated patch arrays.
     Mesh meshBC = mesh;
     meshBC.patchNames = patchNamesForBC;
     meshBC.patchStartFace = patchStartFaceForBC;
     meshBC.patchNFaces = patchNFacesForBC;
 
     std::set<std::string> procPatchNames;
-    for (const auto& pp : dm.procPatches) {
-      procPatchNames.insert(pp.name);
-    }
+    for (const auto& pp : dm.procPatches) procPatchNames.insert(pp.name);
 
     std::vector<std::string> physicalPatchNames;
     for (const auto& name : patchNamesForBC) {
-      if (!is_proc_patch_name(procPatchNames, name)) {
-        physicalPatchNames.push_back(name);
-      }
+      if (!is_proc_patch_name(procPatchNames, name)) physicalPatchNames.push_back(name);
     }
 
-    pipebc::RuntimeBCConfig bcConfig;
-    bool haveBC = !bcConfigPath.empty();
+    pipebc::RuntimeBCConfig bcConfig = pipebc::load_runtime_bc_config(bcConfigPath);
+    pipebc::validate_runtime_bc_config_against_patches(bcConfig, physicalPatchNames);
 
-    if (haveBC) {
-      bcConfig = pipebc::load_runtime_bc_config(bcConfigPath);
-
-      // Important: validate only physical patches.
-      // OpenFOAM processor patches are coupled internal faces, not user BC patches.
-      pipebc::validate_runtime_bc_config_against_patches(bcConfig, physicalPatchNames);
-    }
-
-    // Build patch geometry and evaluate the same modular BC specs used by serial simple_gpu.
     pipebc::PatchGeometryInput patchGeomIn;
     patchGeomIn.nInternalFaces = mesh.nInternalFaces;
     patchGeomIn.nFaces = mesh.nFaces;
@@ -921,16 +1019,14 @@ int main(int argc, char** argv) {
     std::vector<double> wFaceBC(mesh.nFaces, 0.0);
     std::vector<double> pFaceBC(mesh.nFaces, 0.0);
 
-    if (haveBC) {
-      pipebc::apply_bc_specs_to_legacy_face_arrays(
-          legacyBCMesh,
-          patchGeometryTable,
-          bcConfig.velocityPatchSpecs,
-          bcConfig.pressurePatchSpecs,
-          0.0,
-          bcUType, bcVType, bcWType, bcPType,
-          uFaceBC, vFaceBC, wFaceBC, pFaceBC);
-    }
+    pipebc::apply_bc_specs_to_legacy_face_arrays(
+        legacyBCMesh,
+        patchGeometryTable,
+        bcConfig.velocityPatchSpecs,
+        bcConfig.pressurePatchSpecs,
+        0.0,
+        bcUType, bcVType, bcWType, bcPType,
+        uFaceBC, vFaceBC, wFaceBC, pFaceBC);
 
     int localProcFaces = 0;
     for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
@@ -948,8 +1044,6 @@ int main(int argc, char** argv) {
     MPI_Allreduce(&localProcFaces, &globalProcFaces, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(&localPhysicalFaces, &globalPhysicalFaces, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 
-    MPI_Barrier(MPI_COMM_WORLD);
-
     std::printf(
       "simple_gpu_mpi_port rank %d/%d: rows=[%lld,%lld] nLocal=%d nFaces=%d internalFaces=%d physicalBoundaryFaces=%d procFaces=%d cudaDevice=%d name=%s\n",
       rank, size,
@@ -961,68 +1055,100 @@ int main(int argc, char** argv) {
       localProcFaces,
       devCount > 0 ? device % devCount : -1,
       devCount > 0 ? prop.name : "NO_CUDA_DEVICE");
-
     std::fflush(stdout);
-    MPI_Barrier(MPI_COMM_WORLD);
 
     if (rank == 0) {
       std::printf("====================================================================\n");
-      std::printf("simple_gpu_mpi_port FRONTEND CHECKPOINT PASS\n");
+      std::printf("simple_gpu_mpi_port SIMPLE LOOP CHECKPOINT\n");
       std::printf("caseRoot       : %s\n", caseRoot.c_str());
-      std::printf("bcConfig       : %s\n", haveBC ? bcConfigPath.c_str() : "<none>\n");
+      std::printf("bcConfig       : %s\n", bcConfigPath.c_str());
       std::printf("worldSize      : %d\n", size);
       std::printf("globalCells    : %d\n", globalCells);
       std::printf("globalProcFaces: %d\n", globalProcFaces);
       std::printf("globalPhysFaces: %d\n", globalPhysicalFaces);
       std::printf("rho/mu/uMean   : %.6e / %.6e / %.6e\n", rho, mu, uMean);
-      std::printf("patch aliases  : wall=%s inlet=%s outlet=%s\n",
-                  wallPatch.c_str(), inletPatch.c_str(), outletPatch.c_str());
-      std::printf("physical patches validated against BC config:\n");
-      for (const auto& name : physicalPatchNames) {
-        std::printf("  physical patch: %s\n", name.c_str());
-      }
-      std::printf("all local patch table entries on rank0:\n");
-      for (size_t ip = 0; ip < meshBC.patchNames.size(); ++ip) {
-        std::printf("  patch[%zu] name=%s start=%d nFaces=%d%s\n",
-                    ip,
-                    meshBC.patchNames[ip].c_str(),
-                    meshBC.patchStartFace[ip],
-                    meshBC.patchNFaces[ip],
-                    is_proc_patch_name(procPatchNames, meshBC.patchNames[ip]) ? " processor" : " physical");
-      }
-      std::printf("BC entries:\n");
-      std::printf("  velocityPatchSpecs = %zu\n", bcConfig.velocityPatchSpecs.size());
-      std::printf("  pressurePatchSpecs = %zu\n", bcConfig.pressurePatchSpecs.size());
-      std::printf("Patch geometry table local rank0 entries: %zu\n", patchGeometryTable.size());
-      std::printf("====================================================================\n");
+      std::printf("relax U/P      : %.6e / %.6e\n", uRelax, pRelax);
+      std::printf("pCoeffScale    : %.6e\n", pCoeffScale);
+      std::printf("nsteps/minSteps/tolMass/tolVel : %d / %d / %.6e / %.6e\n", nsteps, minSteps, tolMass, tolVel);
+      std::printf("velocityPatchSpecs = %zu pressurePatchSpecs = %zu\n",
+                  bcConfig.velocityPatchSpecs.size(), bcConfig.pressurePatchSpecs.size());
       std::fflush(stdout);
     }
 
-    if (haveBC) {
-      print_patch_audit_rank0(rank, meshBC, wallPatch, bcUType, bcPType,
-                              uFaceBC, vFaceBC, wFaceBC, MPI_COMM_WORLD);
-      print_patch_audit_rank0(rank, meshBC, inletPatch, bcUType, bcPType,
-                              uFaceBC, vFaceBC, wFaceBC, MPI_COMM_WORLD);
-      print_patch_audit_rank0(rank, meshBC, outletPatch, bcUType, bcPType,
-                              uFaceBC, vFaceBC, wFaceBC, MPI_COMM_WORLD);
+    print_patch_audit_rank0(rank, meshBC, wallPatch, bcUType, bcPType,
+                            uFaceBC, vFaceBC, wFaceBC, MPI_COMM_WORLD);
+    print_patch_audit_rank0(rank, meshBC, inletPatch, bcUType, bcPType,
+                            uFaceBC, vFaceBC, wFaceBC, MPI_COMM_WORLD);
+    print_patch_audit_rank0(rank, meshBC, outletPatch, bcUType, bcPType,
+                            uFaceBC, vFaceBC, wFaceBC, MPI_COMM_WORLD);
 
+    std::vector<double> U(mesh.nCells, 0.0);
+    std::vector<double> V(mesh.nCells, 0.0);
+    std::vector<double> W(mesh.nCells, 0.0);
+    std::vector<double> pField(mesh.nCells, 0.0);
 
-      // Initial field/flux checkpoint.
-      std::vector<double> U(mesh.nCells, 0.0);
-      std::vector<double> V(mesh.nCells, 0.0);
-      std::vector<double> W(mesh.nCells, 0.0);
-      std::vector<double> pField(mesh.nCells, 0.0);
+    ScalarBCSet uCompBC = make_component_scalar_bc_from_legacy_mpi_port(
+        meshBC, procPatchNames, bcUType, uFaceBC, vFaceBC, wFaceBC, 0);
+    ScalarBCSet vCompBC = make_component_scalar_bc_from_legacy_mpi_port(
+        meshBC, procPatchNames, bcUType, uFaceBC, vFaceBC, wFaceBC, 1);
+    ScalarBCSet wCompBC = make_component_scalar_bc_from_legacy_mpi_port(
+        meshBC, procPatchNames, bcUType, uFaceBC, vFaceBC, wFaceBC, 2);
+    ScalarBCSet pCorrBC = make_pcorr_bc_from_legacy_pressure_mpi_port(
+        meshBC, procPatchNames, bcPType);
 
-      const auto phi0 = build_face_flux_mpi_port(
-          dm, meshBC, bcUType,
-          U, V, W,
-          uFaceBC, vFaceBC, wFaceBC);
+    PressureBCFaceData pBCData = build_pressure_bc_face_data_mpi_port(
+        dm, meshBC, bcPType, pFaceBC);
 
-      print_flux_divergence_audit_rank0(rank, dm, phi0, MPI_COMM_WORLD);
+    libscalar_decomp::DistScalarTransportOptions momOpt;
+    momOpt.convectionScheme = libscalar_decomp::DistConvectionScheme::Upwind;
+    momOpt.diffusionScheme = libscalar_decomp::DistDiffusionScheme::Orth;
+    momOpt.gradScheme = "lsq";
+    momOpt.nNonOrthCorr = 0;
+    momOpt.underRelax = uRelax;
+    momOpt.solver.maxIter = velMaxit;
+    momOpt.solver.absTol = velAbsTol;
+    momOpt.solver.relTol = velRelTol;
+    momOpt.solver.monitor = 0;
 
-      // First distributed momentum predictor.
-      // This is not yet the final serial simple_gpu momentum physics;
-      // it is the first MPI momentum-solve checkpoint using libscalar_decomp.
+    DistEllipticOptions pOpt;
+    pOpt.gradScheme = "lsq";
+    pOpt.laplacianScheme = "orth";
+    pOpt.nNonOrthCorr = 0;
+    pOpt.useReferenceCell = false;
+    pOpt.referenceGlobalCell = 0;
+    pOpt.referenceValue = 0.0;
+    pOpt.hypre.maxIter = pMaxit;
+    pOpt.hypre.absTol = pAbsTol;
+    pOpt.hypre.relTol = 0.0;
+    pOpt.hypre.tol = pAbsTol;
+    pOpt.hypre.monitor = 0;
+    pOpt.hypre.amgMaxIter = 1;
+    pOpt.hypre.amgRelaxType = 18;
+    pOpt.hypre.amgCoarsenType = 8;
+    pOpt.hypre.amgInterpType = 6;
+    pOpt.hypre.amgAggLevels = 1;
+    pOpt.hypre.amgPmax = 4;
+    pOpt.hypre.amgKeepTranspose = 1;
+
+    std::vector<double> phi = build_face_flux_mpi_port(
+        dm, meshBC, bcUType,
+        U, V, W,
+        uFaceBC, vFaceBC, wFaceBC);
+    for (double& pf : phi) pf *= rho;
+
+    print_div_metrics_rank0(rank, "initial", dm, phi, MPI_COMM_WORLD);
+
+    double finalMass = 1.0e300;
+
+    for (int iter = 1; iter <= nsteps; ++iter) {
+      std::vector<double> Uold = U;
+      std::vector<double> Vold = V;
+      std::vector<double> Wold = W;
+      std::vector<double> pOld = pField;
+
+      std::vector<std::array<double,3>> gradP;
+      compute_lsq_gradient_scalar_mpi_port(dm, pField, pBCData, gradP);
+
       libscalar_decomp::DistScalarTransportInputs momIn;
       momIn.faceFlux.assign(mesh.nFaces, 0.0);
       momIn.gammaFace.assign(mesh.nFaces, mu);
@@ -1030,81 +1156,58 @@ int main(int argc, char** argv) {
       momIn.Sp.assign(mesh.nCells, 0.0);
 
       for (int f = 0; f < mesh.nFaces; ++f) {
-        momIn.faceFlux[f] = rho * phi0[f];
+        // phi is already mass flux, matching serial simple_gpu convention.
+        momIn.faceFlux[f] = phi[f];
       }
 
-      ScalarBCSet uCompBC = make_component_scalar_bc_from_legacy_mpi_port(
-          meshBC, procPatchNames, bcUType, uFaceBC, vFaceBC, wFaceBC, 0);
-      ScalarBCSet vCompBC = make_component_scalar_bc_from_legacy_mpi_port(
-          meshBC, procPatchNames, bcUType, uFaceBC, vFaceBC, wFaceBC, 1);
-      ScalarBCSet wCompBC = make_component_scalar_bc_from_legacy_mpi_port(
-          meshBC, procPatchNames, bcUType, uFaceBC, vFaceBC, wFaceBC, 2);
+      for (int c = 0; c < mesh.nCells; ++c) {
+        momIn.Su[c] = -gradP[c][0];
+      }
+      auto uRes = libscalar_decomp::solve_scalar_transport_decomp(dm, momIn, uCompBC, momOpt, U);
 
-      libscalar_decomp::DistScalarTransportOptions momOpt;
-      momOpt.convectionScheme = libscalar_decomp::DistConvectionScheme::Upwind;
-      momOpt.diffusionScheme = libscalar_decomp::DistDiffusionScheme::Orth;
-      momOpt.gradScheme = "lsq";
-      momOpt.nNonOrthCorr = 0;
-      momOpt.solver.maxIter = 500;
-      momOpt.solver.absTol = 1.0e-7;
-      momOpt.solver.relTol = 1.0e-5;
-      momOpt.solver.monitor = 0;
+      for (int c = 0; c < mesh.nCells; ++c) {
+        momIn.Su[c] = -gradP[c][1];
+      }
+      auto vRes = libscalar_decomp::solve_scalar_transport_decomp(dm, momIn, vCompBC, momOpt, V);
 
-      auto uRes = libscalar_decomp::solve_scalar_transport_decomp(
-          dm, momIn, uCompBC, momOpt, U);
-      auto vRes = libscalar_decomp::solve_scalar_transport_decomp(
-          dm, momIn, vCompBC, momOpt, V);
-      auto wRes = libscalar_decomp::solve_scalar_transport_decomp(
-          dm, momIn, wCompBC, momOpt, W);
+      for (int c = 0; c < mesh.nCells; ++c) {
+        momIn.Su[c] = -gradP[c][2];
+      }
+      auto wRes = libscalar_decomp::solve_scalar_transport_decomp(dm, momIn, wCompBC, momOpt, W);
 
       U = std::move(uRes.phi);
       V = std::move(vRes.phi);
       W = std::move(wRes.phi);
 
-      const auto phiPred = build_face_flux_mpi_port(
-          dm, meshBC, bcUType,
+      // Use rAU extracted from the actual relaxed momentum matrix.
+      // The U/V/W component matrices have the same operator for this pipe case;
+      // W is the driven component, so use its returned rAU.
+      std::vector<double> rAU = wRes.rAU;
+      if (rAU.empty()) {
+        rAU = build_rAU_mpi_port(dm, meshBC, bcUType, phi, rho, mu);
+      }
+
+      const auto phiPred = build_rhiechow_phi_star_mpi_port(
+          dm, meshBC,
+          bcUType, bcVType, bcWType,
           U, V, W,
-          uFaceBC, vFaceBC, wFaceBC);
+          pField, gradP,
+          rAU,
+          uFaceBC, vFaceBC, wFaceBC,
+          rho);
 
-      print_velocity_predictor_audit_rank0(
-          rank, dm, U, V, W, phiPred,
-          uRes.iterations, vRes.iterations, wRes.iterations,
-          uRes.finalRelRes, vRes.finalRelRes, wRes.finalRelRes,
-          MPI_COMM_WORLD);
+      const auto pGammaFace = build_pressure_gamma_faces_mpi_port(
+          dm, rAU, rho, pCoeffScale);
 
-
-      // First distributed pressure correction checkpoint.
-      const auto rAU = build_rAU_diffusion_mpi_port(dm, mu);
-      const auto pGammaFace = build_pressure_gamma_faces_mpi_port(dm, rAU);
       const auto divPred = compute_cell_div_sum_mpi_port(dm, phiPred);
 
       std::vector<double> pCorrSource(mesh.nCells, 0.0);
       for (int c = 0; c < mesh.nCells; ++c) {
+        // libpoisson_decomp treats cellSource as source per volume and internally
+        // multiplies by cell volume. To match serial simple_gpu rhs=-div(phi),
+        // pass -div(phi)/V here.
         pCorrSource[c] = -divPred[c] / std::max(mesh.vol[c], 1.0e-300);
       }
-
-      ScalarBCSet pCorrBC = make_pcorr_bc_from_legacy_pressure_mpi_port(
-          meshBC, procPatchNames, bcPType);
-
-      DistEllipticOptions pOpt;
-      pOpt.gradScheme = "lsq";
-      pOpt.laplacianScheme = "orth";
-      pOpt.nNonOrthCorr = 0;
-      pOpt.useReferenceCell = false;
-      pOpt.referenceGlobalCell = 0;
-      pOpt.referenceValue = 0.0;
-      pOpt.hypre.maxIter = 1000;
-      pOpt.hypre.absTol = 1.0e-9;
-      pOpt.hypre.relTol = 0.0;
-      pOpt.hypre.tol = 1.0e-9;
-      pOpt.hypre.monitor = 0;
-      pOpt.hypre.amgMaxIter = 1;
-      pOpt.hypre.amgRelaxType = 18;
-      pOpt.hypre.amgCoarsenType = 8;
-      pOpt.hypre.amgInterpType = 6;
-      pOpt.hypre.amgAggLevels = 1;
-      pOpt.hypre.amgPmax = 4;
-      pOpt.hypre.amgKeepTranspose = 1;
 
       auto pCorrRes = solve_scalar_elliptic_decomp(
           dm, pGammaFace, pCorrSource, pCorrBC, pOpt);
@@ -1112,18 +1215,92 @@ int main(int argc, char** argv) {
       const auto phiCorr = correct_flux_orthogonal_pcorr_mpi_port(
           dm, meshBC, bcPType, phiPred, pCorrRes.phi, pGammaFace);
 
-      print_pressure_correction_audit_rank0(
-          rank, dm, phiPred, phiCorr, pCorrRes.phi,
-          pCorrRes.lastSolveInfo.iterations,
-          pCorrRes.lastSolveInfo.finalRelResNorm,
-          MPI_COMM_WORLD);
-
-
-      if (rank == 0) {
-        std::printf("NOTE: this checkpoint exits after first distributed momentum predictor + pressure correction. Next step wraps these in the SIMPLE loop.\n");
-        std::printf("====================================================================\n");
-        std::fflush(stdout);
+      PressureBCFaceData pCorrBCData;
+      pCorrBCData.type.assign(mesh.nFaces, ScalarBCType::Neumann);
+      pCorrBCData.value.assign(mesh.nFaces, 0.0);
+      for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
+        if (dm.isProcFace[f]) continue;
+        const int ip = patch_index_for_face_mpi_port(meshBC, f);
+        if (ip >= 0 && ip < static_cast<int>(bcPType.size()) && bcPType[ip] == "Dirichlet") {
+          pCorrBCData.type[f] = ScalarBCType::Dirichlet;
+          pCorrBCData.value[f] = 0.0;
+        }
       }
+
+      std::vector<std::array<double,3>> gradPCorr;
+      compute_lsq_gradient_scalar_mpi_port(dm, pCorrRes.phi, pCorrBCData, gradPCorr);
+
+      for (int c = 0; c < mesh.nCells; ++c) {
+        U[c] -= rAU[c] * gradPCorr[c][0];
+        V[c] -= rAU[c] * gradPCorr[c][1];
+        W[c] -= rAU[c] * gradPCorr[c][2];
+        pField[c] += pRelax * pCorrRes.phi[c];
+      }
+
+      double localDU = 0.0;
+      double localUScale = 0.0;
+      double localDP = 0.0;
+      double localPScale = 0.0;
+
+      for (int c = 0; c < mesh.nCells; ++c) {
+        const double du0 = U[c] - Uold[c];
+        const double du1 = V[c] - Vold[c];
+        const double du2 = W[c] - Wold[c];
+
+        const double duMag = std::sqrt(du0*du0 + du1*du1 + du2*du2);
+        const double uMag  = std::sqrt(U[c]*U[c] + V[c]*V[c] + W[c]*W[c]);
+
+        localDU = std::max(localDU, duMag);
+        localUScale = std::max(localUScale, uMag);
+
+        localDP = std::max(localDP, std::abs(pField[c] - pOld[c]));
+        localPScale = std::max(localPScale, std::abs(pField[c]));
+      }
+
+      double gDU = 0.0, gUScale = 0.0, gDP = 0.0, gPScale = 0.0;
+      MPI_Allreduce(&localDU, &gDU, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+      MPI_Allreduce(&localUScale, &gUScale, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+      MPI_Allreduce(&localDP, &gDP, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+      MPI_Allreduce(&localPScale, &gPScale, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+      const double velRel = gDU / std::max(gUScale, 1.0e-300);
+      const double pChangeRel = gDP / std::max(gPScale, 1.0e-300);
+
+      phi = phiCorr;
+
+      const auto divCorr = compute_cell_div_sum_mpi_port(dm, phi);
+      finalMass = global_max_abs_vec_mpi_port(divCorr, MPI_COMM_WORLD);
+
+      if (iter % std::max(printEvery, 1) == 0 || iter == 1 || finalMass < tolMass) {
+        print_outer_iter_rank0(
+            rank, iter, dm, phiPred, phi,
+            U, V, W,
+            pCorrRes.phi,
+            uRes.iterations, vRes.iterations, wRes.iterations,
+            uRes.finalRelRes, vRes.finalRelRes, wRes.finalRelRes,
+            pCorrRes.lastSolveInfo.iterations,
+            pCorrRes.lastSolveInfo.finalRelResNorm,
+            MPI_COMM_WORLD);
+
+        if (rank == 0) {
+          std::printf("          convergence check: velRel=%.12e pChangeRel=%.12e minSteps=%d\n",
+                      velRel, pChangeRel, minSteps);
+        }
+      }
+
+      if (iter >= minSteps && finalMass < tolMass && velRel < tolVel) {
+        if (rank == 0) {
+          std::printf("simple_gpu_mpi_port CONVERGED at iter %d massLinf=%.12e velRel=%.12e\n",
+                      iter, finalMass, velRel);
+        }
+        break;
+      }
+    }
+
+    if (rank == 0) {
+      std::printf("simple_gpu_mpi_port FINAL massLinf=%.12e\n", finalMass);
+      std::printf("simple_gpu_mpi_port PASS_RAN\n");
+      std::printf("====================================================================\n");
     }
 
     MPI_Finalize();

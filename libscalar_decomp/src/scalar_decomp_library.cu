@@ -601,6 +601,45 @@ DistSolverInfoLocal solve_bicgstab_jacobi_decomp(
   return out;
 }
 
+
+std::vector<double> apply_under_relaxation_and_extract_rAU_scalar_decomp(
+    const DecompMesh& dm,
+    const DistCSRPattern& pat,
+    std::vector<HYPRE_Complex>& values,
+    std::vector<HYPRE_Complex>& rhs,
+    const std::vector<double>& phiOld,
+    double underRelax) {
+  const Mesh& mesh = dm.mesh;
+
+  if (static_cast<int>(phiOld.size()) != mesh.nCells) {
+    throw std::runtime_error("apply_under_relaxation_and_extract_rAU: phiOld size mismatch");
+  }
+
+  std::vector<double> rAU(mesh.nCells, 0.0);
+
+  const double ur = std::max(underRelax, 1.0e-30);
+  const double invRelax = 1.0 / ur;
+
+  for (int c = 0; c < mesh.nCells; ++c) {
+    const int diag = pat.diagPos[c];
+
+    const double aPraw = static_cast<double>(values[diag]);
+
+    if (std::abs(ur - 1.0) > 1.0e-15) {
+      values[diag] = static_cast<HYPRE_Complex>(aPraw * invRelax);
+      rhs[c] += static_cast<HYPRE_Complex>((invRelax - 1.0) * aPraw * phiOld[c]);
+    }
+
+    const double aPrelaxed = static_cast<double>(values[diag]);
+    rAU[c] = (std::abs(aPrelaxed) > 1.0e-300)
+           ? mesh.vol[c] / aPrelaxed
+           : 0.0;
+  }
+
+  return rAU;
+}
+
+
 } // namespace
 
 DistScalarTransportResult solve_scalar_transport_decomp(
@@ -630,6 +669,7 @@ DistScalarTransportResult solve_scalar_transport_decomp(
   std::vector<std::array<double,3>> grad(mesh.nCells, {0.0, 0.0, 0.0});
   std::vector<std::array<double,3>> remoteGrad(mesh.nFaces, {0.0, 0.0, 0.0});
   std::vector<HYPRE_Complex> values, rhs;
+  std::vector<double> latestRAU(mesh.nCells, 0.0);
   DistSolverInfoLocal last;
 
   for (int outer = 0; outer < nOuter; ++outer) {
@@ -637,6 +677,12 @@ DistScalarTransportResult solve_scalar_transport_decomp(
     remoteGrad = exchange_proc_face_vector_owner_values(dm, grad);
 
     assemble_scalar_transport_decomp(dm, pat, in, bcFaceData, grad, remoteGrad, opt, values, rhs);
+
+    // Match serial simple_gpu momentum semantics:
+    // apply equation under-relaxation to the assembled matrix and extract
+    // rAU from the actual relaxed diagonal before the solve.
+    latestRAU = apply_under_relaxation_and_extract_rAU_scalar_decomp(
+        dm, pat, values, rhs, phi, opt.underRelax);
 
     last = solve_bicgstab_jacobi_decomp(dm, pat, values, rhs, phi, opt.solver);
     phi = last.x;
@@ -648,6 +694,7 @@ DistScalarTransportResult solve_scalar_transport_decomp(
 
   DistScalarTransportResult out;
   out.phi = std::move(phi);
+  out.rAU = std::move(latestRAU);
   out.iterations = last.iterations;
   out.finalRelRes = last.relRes;
   out.nOuter = nOuter;

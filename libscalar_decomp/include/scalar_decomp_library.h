@@ -44,11 +44,23 @@ struct DistScalarTransportOptions {
   std::string gradScheme = "lsq";
   int nNonOrthCorr = 2;
 
+  // SIMPLE equation under-relaxation.
+  // Matches serial simple_gpu:
+  //   aP_relaxed = aP_raw / underRelax
+  //   rhs += (1/underRelax - 1) * aP_raw * phiOld
+  double underRelax = 1.0;
+
   DistBiCGSTABOptions solver;
 };
 
 struct DistScalarTransportResult {
   std::vector<double> phi;
+
+  // Extracted from the actual relaxed matrix diagonal:
+  //   rAU = cellVolume / aP_relaxed
+  // This is the value needed by SIMPLE/Rhie-Chow/pressure correction.
+  std::vector<double> rAU;
+
   int iterations = 0;
   double finalRelRes = 0.0;
   int nOuter = 0;
