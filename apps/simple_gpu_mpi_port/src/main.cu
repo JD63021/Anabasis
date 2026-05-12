@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <regex>
 #include <set>
@@ -133,6 +134,192 @@ static double face_lambda_proc_mpi_port(const DecompMesh& dm, int f) {
   const double lam = dot3_local(dx, d) / std::max(dot3_local(d, d), 1.0e-300);
   return std::min(1.0, std::max(0.0, lam));
 }
+
+
+
+struct PressureBCFaceData {
+  std::vector<ScalarBCType> type;
+  std::vector<double> value;
+};
+
+static void compute_lsq_gradient_scalar_mpi_port(
+    const DecompMesh& dm,
+    const std::vector<double>& field,
+    const PressureBCFaceData& bc,
+    std::vector<std::array<double,3>>& grad);
+
+static double pressure_delta_coeff_mpi_port(
+    const std::array<double,3>& d,
+    const std::array<double,3>& n,
+    int pDeltaMode,
+    double pDeltaMinCos)
+{
+  const double nd = dot3_local(n, d);
+  const double dmag = std::sqrt(std::max(dot3_local(d, d), 1.0e-300));
+
+  if (pDeltaMode == 0) {
+    // legacy/v1 signed projected
+    return 1.0 / std::max(nd, 1.0e-300);
+  }
+
+  if (pDeltaMode == 1) {
+    // OpenFOAM-like stabilised projected delta
+    const double denom = std::max(std::fabs(nd), pDeltaMinCos * dmag);
+    return 1.0 / std::max(denom, 1.0e-300);
+  }
+
+  if (pDeltaMode == 2) {
+    return 1.0 / std::max(std::fabs(nd), 1.0e-300);
+  }
+
+  // distance mode
+  return 1.0 / std::max(dmag, 1.0e-300);
+}
+
+static void compute_gauss_gradient_scalar_mpi_port(
+    const DecompMesh& dm,
+    const Mesh& meshBC,
+    const std::vector<double>& field,
+    const PressureBCFaceData& bc,
+    std::vector<std::array<double,3>>& grad)
+{
+  const Mesh& mesh = dm.mesh;
+  const auto remoteField = exchange_proc_face_scalar_owner_values(dm, field);
+
+  grad.assign(mesh.nCells, {0.0, 0.0, 0.0});
+
+  for (int f = 0; f < mesh.nInternalFaces; ++f) {
+    const int P = mesh.owner[f];
+    const int N = mesh.neigh[f];
+    const double lam = face_lambda_local_mpi_port(mesh, f);
+    const double phif = (1.0 - lam) * field[P] + lam * field[N];
+
+    for (int k = 0; k < 3; ++k) {
+      const double contrib = phif * mesh.Sf[f][k];
+      grad[P][k] += contrib;
+      grad[N][k] -= contrib;
+    }
+  }
+
+  for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
+    const int P = mesh.owner[f];
+
+    double phif = field[P];
+
+    if (dm.isProcFace[f]) {
+      const double lam = face_lambda_proc_mpi_port(dm, f);
+      phif = (1.0 - lam) * field[P] + lam * remoteField[f];
+    } else {
+      if (bc.type[f] == ScalarBCType::Dirichlet) {
+        phif = bc.value[f];
+      } else {
+        // zero-gradient: extrapolate cell-centre value
+        phif = field[P];
+      }
+    }
+
+    for (int k = 0; k < 3; ++k) {
+      grad[P][k] += phif * mesh.Sf[f][k];
+    }
+  }
+
+  for (int c = 0; c < mesh.nCells; ++c) {
+    const double invV = 1.0 / std::max(mesh.vol[c], 1.0e-300);
+    grad[c][0] *= invV;
+    grad[c][1] *= invV;
+    grad[c][2] *= invV;
+  }
+}
+
+static void compute_pressure_gradient_selected_mpi_port(
+    const DecompMesh& dm,
+    const Mesh& meshBC,
+    const std::vector<double>& field,
+    const PressureBCFaceData& bc,
+    const std::string& pGradScheme,
+    std::vector<std::array<double,3>>& grad)
+{
+  if (pGradScheme == "gauss") {
+    compute_gauss_gradient_scalar_mpi_port(dm, meshBC, field, bc, grad);
+  } else {
+    compute_lsq_gradient_scalar_mpi_port(dm, field, bc, grad);
+  }
+}
+
+static void write_rank_cellcenter_vtu_mpi_port(
+    const std::string& filename,
+    const DecompMesh& dm,
+    const std::vector<double>& U,
+    const std::vector<double>& V,
+    const std::vector<double>& W,
+    const std::vector<double>& pField,
+    const std::vector<double>& div)
+{
+  const Mesh& mesh = dm.mesh;
+  std::ofstream out(filename);
+  if (!out) throw std::runtime_error("could not write VTU file " + filename);
+
+  out << "<?xml version=\"1.0\"?>\n";
+  out << "<VTKFile type=\"UnstructuredGrid\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
+  out << "<UnstructuredGrid>\n";
+  out << "<Piece NumberOfPoints=\"" << mesh.nCells << "\" NumberOfCells=\"" << mesh.nCells << "\">\n";
+
+  out << "<Points>\n";
+  out << "<DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+  out << std::setprecision(17);
+  for (int c = 0; c < mesh.nCells; ++c) {
+    out << mesh.cc[c][0] << " " << mesh.cc[c][1] << " " << mesh.cc[c][2] << "\n";
+  }
+  out << "</DataArray>\n";
+  out << "</Points>\n";
+
+  out << "<Cells>\n";
+  out << "<DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n";
+  for (int c = 0; c < mesh.nCells; ++c) out << c << "\n";
+  out << "</DataArray>\n";
+
+  out << "<DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">\n";
+  for (int c = 0; c < mesh.nCells; ++c) out << (c + 1) << "\n";
+  out << "</DataArray>\n";
+
+  out << "<DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">\n";
+  for (int c = 0; c < mesh.nCells; ++c) out << "1\n"; // VTK_VERTEX
+  out << "</DataArray>\n";
+  out << "</Cells>\n";
+
+  out << "<PointData Vectors=\"U\">\n";
+
+  out << "<DataArray type=\"Float64\" Name=\"U\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+  for (int c = 0; c < mesh.nCells; ++c) out << U[c] << " " << V[c] << " " << W[c] << "\n";
+  out << "</DataArray>\n";
+
+  out << "<DataArray type=\"Float64\" Name=\"p\" format=\"ascii\">\n";
+  for (int c = 0; c < mesh.nCells; ++c) out << pField[c] << "\n";
+  out << "</DataArray>\n";
+
+  out << "<DataArray type=\"Float64\" Name=\"umag\" format=\"ascii\">\n";
+  for (int c = 0; c < mesh.nCells; ++c) {
+    const double m = std::sqrt(U[c]*U[c] + V[c]*V[c] + W[c]*W[c]);
+    out << m << "\n";
+  }
+  out << "</DataArray>\n";
+
+  out << "<DataArray type=\"Float64\" Name=\"div\" format=\"ascii\">\n";
+  for (int c = 0; c < mesh.nCells; ++c) out << div[c] << "\n";
+  out << "</DataArray>\n";
+
+  out << "<DataArray type=\"Int32\" Name=\"rank\" format=\"ascii\">\n";
+  int rank = 0;
+  MPI_Comm_rank(dm.comm, &rank);
+  for (int c = 0; c < mesh.nCells; ++c) out << rank << "\n";
+  out << "</DataArray>\n";
+
+  out << "</PointData>\n";
+  out << "</Piece>\n";
+  out << "</UnstructuredGrid>\n";
+  out << "</VTKFile>\n";
+}
+
 
 static std::vector<double> compute_cell_div_sum_mpi_port(
     const DecompMesh& dm,
@@ -317,10 +504,6 @@ static std::vector<double> build_face_flux_mpi_port(
   return phi;
 }
 
-struct PressureBCFaceData {
-  std::vector<ScalarBCType> type;
-  std::vector<double> value;
-};
 
 
 static std::vector<double> build_rhiechow_phi_star_mpi_port(
@@ -338,7 +521,10 @@ static std::vector<double> build_rhiechow_phi_star_mpi_port(
     const std::vector<double>& uFaceBC,
     const std::vector<double>& vFaceBC,
     const std::vector<double>& wFaceBC,
-    double rho)
+    double rho,
+    int rcModeInt,
+    int pDeltaModeInt,
+    double pDeltaMinCos)
 {
   const Mesh& mesh = dm.mesh;
 
@@ -375,9 +561,11 @@ static std::vector<double> build_rhiechow_phi_star_mpi_port(
         rho * mesh.Af[f] *
         (uf * mesh.nf[f][0] + vf * mesh.nf[f][1] + wf * mesh.nf[f][2]);
 
-    const double rc =
-        rho * mesh.Af[f] * rAUf / std::max(std::fabs(dpn), 1.0e-300) *
-        ((pField[N] - pField[P]) - dot3_local(gradpf, d));
+    const double deltaCoeff = pressure_delta_coeff_mpi_port(d, mesh.nf[f], pDeltaModeInt, pDeltaMinCos);
+    const double rc = (rcModeInt == 0)
+        ? rho * mesh.Af[f] * rAUf * deltaCoeff *
+          ((pField[N] - pField[P]) - dot3_local(gradpf, d))
+        : 0.0;
 
     phiStar[f] = phiInterp - rc;
   }
@@ -406,9 +594,11 @@ static std::vector<double> build_rhiechow_phi_star_mpi_port(
           rho * mesh.Af[f] *
           (uf * mesh.nf[f][0] + vf * mesh.nf[f][1] + wf * mesh.nf[f][2]);
 
-      const double rc =
-          rho * mesh.Af[f] * rAUf / std::max(std::fabs(dpn), 1.0e-300) *
-          ((rP[f] - pField[P]) - dot3_local(gradpf, d));
+      const double deltaCoeff = pressure_delta_coeff_mpi_port(d, mesh.nf[f], pDeltaModeInt, pDeltaMinCos);
+      const double rc = (rcModeInt == 0)
+          ? rho * mesh.Af[f] * rAUf * deltaCoeff *
+            ((rP[f] - pField[P]) - dot3_local(gradpf, d))
+          : 0.0;
 
       phiStar[f] = phiInterp - rc;
     } else {
@@ -655,23 +845,32 @@ static std::vector<double> build_pressure_gamma_faces_mpi_port(
     const DecompMesh& dm,
     const std::vector<double>& rAU,
     double rho,
-    double pCoeffScale)
+    double pCoeffScale,
+    int pDeltaModeInt,
+    double pDeltaMinCos)
 {
   const Mesh& mesh = dm.mesh;
   const auto rRAU = exchange_proc_face_scalar_owner_values(dm, rAU);
 
   std::vector<double> gamma(mesh.nFaces, 0.0);
 
+  auto make_gamma = [&](int f, double rAUf, const std::array<double,3>& d) {
+    const double delta = pressure_delta_coeff_mpi_port(d, mesh.nf[f], pDeltaModeInt, pDeltaMinCos);
+    const double dDotS = dot3_local(d, mesh.Sf[f]);
+    const double Af = std::max(mesh.Af[f], 1.0e-300);
+
+    // libpoisson_decomp orth coefficient is gamma * |Sf|^2/(d.S).
+    // Choose gamma so coefficient becomes serial:
+    //   pCoeffScale * rho * Af * rAUf * deltaCoeff.
+    return rho * pCoeffScale * rAUf * delta * dDotS / Af;
+  };
+
   for (int f = 0; f < mesh.nInternalFaces; ++f) {
     const int P = mesh.owner[f];
     const int N = mesh.neigh[f];
     const double lam = face_lambda_local_mpi_port(mesh, f);
     const double rAUf = (1.0 - lam) * rAU[P] + lam * rAU[N];
-
-    // Serial pressure coefficient:
-    // coeff = pCoeffScale * rho * Af * rAUf * deltaCoeff.
-    // libpoisson_decomp with gammaFace gives coeff = gammaFace * Af * deltaCoeff.
-    gamma[f] = rho * pCoeffScale * rAUf;
+    gamma[f] = make_gamma(f, rAUf, sub3_local(mesh.cc[N], mesh.cc[P]));
   }
 
   for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
@@ -680,9 +879,9 @@ static std::vector<double> build_pressure_gamma_faces_mpi_port(
     if (dm.isProcFace[f]) {
       const double lam = face_lambda_proc_mpi_port(dm, f);
       const double rAUf = (1.0 - lam) * rAU[P] + lam * rRAU[f];
-      gamma[f] = rho * pCoeffScale * rAUf;
+      gamma[f] = make_gamma(f, rAUf, sub3_local(dm.remoteCCForFace[f], mesh.cc[P]));
     } else {
-      gamma[f] = rho * pCoeffScale * rAU[P];
+      gamma[f] = make_gamma(f, rAU[P], sub3_local(mesh.xf[f], mesh.cc[P]));
     }
   }
 
@@ -787,6 +986,56 @@ static void print_div_metrics_rank0(
   }
 }
 
+
+static void print_minmax_abs_rank0_mpi_port(
+    int rank,
+    const std::string& name,
+    const std::vector<double>& a,
+    MPI_Comm comm)
+{
+  double lmin = 1.0e300;
+  double lmax = -1.0e300;
+  double labs = 0.0;
+
+  for (double v : a) {
+    lmin = std::min(lmin, v);
+    lmax = std::max(lmax, v);
+    labs = std::max(labs, std::abs(v));
+  }
+
+  double gmin = 0.0, gmax = 0.0, gabs = 0.0;
+  MPI_Reduce(&lmin, &gmin, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+  MPI_Reduce(&lmax, &gmax, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+  MPI_Reduce(&labs, &gabs, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+
+  if (rank == 0) {
+    std::printf("DEBUG %-20s min/max/maxAbs = %.12e %.12e %.12e\\n",
+                name.c_str(), gmin, gmax, gabs);
+  }
+}
+
+static void print_minmax_abs_grad_rank0_mpi_port(
+    int rank,
+    const std::string& name,
+    const std::vector<std::array<double,3>>& g,
+    MPI_Comm comm)
+{
+  double labs = 0.0;
+
+  for (const auto& v : g) {
+    const double m = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+    labs = std::max(labs, m);
+  }
+
+  double gabs = 0.0;
+  MPI_Reduce(&labs, &gabs, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+
+  if (rank == 0) {
+    std::printf("DEBUG %-20s maxMag = %.12e\\n", name.c_str(), gabs);
+  }
+}
+
+
 static void print_outer_iter_rank0(
     int rank,
     int iter,
@@ -849,6 +1098,25 @@ int main(int argc, char** argv) {
     double pRelax = 0.3;
     double pCoeffScale = 1.0;
 
+    // v1.1b industrial reference defaults.
+    std::string pMode = "absolute";
+    std::string pSolveMode = "ofAbsolute";
+    std::string rcMode = "oflike";
+    std::string pGradScheme = "gauss";
+    std::string rAUMode = "raw";
+    std::string pDeltaMode = "of";
+    double pDeltaMinCos = 0.05;
+    std::string momentumConvectionScheme = "central";
+    double momNonOrthScale = 0.0;
+    double pNonOrthScale = 0.0;
+    int nVelNonOrthCorr = 0;
+    int nNonOrthCorr = 0;
+    int nPressureCorr = 0;
+
+    int writeVtu = 1;
+    int writeEvery = 0;
+    std::string outPrefix = "/tmp/case/simple_gpu_mpi_port";
+
     int nsteps = 50;
     int minSteps = 5;
     int printEvery = 1;
@@ -890,6 +1158,54 @@ int main(int argc, char** argv) {
       } else if (a == "-outlet-patch") {
         need("-outlet-patch");
         outletPatch = argv[++i];
+      } else if (a == "-out-prefix" || a == "-outPrefix") {
+        need(a.c_str());
+        outPrefix = argv[++i];
+      } else if (a == "-write-vtu" || a == "-writeVtu") {
+        need(a.c_str());
+        writeVtu = std::atoi(argv[++i]);
+      } else if (a == "-write-every" || a == "-writeEvery") {
+        need(a.c_str());
+        writeEvery = std::atoi(argv[++i]);
+      } else if (a == "-p-mode" || a == "-pMode") {
+        need(a.c_str());
+        pMode = argv[++i];
+      } else if (a == "-p-solve-mode" || a == "-pSolveMode") {
+        need(a.c_str());
+        pSolveMode = argv[++i];
+      } else if (a == "-rc-mode" || a == "-rcMode" || a == "-rhie-chow-mode") {
+        need(a.c_str());
+        rcMode = argv[++i];
+      } else if (a == "-p-grad-scheme" || a == "-pGradScheme") {
+        need(a.c_str());
+        pGradScheme = argv[++i];
+      } else if (a == "-rAU-mode" || a == "-rau-mode" || a == "-rAUMode") {
+        need(a.c_str());
+        rAUMode = argv[++i];
+      } else if (a == "-p-delta-mode" || a == "-pDeltaMode") {
+        need(a.c_str());
+        pDeltaMode = argv[++i];
+      } else if (a == "-p-delta-min-cos" || a == "-pDeltaMinCos") {
+        need(a.c_str());
+        pDeltaMinCos = std::atof(argv[++i]);
+      } else if (a == "-momentum-convection-scheme" || a == "-momentumConvectionScheme") {
+        need(a.c_str());
+        momentumConvectionScheme = argv[++i];
+      } else if (a == "-mom-nonorth-scale" || a == "-momNonOrthScale") {
+        need(a.c_str());
+        momNonOrthScale = std::atof(argv[++i]);
+      } else if (a == "-p-nonorth-scale" || a == "-pNonOrthScale") {
+        need(a.c_str());
+        pNonOrthScale = std::atof(argv[++i]);
+      } else if (a == "-nVelNonOrthCorr" || a == "-n-vel-nonorth-corr") {
+        need(a.c_str());
+        nVelNonOrthCorr = std::atoi(argv[++i]);
+      } else if (a == "-nNonOrthCorr" || a == "-n-nonorth-corr") {
+        need(a.c_str());
+        nNonOrthCorr = std::atoi(argv[++i]);
+      } else if (a == "-nPressureCorr" || a == "-n-pressure-corr") {
+        need(a.c_str());
+        nPressureCorr = std::atoi(argv[++i]);
       } else if (a == "-rho") {
         need("-rho");
         rho = std::atof(argv[++i]);
@@ -944,6 +1260,58 @@ int main(int argc, char** argv) {
         }
       }
     }
+
+
+    auto lower_mode = [](std::string v) {
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c){ return std::tolower(c); });
+      return v;
+    };
+
+    pMode = lower_mode(pMode);
+    pSolveMode = lower_mode(pSolveMode);
+    rcMode = lower_mode(rcMode);
+    pGradScheme = lower_mode(pGradScheme);
+    rAUMode = lower_mode(rAUMode);
+    pDeltaMode = lower_mode(pDeltaMode);
+    momentumConvectionScheme = lower_mode(momentumConvectionScheme);
+
+    if (!(pMode == "absolute" || pMode == "abs")) {
+      throw std::runtime_error("MPI port currently implements industrial pMode absolute only");
+    }
+    if (!(pSolveMode == "ofabsolute" || pSolveMode == "of-absolute" || pSolveMode == "openfoam" || pSolveMode == "of")) {
+      throw std::runtime_error("MPI port currently implements pSolveMode ofAbsolute only");
+    }
+    if (!(rcMode == "oflike" || rcMode == "of" || rcMode == "openfoam" || rcMode == "old" || rcMode == "legacy")) {
+      throw std::runtime_error("Unknown rcMode for MPI port");
+    }
+    if (!(pGradScheme == "gauss" || pGradScheme == "lsq")) {
+      throw std::runtime_error("Unknown pGradScheme for MPI port");
+    }
+    if (!(rAUMode == "raw" || rAUMode == "relaxed")) {
+      throw std::runtime_error("Unknown rAUMode for MPI port");
+    }
+    if (!(pDeltaMode == "of" || pDeltaMode == "openfoam" || pDeltaMode == "legacy" || pDeltaMode == "v1" || pDeltaMode == "normal" || pDeltaMode == "distance")) {
+      throw std::runtime_error("Unknown pDeltaMode for MPI port");
+    }
+    if (!(momentumConvectionScheme == "central" || momentumConvectionScheme == "linear" || momentumConvectionScheme == "upwind")) {
+      throw std::runtime_error("Unknown momentumConvectionScheme for MPI port");
+    }
+    if (std::abs(momNonOrthScale) > 1.0e-30) {
+      throw std::runtime_error("momNonOrthScale != 0 not yet ported; reference.case uses 0");
+    }
+    if (std::abs(pNonOrthScale) > 1.0e-30) {
+      throw std::runtime_error("pNonOrthScale != 0 not yet ported; reference.case uses 0");
+    }
+    if (nVelNonOrthCorr != 0 || nNonOrthCorr != 0 || nPressureCorr != 0) {
+      throw std::runtime_error("nonzero pressure/velocity correction subloops not yet ported; reference.case uses zeros");
+    }
+
+    const int rcModeInt = (rcMode == "old" || rcMode == "legacy") ? 0 : 1;
+    const int rAUModeInt = (rAUMode == "raw") ? 0 : 1;
+    const int pDeltaModeInt =
+        (pDeltaMode == "legacy" || pDeltaMode == "v1") ? 0 :
+        (pDeltaMode == "normal") ? 2 :
+        (pDeltaMode == "distance") ? 3 : 1;
 
     int devCount = 0;
     cuda_check(cudaGetDeviceCount(&devCount), "cudaGetDeviceCount");
@@ -1069,6 +1437,12 @@ int main(int argc, char** argv) {
       std::printf("rho/mu/uMean   : %.6e / %.6e / %.6e\n", rho, mu, uMean);
       std::printf("relax U/P      : %.6e / %.6e\n", uRelax, pRelax);
       std::printf("pCoeffScale    : %.6e\n", pCoeffScale);
+      std::printf("modes          : pMode=%s pSolveMode=%s rcMode=%s pGradScheme=%s rAUMode=%s pDeltaMode=%s pDeltaMinCos=%.6g momentumConvection=%s momNonOrthScale=%.6g pNonOrthScale=%.6g\n",
+                  pMode.c_str(), pSolveMode.c_str(), rcMode.c_str(), pGradScheme.c_str(),
+                  rAUMode.c_str(), pDeltaMode.c_str(), pDeltaMinCos,
+                  momentumConvectionScheme.c_str(), momNonOrthScale, pNonOrthScale);
+      std::printf("writeVtu/writeEvery/outPrefix : %d / %d / %s\n",
+                  writeVtu, writeEvery, outPrefix.c_str());
       std::printf("nsteps/minSteps/tolMass/tolVel : %d / %d / %.6e / %.6e\n", nsteps, minSteps, tolMass, tolVel);
       std::printf("velocityPatchSpecs = %zu pressurePatchSpecs = %zu\n",
                   bcConfig.velocityPatchSpecs.size(), bcConfig.pressurePatchSpecs.size());
@@ -1100,11 +1474,16 @@ int main(int argc, char** argv) {
         dm, meshBC, bcPType, pFaceBC);
 
     libscalar_decomp::DistScalarTransportOptions momOpt;
-    momOpt.convectionScheme = libscalar_decomp::DistConvectionScheme::Upwind;
+    momOpt.convectionScheme =
+        (momentumConvectionScheme == "upwind")
+        ? libscalar_decomp::DistConvectionScheme::Upwind
+        : libscalar_decomp::DistConvectionScheme::Central;
     momOpt.diffusionScheme = libscalar_decomp::DistDiffusionScheme::Orth;
     momOpt.gradScheme = "lsq";
     momOpt.nNonOrthCorr = 0;
     momOpt.underRelax = uRelax;
+    momOpt.rAUMode = rAUModeInt;
+    momOpt.rAUScale = 1.0;
     momOpt.solver.maxIter = velMaxit;
     momOpt.solver.absTol = velAbsTol;
     momOpt.solver.relTol = velRelTol;
@@ -1147,7 +1526,11 @@ int main(int argc, char** argv) {
       std::vector<double> pOld = pField;
 
       std::vector<std::array<double,3>> gradP;
-      compute_lsq_gradient_scalar_mpi_port(dm, pField, pBCData, gradP);
+      compute_pressure_gradient_selected_mpi_port(dm, meshBC, pField, pBCData, pGradScheme, gradP);
+      if (iter <= 3 || iter % 10 == 0) {
+        print_minmax_abs_rank0_mpi_port(rank, "pOld", pField, MPI_COMM_WORLD);
+        print_minmax_abs_grad_rank0_mpi_port(rank, "gradPold", gradP, MPI_COMM_WORLD);
+      }
 
       libscalar_decomp::DistScalarTransportInputs momIn;
       momIn.faceFlux.assign(mesh.nFaces, 0.0);
@@ -1187,19 +1570,36 @@ int main(int argc, char** argv) {
         rAU = build_rAU_mpi_port(dm, meshBC, bcUType, phi, rho, mu);
       }
 
+      std::vector<double> Hx = U;
+      std::vector<double> Hy = V;
+      std::vector<double> Hz = W;
+      for (int c = 0; c < mesh.nCells; ++c) {
+        // ofAbsolute path: reconstruct HbyA = Ustar + rAU*grad(pOld)
+        Hx[c] += rAU[c] * gradP[c][0];
+        Hy[c] += rAU[c] * gradP[c][1];
+        Hz[c] += rAU[c] * gradP[c][2];
+      }
+
       const auto phiPred = build_rhiechow_phi_star_mpi_port(
           dm, meshBC,
           bcUType, bcVType, bcWType,
-          U, V, W,
+          Hx, Hy, Hz,
           pField, gradP,
           rAU,
           uFaceBC, vFaceBC, wFaceBC,
-          rho);
+          rho, rcModeInt, pDeltaModeInt, pDeltaMinCos);
 
       const auto pGammaFace = build_pressure_gamma_faces_mpi_port(
-          dm, rAU, rho, pCoeffScale);
+          dm, rAU, rho, pCoeffScale, pDeltaModeInt, pDeltaMinCos);
 
       const auto divPred = compute_cell_div_sum_mpi_port(dm, phiPred);
+
+      if (iter <= 3 || iter % 10 == 0) {
+        print_minmax_abs_rank0_mpi_port(rank, "rAU", rAU, MPI_COMM_WORLD);
+        print_minmax_abs_rank0_mpi_port(rank, "pGammaFace", pGammaFace, MPI_COMM_WORLD);
+        print_minmax_abs_rank0_mpi_port(rank, "phiPred", phiPred, MPI_COMM_WORLD);
+        print_minmax_abs_rank0_mpi_port(rank, "divPred", divPred, MPI_COMM_WORLD);
+      }
 
       std::vector<double> pCorrSource(mesh.nCells, 0.0);
       for (int c = 0; c < mesh.nCells; ++c) {
@@ -1209,8 +1609,16 @@ int main(int argc, char** argv) {
         pCorrSource[c] = -divPred[c] / std::max(mesh.vol[c], 1.0e-300);
       }
 
+      if (iter <= 3 || iter % 10 == 0) {
+        print_minmax_abs_rank0_mpi_port(rank, "pRHS_source", pCorrSource, MPI_COMM_WORLD);
+      }
+
       auto pCorrRes = solve_scalar_elliptic_decomp(
           dm, pGammaFace, pCorrSource, pCorrBC, pOpt);
+
+      if (iter <= 3 || iter % 10 == 0) {
+        print_minmax_abs_rank0_mpi_port(rank, "pSolved_or_pCorr", pCorrRes.phi, MPI_COMM_WORLD);
+      }
 
       const auto phiCorr = correct_flux_orthogonal_pcorr_mpi_port(
           dm, meshBC, bcPType, phiPred, pCorrRes.phi, pGammaFace);
@@ -1228,13 +1636,22 @@ int main(int argc, char** argv) {
       }
 
       std::vector<std::array<double,3>> gradPCorr;
-      compute_lsq_gradient_scalar_mpi_port(dm, pCorrRes.phi, pCorrBCData, gradPCorr);
+      compute_pressure_gradient_selected_mpi_port(dm, meshBC, pCorrRes.phi, pCorrBCData, pGradScheme, gradPCorr);
+
+      // ofAbsolute path:
+      // pCorrRes.phi is the newly solved absolute pressure candidate.
+      // Relax pressure absolutely, then set U = HbyA - rAU*grad(pNew).
+      for (int c = 0; c < mesh.nCells; ++c) {
+        pField[c] = (1.0 - pRelax) * pField[c] + pRelax * pCorrRes.phi[c];
+      }
+
+      std::vector<std::array<double,3>> gradPNew;
+      compute_pressure_gradient_selected_mpi_port(dm, meshBC, pField, pBCData, pGradScheme, gradPNew);
 
       for (int c = 0; c < mesh.nCells; ++c) {
-        U[c] -= rAU[c] * gradPCorr[c][0];
-        V[c] -= rAU[c] * gradPCorr[c][1];
-        W[c] -= rAU[c] * gradPCorr[c][2];
-        pField[c] += pRelax * pCorrRes.phi[c];
+        U[c] = Hx[c] - rAU[c] * gradPNew[c][0];
+        V[c] = Hy[c] - rAU[c] * gradPNew[c][1];
+        W[c] = Hz[c] - rAU[c] * gradPNew[c][2];
       }
 
       double localDU = 0.0;
@@ -1297,8 +1714,30 @@ int main(int argc, char** argv) {
       }
     }
 
+
+    if (writeVtu) {
+      const auto divFinal = compute_cell_div_sum_mpi_port(dm, phi);
+
+      std::ostringstream fn;
+      fn << outPrefix << "_rank" << std::setw(4) << std::setfill('0') << rank << "_final.vtu";
+
+      write_rank_cellcenter_vtu_mpi_port(fn.str(), dm, U, V, W, pField, divFinal);
+
+      if (rank == 0) {
+        std::printf("simple_gpu_mpi_port wrote per-rank VTU files: %s_rank####_final.vtu\n",
+                    outPrefix.c_str());
+      }
+    }
+
+    const double finalUmax = global_max_abs_vec_mpi_port(U, MPI_COMM_WORLD);
+    const double finalVmax = global_max_abs_vec_mpi_port(V, MPI_COMM_WORLD);
+    const double finalWmax = global_max_abs_vec_mpi_port(W, MPI_COMM_WORLD);
+    const double finalPmax = global_max_abs_vec_mpi_port(pField, MPI_COMM_WORLD);
+
     if (rank == 0) {
       std::printf("simple_gpu_mpi_port FINAL massLinf=%.12e\n", finalMass);
+      std::printf("simple_gpu_mpi_port FINAL max|u/v/w/p| = %.12e %.12e %.12e %.12e\n",
+                  finalUmax, finalVmax, finalWmax, finalPmax);
       std::printf("simple_gpu_mpi_port PASS_RAN\n");
       std::printf("====================================================================\n");
     }

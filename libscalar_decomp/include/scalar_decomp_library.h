@@ -50,6 +50,12 @@ struct DistScalarTransportOptions {
   //   rhs += (1/underRelax - 1) * aP_raw * phiOld
   double underRelax = 1.0;
 
+  // v1.1b-compatible rAU mode:
+  //   0 = raw     => V/aP_raw
+  //   1 = relaxed => V/aP_relaxed
+  int rAUMode = 1;
+  double rAUScale = 1.0;
+
   DistBiCGSTABOptions solver;
 };
 

@@ -547,6 +547,7 @@ DistSolverInfoLocal solve_bicgstab_jacobi_decomp(
                  "[%d] WARNING: HYPRE_ParCSRBiCGSTABSolve returned code=%d; "
                  "continuing to inspect iterations/residual and current iterate.\n",
                  wrank, (int)solveIerr);
+    HYPRE_ClearAllErrors();
   }
 
   HYPRE_Int its = 0;
@@ -608,7 +609,9 @@ std::vector<double> apply_under_relaxation_and_extract_rAU_scalar_decomp(
     std::vector<HYPRE_Complex>& values,
     std::vector<HYPRE_Complex>& rhs,
     const std::vector<double>& phiOld,
-    double underRelax) {
+    double underRelax,
+    int rAUMode,
+    double rAUScale) {
   const Mesh& mesh = dm.mesh;
 
   if (static_cast<int>(phiOld.size()) != mesh.nCells) {
@@ -631,8 +634,14 @@ std::vector<double> apply_under_relaxation_and_extract_rAU_scalar_decomp(
     }
 
     const double aPrelaxed = static_cast<double>(values[diag]);
-    rAU[c] = (std::abs(aPrelaxed) > 1.0e-300)
-           ? mesh.vol[c] / aPrelaxed
+
+    // v1.1b-compatible:
+    // raw     rAU = V/aP_raw
+    // relaxed rAU = V/aP_relaxed
+    const double aForRAU = (rAUMode == 0) ? aPraw : aPrelaxed;
+
+    rAU[c] = (std::abs(aForRAU) > 1.0e-300)
+           ? rAUScale * mesh.vol[c] / aForRAU
            : 0.0;
   }
 
@@ -682,7 +691,7 @@ DistScalarTransportResult solve_scalar_transport_decomp(
     // apply equation under-relaxation to the assembled matrix and extract
     // rAU from the actual relaxed diagonal before the solve.
     latestRAU = apply_under_relaxation_and_extract_rAU_scalar_decomp(
-        dm, pat, values, rhs, phi, opt.underRelax);
+        dm, pat, values, rhs, phi, opt.underRelax, opt.rAUMode, opt.rAUScale);
 
     last = solve_bicgstab_jacobi_decomp(dm, pat, values, rhs, phi, opt.solver);
     phi = last.x;
