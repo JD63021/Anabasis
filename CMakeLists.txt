@@ -10,6 +10,7 @@ find_package(MPI REQUIRED COMPONENTS CXX)
 
 add_subdirectory(libpoisson)
 add_subdirectory(libpoisson_decomp)
+add_subdirectory(libscalar_decomp)
 add_subdirectory(libscalar)
 add_subdirectory(apps/simple_gpu)
 
@@ -38,3 +39,5 @@ add_subdirectory(apps/pre3_pipe_momentum_predictor_gpu_mpi)
 add_subdirectory(apps/pre3_pipe_momentum_flux_audit_gpu_mpi)
 
 add_subdirectory(apps/poisson_mms_decomp_gpu_mpi)
+
+add_subdirectory(apps/scalar_transport_mms_decomp_gpu_mpi)

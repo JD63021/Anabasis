@@ -1,0 +1,572 @@
+# Anabasis v1.1c / pre4 MPI-Decomposed Scalar Transport + Poisson Handover
+
+Date context: May 2026
+Checkpoint purpose: handover to the next phase: building the MPI-decomposed `simple_gpu_mpi` / SIMPLE solver using modular libraries.
+
+================================================================================
+0. Executive summary
+================================================================================
+
+Current checkpoint folder on Jaydeep's main Ubuntu machine:
+
+  ~/anabasis_v1_1c_pre4_poisson_decomp
+
+Despite the folder name, this checkpoint now contains both:
+
+  libpoisson_decomp/
+  libscalar_decomp/
+
+and validation apps:
+
+  apps/poisson_mms_decomp_gpu_mpi/
+  apps/scalar_transport_mms_decomp_gpu_mpi/
+
+The important conclusion:
+
+  The decomposed Poisson/elliptic layer and the decomposed scalar convection-diffusion layer now work over OpenFOAM-decomposed `processor*/constant/polyMesh` cases.
+
+The next phase should build the actual MPI version of `simple_gpu` by reusing these libraries rather than continuing to patch one-off proof apps.
+
+Target next solver:
+
+  apps/simple_gpu_mpi/
+
+Recommended next validation:
+
+  Stokes MMS on the same decomposed unit-cube polyhedral meshes:
+    /tmp/case_cube_0p05mm
+    /tmp/case_cube_0p04mm
+    /tmp/case_cube_0p03mm
+
+================================================================================
+1. What is already validated
+================================================================================
+
+Poisson-decomp validation:
+
+  - OpenFOAM processor mesh reading works.
+  - Processor faces are converted into off-rank HYPRE columns.
+  - Processor-face remote cell centers are exchanged.
+  - Scalar and vector/gradient halo exchange works.
+  - Modular BC config is active.
+  - LSQ and Gauss gradient paths run.
+  - Non-orthogonal correction loop works.
+  - `nNonOrthCorr=4` gives `nOuter=5`.
+  - Distributed HYPRE PCG + BoomerAMG works for Poisson/pressure-like solves.
+
+Scalar-decomp validation:
+
+  - `libscalar_decomp` builds and runs with `np=2`.
+  - Uses OpenFOAM decomposed meshes directly.
+  - Uses BiCGSTAB + Jacobi/DiagScale, not AMG.
+  - Supports:
+      grad-scheme: lsq / gauss
+      diffusion-scheme: orth / nonorth
+      nNonOrthCorr
+      convection-scheme: upwind / central
+  - Upwind gives ~first-order convergence.
+  - Central gives ~second-order convergence.
+  - Processor-face convection and diffusion are active.
+
+================================================================================
+2. Main source layout
+================================================================================
+
+Main folder:
+
+  ~/anabasis_v1_1c_pre4_poisson_decomp
+
+Important new source:
+
+  libpoisson_decomp/include/poisson_decomp_library.h
+  libpoisson_decomp/src/poisson_decomp_library.cu
+  libpoisson_decomp/CMakeLists.txt
+
+  libscalar_decomp/include/scalar_decomp_library.h
+  libscalar_decomp/src/scalar_decomp_library.cu
+  libscalar_decomp/CMakeLists.txt
+
+  apps/poisson_mms_decomp_gpu_mpi/src/main.cu
+  apps/poisson_mms_decomp_gpu_mpi/CMakeLists.txt
+
+  apps/scalar_transport_mms_decomp_gpu_mpi/src/main.cu
+  apps/scalar_transport_mms_decomp_gpu_mpi/CMakeLists.txt
+
+Patch/construction scripts retained:
+
+  make_libpoisson_decomp_pre4.py
+  make_libscalar_decomp_pre4.py
+
+Recommended handover text already in repo:
+
+  POISSON_DECOMP_HANDOVER_TO_SCALAR_TRANSPORT.txt
+
+This file is the current handover for moving from scalar/Poisson to SIMPLE:
+
+  SIMPLE_MPI_HANDOVER_FROM_POISSON_SCALAR_DECOMP.txt
+
+================================================================================
+3. Build environment
+================================================================================
+
+Main machine:
+
+  hostname: jd-MS-7E51
+  CUDA: /usr/local/cuda-12.2
+  GPU: NVIDIA RTX 3060
+  GPU arch: sm_86
+  HYPRE: /opt/hypre-3.1.0-cuda-single
+  MPI: OpenMPI
+
+Build commands:
+
+  cd ~/anabasis_v1_1c_pre4_poisson_decomp
+
+  export CUDA_HOME=/usr/local/cuda-12.2
+  export HYPRE_ROOT=/opt/hypre-3.1.0-cuda-single
+  export HYPRE_LIBRARY=$HYPRE_ROOT/lib/libHYPRE.a
+  export PATH=$CUDA_HOME/bin:$PATH
+  export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+
+  cmake -S . -B build_pre4_poisson_decomp \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_ARCHITECTURES=86 \
+    -DHYPRE_ROOT=$HYPRE_ROOT \
+    -DANABASIS_HYPRE_STATIC_CUDA_DEPS=ON
+
+  cmake --build build_pre4_poisson_decomp -j"$(nproc)" --target poisson_mms_decomp_gpu_mpi
+  cmake --build build_pre4_poisson_decomp -j"$(nproc)" --target scalar_transport_mms_decomp_gpu_mpi
+
+================================================================================
+4. Meshes used for validation
+================================================================================
+
+Original mesh folders:
+
+  ~/Desktop/0.05mm/meshCase
+  ~/Desktop/0.04mm/meshCase
+  ~/Desktop/0.03mm/meshCase
+
+These were 1 mm^3 polyhedral box meshes. For MMS, copied test cases were scaled by 1000 to become unit-cube domains [0,1]^3.
+
+Prepared decomposed cases:
+
+  /tmp/case_cube_0p05mm
+  /tmp/case_cube_0p04mm
+  /tmp/case_cube_0p03mm
+
+All cases use one physical patch:
+
+  patch_0_0
+
+and processor patches generated by OpenFOAM `decomposePar`.
+
+Decomposition:
+
+  numberOfSubdomains 2;
+  method simple;
+  simpleCoeffs
+  {
+      n       (2 1 1);
+      delta   0.001;
+  }
+
+================================================================================
+5. libpoisson_decomp API and role
+================================================================================
+
+Header:
+
+  libpoisson_decomp/include/poisson_decomp_library.h
+
+Main objects:
+
+  DecompMesh
+  DistCSRPattern
+  DistEllipticOptions
+  DistEllipticResult
+
+Main functions:
+
+  DecompMesh read_decomposed_openfoam_case(
+      const std::string& caseRoot,
+      MPI_Comm comm = MPI_COMM_WORLD);
+
+  DistCSRPattern build_decomp_scalar_pattern(const DecompMesh& dm);
+
+  DistEllipticResult solve_scalar_elliptic_decomp(
+      const DecompMesh& dm,
+      const std::vector<double>& gammaFace,
+      const std::vector<double>& cellSource,
+      const ScalarBCSet& bcSet,
+      const DistEllipticOptions& opts);
+
+  DistEllipticResult solve_poisson_decomp(
+      const DecompMesh& dm,
+      const std::vector<double>& cellSource,
+      const ScalarBCSet& bcSet,
+      const DistEllipticOptions& opts);
+
+  std::vector<double> exchange_proc_face_scalar_owner_values(
+      const DecompMesh& dm,
+      const std::vector<double>& phi);
+
+  std::vector<std::array<double,3>> exchange_proc_face_vector_owner_values(
+      const DecompMesh& dm,
+      const std::vector<std::array<double,3>>& vec);
+
+Poisson/pressure solve backend:
+
+  HYPRE ParCSR PCG + BoomerAMG.
+
+Important:
+  Current implementation uses host-side HYPRE IJ insertion, then migrates matrix/vector to device.
+  This is acceptable for correctness/modularity.
+  Earlier pre3 proof apps had device IJ insertion; performance can be restored later after SIMPLE correctness is closed.
+
+================================================================================
+6. libscalar_decomp API and role
+================================================================================
+
+Header:
+
+  libscalar_decomp/include/scalar_decomp_library.h
+
+Main equation form:
+
+  div(F phi) - div(Gamma grad(phi)) + Sp phi = Su
+
+where:
+  F = faceFlux = rho u_f dot S_f, oriented owner -> neighbour / outward for boundary faces.
+
+Main objects:
+
+  libscalar_decomp::DistScalarTransportInputs
+    std::vector<double> faceFlux
+    std::vector<double> gammaFace
+    std::vector<double> Su
+    std::vector<double> Sp
+
+  libscalar_decomp::DistScalarTransportOptions
+    convectionScheme = upwind / central
+    diffusionScheme  = orth / nonorth
+    gradScheme       = lsq / gauss
+    nNonOrthCorr
+    solver = BiCGSTAB options
+
+  libscalar_decomp::DistScalarTransportResult
+    phi
+    iterations
+    finalRelRes
+    nOuter
+    globalNnz
+
+Main solve:
+
+  libscalar_decomp::DistScalarTransportResult solve_scalar_transport_decomp(
+      const DecompMesh& dm,
+      const DistScalarTransportInputs& in,
+      const ScalarBCSet& bcSet,
+      const DistScalarTransportOptions& opt,
+      const std::vector<double>& x0 = {});
+
+Linear solver backend:
+
+  HYPRE ParCSR BiCGSTAB + HYPRE_ParCSRDiagScale / Jacobi.
+
+This matches the desired SIMPLE momentum-solve style.
+
+================================================================================
+7. Scalar MMS equation and validation
+================================================================================
+
+Scalar MMS app:
+
+  apps/scalar_transport_mms_decomp_gpu_mpi/
+
+Equation solved:
+
+  div(u phi) - div(Gamma grad(phi)) = S
+
+Exact scalar:
+
+  phi = sin(pi x) sin(pi y) sin(pi z)
+
+Velocity:
+
+  u = (1,0,0)
+
+Diffusion:
+
+  Gamma = 0.01
+
+Source:
+
+  S = u dot grad(phi) + 3 Gamma pi^2 phi
+
+BC file used:
+
+  /tmp/scalar_mms_cube.bc
+
+Content:
+
+  pressure patch_0_0 fixed_value 0.0
+
+Note:
+  The scalar MMS app maps pressure BC specs to scalar BCs for compatibility with the existing simple_gpu runtime BC parser.
+  Later, a true scalar-specific config syntax can be added, but this is enough for the current modular flow.
+
+================================================================================
+8. Scalar validation results
+================================================================================
+
+Upwind LSQ nonorth4:
+
+  h=0.05:
+    L2   = 6.474789179998e-02
+    Linf = 2.447800797795e-01
+
+  h=0.04:
+    L2   = 5.255075086945e-02
+    Linf = 1.850679077547e-01
+
+  h=0.03:
+    L2   = 3.989214210147e-02
+    Linf = 1.408531021885e-01
+
+Observed convergence:
+  Upwind L2:
+    0.05 -> 0.04 : p ≈ 0.94
+    0.04 -> 0.03 : p ≈ 0.96
+    overall       : p ≈ 0.95
+
+  Upwind Linf:
+    0.05 -> 0.04 : p ≈ 1.25
+    0.04 -> 0.03 : p ≈ 0.95
+    overall       : p ≈ 1.08
+
+Conclusion:
+  Upwind behaves as expected: stable, diffusive, about first order.
+
+Central LSQ nonorth4:
+
+  h=0.05:
+    L2   = 7.528323910365e-03
+    Linf = 3.034205692837e-02
+
+  h=0.04:
+    L2   = 4.880457042467e-03
+    Linf = 2.016827484721e-02
+
+  h=0.03:
+    L2   = 2.537505569722e-03
+    Linf = 1.187485961148e-02
+
+Observed convergence:
+  Central L2:
+    0.05 -> 0.04 : p ≈ 1.94
+    0.04 -> 0.03 : p ≈ 2.27
+    overall       : p ≈ 2.13
+
+  Central Linf:
+    0.05 -> 0.04 : p ≈ 1.83
+    0.04 -> 0.03 : p ≈ 1.84
+    overall       : p ≈ 1.84
+
+Conclusion:
+  Central behaves as expected: about second-order, especially in L2.
+
+================================================================================
+9. What to do next: MPI simple_gpu / Stokes MMS
+================================================================================
+
+The next step should NOT be another two-machine test.
+
+The next step should be building the actual decomposed SIMPLE/MPI app in a modular way using:
+
+  libscalar_decomp  -> vector momentum/Stokes component solves
+  libpoisson_decomp -> pressure correction / pressure Poisson solve
+  DecompMesh        -> processor patches, off-rank columns, halos
+
+Recommended first target is NOT full SIMPLE immediately.
+
+Recommended first target:
+
+  apps/stokes_mms_decomp_gpu_mpi/
+
+or a staged mode inside:
+
+  apps/simple_gpu_mpi/
+
+that solves a Stokes MMS problem:
+
+  -mu laplacian(U) + grad(p) = f
+  div(U) = 0
+
+Suggested MMS:
+
+  u = sin(pi x)^2 * sin(2 pi y) * sin(2 pi z)
+  v = sin(pi y)^2 * sin(2 pi z) * sin(2 pi x)
+  w = sin(pi z)^2 * sin(2 pi x) * sin(2 pi y)
+
+or use a simpler divergence-free manufactured vector field from a vector potential.
+
+Pressure:
+
+  p = sin(pi x) sin(pi y) sin(pi z)
+
+Then source:
+
+  f = -mu laplacian(U) + grad(p)
+
+For the first implementation, it is okay to start with a known analytic velocity and pressure source to validate:
+  - vector component scalar solves,
+  - boundary velocity Dirichlet,
+  - processor-face diffusion,
+  - pressure-gradient source,
+  - divergence calculation.
+
+Then add pressure correction / SIMPLE-like iteration.
+
+================================================================================
+10. Required BC support for simple_gpu_mpi
+================================================================================
+
+The final MPI `simple_gpu_mpi` must keep the original modular BC idea.
+
+Needed velocity BC types:
+
+  1. wall no-slip:
+       velocity patch wall_noslip
+
+  2. fixed normal speed:
+       velocity patch fixed_normal_speed <value> average_patch_normal
+
+  3. fixed flow rate / uMean through patch:
+       normal inlet velocity based on patch area/normal
+
+  4. zero-gradient velocity:
+       velocity patch zero_gradient
+
+Needed pressure BC types:
+
+  1. fixed value / Dirichlet:
+       pressure patch fixed_value 0.0
+
+  2. zero gradient / Neumann:
+       pressure patch zero_gradient
+
+  3. open/outlet variants if already present in original parser.
+
+For Stokes MMS, the easiest first BC is:
+  velocity patch_0_0 fixed_value_function/exact Dirichlet
+  pressure patch_0_0 exact or pressure reference as needed
+
+But for the pipe/SIMPLE case, preserve:
+  wall patch_0_0 -> no-slip
+  inlet patch    -> normal inlet velocity / flow rate
+  outlet patch   -> pressure fixed_value 0 and velocity zero_gradient
+
+================================================================================
+11. Simple_gpu_mpi architecture recommendation
+================================================================================
+
+Do not make `simple_gpu_mpi` a huge monolithic patch again.
+
+Recommended architecture:
+
+  1. Keep DecompMesh from libpoisson_decomp.
+
+  2. Use libscalar_decomp for:
+       U component predictor
+       V component predictor
+       W component predictor
+
+  3. Use libpoisson_decomp for:
+       pressure correction
+       pressure/Poisson-type elliptic solves
+
+  4. Add a thin FV-SIMPLE orchestration layer:
+       - persistent fields U,V,W,p,pCorr
+       - face flux phi
+       - rAU / momentum diagonal extraction
+       - Rhie-Chow face flux construction
+       - pCorr solve
+       - velocity correction
+       - pressure update
+       - convergence checks
+
+  5. Processor-face versions must exist for:
+       - velocity halo
+       - pressure halo
+       - rAU halo
+       - gradP / gradPCorr halo
+       - Rhie-Chow flux
+       - velocity correction
+       - divergence/mass residual
+
+================================================================================
+12. What is not performance-final yet
+================================================================================
+
+Both libpoisson_decomp and libscalar_decomp currently prioritize correctness and modularity.
+
+Known performance limitations:
+
+  - host-side assembly,
+  - host IJ SetValues,
+  - matrix recreation each solve,
+  - no persistent HYPRE context reuse,
+  - no GPU assembly kernels yet.
+
+This is acceptable now.
+
+The next goal is solver correctness and matching the serial SIMPLE algorithm.
+
+Once the MPI SIMPLE logic is correct, optimize:
+  - device assembly,
+  - device IJ insertion,
+  - persistent matrix pattern,
+  - AMG reuse for pressure,
+  - persistent BiCGSTAB/Jacobi context for momentum/scalar.
+
+================================================================================
+13. Do not do next
+================================================================================
+
+Do not retest two-machine mode until:
+  - MPI halo exchange changes,
+  - processor-face indexing changes,
+  - deployment/build assumptions change,
+  - or the final MPI SIMPLE solver passes same-machine tests.
+
+Do not directly paste all serial simple_gpu code into simple_gpu_mpi.
+Instead, port it as a modular orchestrator using libscalar_decomp and libpoisson_decomp.
+
+Do not skip Stokes MMS.
+The exact same cube meshes should be used first to test decomposed vector momentum and pressure coupling before pipe SIMPLE.
+
+================================================================================
+14. Immediate next command-level goal
+================================================================================
+
+Create a new branch/checkpoint after committing scalar-decomp:
+
+  git checkout -b feature/pre5-stokes-mms-decomp
+
+Then create:
+
+  apps/stokes_mms_decomp_gpu_mpi/
+
+or a clean mode under:
+
+  apps/simple_gpu_mpi/
+
+Recommended first validation:
+  - diffusion-only vector MMS using libscalar_decomp with ux=uy=uz manufactured velocity components,
+  - then Stokes MMS with pressure-gradient source,
+  - then pressure correction / SIMPLE-like Stokes loop.
+
+================================================================================
+End of handover.
+================================================================================

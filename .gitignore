@@ -23,3 +23,11 @@ runs/
 *.vtu
 *.pvtu
 __pycache__/
+
+# local build/output/checkpoint noise
+build*/
+runs/
+*.log
+*.vtu
+*.pvtu
+__pycache__/
