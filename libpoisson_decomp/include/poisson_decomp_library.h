@@ -32,6 +32,11 @@ struct DecompMesh {
 
   std::vector<HYPRE_BigInt> remoteRowForFace;
   std::vector<std::array<double,3>> remoteCCForFace;
+  // For each local processor boundary face f, this is the slot/index
+  // in the neighbour processor patch receive buffer corresponding to
+  // the same geometric face. Do not assume OpenFOAM processor patch
+  // face ordering is identical across ranks on all decompositions.
+  std::vector<int> remoteSlotForFace;
 };
 
 struct DistCSRPattern {
@@ -86,6 +91,19 @@ DistEllipticResult solve_scalar_elliptic_decomp(
     const DecompMesh& dm,
     const std::vector<double>& gammaFace,
     const std::vector<double>& cellSource,
+    const ScalarBCSet& bcSet,
+    const DistEllipticOptions& opts);
+
+
+// Direct coefficient elliptic solve for SIMPLE pressure.
+// faceCoeff is already the finite-volume face coefficient used in both
+// pressure matrix assembly and flux correction, e.g. serial v1.1b:
+//   coeff = pCoeffScale * rho * Af * rAUf * pressure_delta_coeff_runtime(...).
+// rhsFlux has flux-divergence units directly; it is NOT multiplied by volume.
+DistEllipticResult solve_scalar_elliptic_direct_coeff_decomp(
+    const DecompMesh& dm,
+    const std::vector<double>& faceCoeff,
+    const std::vector<double>& rhsFlux,
     const ScalarBCSet& bcSet,
     const DistEllipticOptions& opts);
 

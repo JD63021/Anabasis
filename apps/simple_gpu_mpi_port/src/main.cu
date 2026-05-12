@@ -146,6 +146,7 @@ static void compute_lsq_gradient_scalar_mpi_port(
     const DecompMesh& dm,
     const std::vector<double>& field,
     const PressureBCFaceData& bc,
+    double lsqWeightPower,
     std::vector<std::array<double,3>>& grad);
 
 static double pressure_delta_coeff_mpi_port(
@@ -237,12 +238,13 @@ static void compute_pressure_gradient_selected_mpi_port(
     const std::vector<double>& field,
     const PressureBCFaceData& bc,
     const std::string& pGradScheme,
+    double lsqWeightPower,
     std::vector<std::array<double,3>>& grad)
 {
   if (pGradScheme == "gauss") {
     compute_gauss_gradient_scalar_mpi_port(dm, meshBC, field, bc, grad);
   } else {
-    compute_lsq_gradient_scalar_mpi_port(dm, field, bc, grad);
+    compute_lsq_gradient_scalar_mpi_port(dm, field, bc, lsqWeightPower, grad);
   }
 }
 
@@ -659,6 +661,7 @@ static void compute_lsq_gradient_scalar_mpi_port(
     const DecompMesh& dm,
     const std::vector<double>& field,
     const PressureBCFaceData& bc,
+    double weightPower,
     std::vector<std::array<double,3>>& grad)
 {
   const Mesh& mesh = dm.mesh;
@@ -674,7 +677,8 @@ static void compute_lsq_gradient_scalar_mpi_port(
     double rhs[3] = {0,0,0};
 
     auto add_constraint = [&](const std::array<double,3>& r, double dphi) {
-      const double w = 1.0 / std::max(dot3_local(r, r), 1.0e-300);
+      const double rmag = std::sqrt(std::max(dot3_local(r, r), 1.0e-300));
+      const double w = 1.0 / std::pow(rmag, weightPower);
       for (int i = 0; i < 3; ++i) {
         for (int j = 0; j < 3; ++j) M[i][j] += w * r[i] * r[j];
         rhs[i] += w * r[i] * dphi;
@@ -694,8 +698,13 @@ static void compute_lsq_gradient_scalar_mpi_port(
         if (bc.type[f] == ScalarBCType::Dirichlet) {
           add_constraint(rcf, bc.value[f] - phiP);
         } else {
-          const double dn = std::max(dot3_local(rcf, mesh.nf[f]), 1.0e-300);
-          add_constraint(mul3_local(dn, mesh.nf[f]), bc.value[f] * dn);
+          // Match serial v1.1b LSQ boundary operator:
+          // include the boundary face-center vector in the LSQ matrix.
+          // For zero-gradient pressure, dphi = 0 but r must remain xf - xP,
+          // not projected to dn*n. This matters strongly on wall-rich
+          // industrial meshes.
+          const double dn = dot3_local(rcf, mesh.nf[f]);
+          add_constraint(rcf, bc.value[f] * dn);
         }
       }
     }
@@ -841,7 +850,7 @@ static std::vector<double> build_rAU_mpi_port(
   return rAU;
 }
 
-static std::vector<double> build_pressure_gamma_faces_mpi_port(
+static std::vector<double> build_pressure_coeff_faces_v11b_mpi_port(
     const DecompMesh& dm,
     const std::vector<double>& rAU,
     double rho,
@@ -852,17 +861,14 @@ static std::vector<double> build_pressure_gamma_faces_mpi_port(
   const Mesh& mesh = dm.mesh;
   const auto rRAU = exchange_proc_face_scalar_owner_values(dm, rAU);
 
-  std::vector<double> gamma(mesh.nFaces, 0.0);
+  std::vector<double> coeff(mesh.nFaces, 0.0);
 
-  auto make_gamma = [&](int f, double rAUf, const std::array<double,3>& d) {
+  auto make_coeff = [&](int f, double rAUf, const std::array<double,3>& d) {
     const double delta = pressure_delta_coeff_mpi_port(d, mesh.nf[f], pDeltaModeInt, pDeltaMinCos);
-    const double dDotS = dot3_local(d, mesh.Sf[f]);
-    const double Af = std::max(mesh.Af[f], 1.0e-300);
-
-    // libpoisson_decomp orth coefficient is gamma * |Sf|^2/(d.S).
-    // Choose gamma so coefficient becomes serial:
-    //   pCoeffScale * rho * Af * rAUf * deltaCoeff.
-    return rho * pCoeffScale * rAUf * delta * dDotS / Af;
+    // Strict serial v1.1b pressure coefficient:
+    //   coeff = pCoeffScale * rho * Af * rAUf * pressure_delta_coeff_runtime(...)
+    // This is used both in the pressure matrix and in the flux correction.
+    return pCoeffScale * rho * mesh.Af[f] * rAUf * delta;
   };
 
   for (int f = 0; f < mesh.nInternalFaces; ++f) {
@@ -870,7 +876,7 @@ static std::vector<double> build_pressure_gamma_faces_mpi_port(
     const int N = mesh.neigh[f];
     const double lam = face_lambda_local_mpi_port(mesh, f);
     const double rAUf = (1.0 - lam) * rAU[P] + lam * rAU[N];
-    gamma[f] = make_gamma(f, rAUf, sub3_local(mesh.cc[N], mesh.cc[P]));
+    coeff[f] = make_coeff(f, rAUf, sub3_local(mesh.cc[N], mesh.cc[P]));
   }
 
   for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
@@ -879,13 +885,13 @@ static std::vector<double> build_pressure_gamma_faces_mpi_port(
     if (dm.isProcFace[f]) {
       const double lam = face_lambda_proc_mpi_port(dm, f);
       const double rAUf = (1.0 - lam) * rAU[P] + lam * rRAU[f];
-      gamma[f] = make_gamma(f, rAUf, sub3_local(dm.remoteCCForFace[f], mesh.cc[P]));
+      coeff[f] = make_coeff(f, rAUf, sub3_local(dm.remoteCCForFace[f], mesh.cc[P]));
     } else {
-      gamma[f] = make_gamma(f, rAU[P], sub3_local(mesh.xf[f], mesh.cc[P]));
+      coeff[f] = make_coeff(f, rAU[P], sub3_local(mesh.xf[f], mesh.cc[P]));
     }
   }
 
-  return gamma;
+  return coeff;
 }
 
 static ScalarBCSet make_pcorr_bc_from_legacy_pressure_mpi_port(
@@ -910,13 +916,13 @@ static ScalarBCSet make_pcorr_bc_from_legacy_pressure_mpi_port(
   return bc;
 }
 
-static std::vector<double> correct_flux_orthogonal_pcorr_mpi_port(
+static std::vector<double> correct_flux_v11b_coeff_mpi_port(
     const DecompMesh& dm,
     const Mesh& meshBC,
     const std::vector<std::string>& bcPType,
     const std::vector<double>& phiPred,
     const std::vector<double>& pCorr,
-    const std::vector<double>& gammaFace)
+    const std::vector<double>& faceCoeff)
 {
   const Mesh& mesh = dm.mesh;
   const auto rPCorr = exchange_proc_face_scalar_owner_values(dm, pCorr);
@@ -926,25 +932,13 @@ static std::vector<double> correct_flux_orthogonal_pcorr_mpi_port(
   for (int f = 0; f < mesh.nInternalFaces; ++f) {
     const int P = mesh.owner[f];
     const int N = mesh.neigh[f];
-
-    const auto d = sub3_local(mesh.cc[N], mesh.cc[P]);
-    const double dDotS = dot3_local(d, mesh.Sf[f]);
-    const double D = gammaFace[f] * dot3_local(mesh.Sf[f], mesh.Sf[f]) / std::max(dDotS, 1.0e-300);
-
-    const double q = D * (pCorr[N] - pCorr[P]);
-    phi[f] -= q;
+    phi[f] -= faceCoeff[f] * (pCorr[N] - pCorr[P]);
   }
 
   for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
     if (dm.isProcFace[f]) {
       const int P = mesh.owner[f];
-
-      const auto d = sub3_local(dm.remoteCCForFace[f], mesh.cc[P]);
-      const double dDotS = dot3_local(d, mesh.Sf[f]);
-      const double D = gammaFace[f] * dot3_local(mesh.Sf[f], mesh.Sf[f]) / std::max(dDotS, 1.0e-300);
-
-      const double q = D * (rPCorr[f] - pCorr[P]);
-      phi[f] -= q;
+      phi[f] -= faceCoeff[f] * (rPCorr[f] - pCorr[P]);
     } else {
       const int ip = patch_index_for_face_mpi_port(meshBC, f);
       const bool fixedPressure = (ip >= 0 &&
@@ -953,14 +947,8 @@ static std::vector<double> correct_flux_orthogonal_pcorr_mpi_port(
       if (!fixedPressure) continue;
 
       const int P = mesh.owner[f];
-
-      const auto d = sub3_local(mesh.xf[f], mesh.cc[P]);
-      const double dDotS = dot3_local(d, mesh.Sf[f]);
-      const double D = gammaFace[f] * dot3_local(mesh.Sf[f], mesh.Sf[f]) / std::max(dDotS, 1.0e-300);
-
       const double pCorrB = 0.0;
-      const double q = D * (pCorrB - pCorr[P]);
-      phi[f] -= q;
+      phi[f] -= faceCoeff[f] * (pCorrB - pCorr[P]);
     }
   }
 
@@ -1102,7 +1090,8 @@ int main(int argc, char** argv) {
     std::string pMode = "absolute";
     std::string pSolveMode = "ofAbsolute";
     std::string rcMode = "oflike";
-    std::string pGradScheme = "gauss";
+    std::string pGradScheme = "lsq";
+    double lsqWeightPower = 1.0;
     std::string rAUMode = "raw";
     std::string pDeltaMode = "of";
     double pDeltaMinCos = 0.05;
@@ -1126,9 +1115,27 @@ int main(int argc, char** argv) {
     int velMaxit = 500;
     double velAbsTol = 1.0e-7;
     double velRelTol = 1.0e-5;
+    std::string velSolver = "bicgstab";
+    
+    int velSweeps = 3;
+    double velSmootherOmega = 0.8;
+    int velGsSymmetric = 0;
+    int velSmootherMonitor = 0;
+int velGmresRestart = 30;
 
     int pMaxit = 1000;
     double pAbsTol = 1.0e-9;
+    double pRelTol = 0.0;
+    int pAmgMaxit = 1;
+    int pAmgRelaxType = 18;
+    int pAmgCoarsenType = 8;
+    int pAmgInterpType = 6;
+    int pAmgAggLevels = 1;
+    int pAmgAggInterpType = 4;
+    int pAmgPmax = 4;
+    int pAmgKeepTranspose = 1;
+    double pAmgTruncFactor = 0.0;
+    int pAmgRebuildEvery = 1; // parsed for compatibility; current host-IJ path rebuilds every pressure solve
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -1179,6 +1186,9 @@ int main(int argc, char** argv) {
       } else if (a == "-p-grad-scheme" || a == "-pGradScheme") {
         need(a.c_str());
         pGradScheme = argv[++i];
+      } else if (a == "-lsq-weight-power" || a == "-lsqWeightPower" || a == "-lsqWeight") {
+        need(a.c_str());
+        lsqWeightPower = std::atof(argv[++i]);
       } else if (a == "-rAU-mode" || a == "-rau-mode" || a == "-rAUMode") {
         need(a.c_str());
         rAUMode = argv[++i];
@@ -1248,12 +1258,68 @@ int main(int argc, char** argv) {
       } else if (a == "-vel-reltol") {
         need("-vel-reltol");
         velRelTol = std::atof(argv[++i]);
+      } else if (a == "-vel-solver" || a == "-velSolver") {
+        need(a.c_str());
+        velSolver = argv[++i];
+      } else if (a == "-vel-gmres-restart" || a == "-velGmresRestart") {
+        need(a.c_str());
+        velGmresRestart = std::atoi(argv[++i]);
+      } else if (a == "-vel-sweeps" || a == "-velSweeps") {
+        need(a.c_str());
+        velSweeps = std::atoi(argv[++i]);
+      } else if (a == "-vel-smoother-omega" || a == "-velSmootherOmega") {
+        need(a.c_str());
+        velSmootherOmega = std::atof(argv[++i]);
+      } else if (a == "-vel-gs-symmetric" || a == "-velGsSymmetric") {
+        need(a.c_str());
+        velGsSymmetric = std::atoi(argv[++i]);
+      } else if (a == "-vel-smoother-monitor" || a == "-velSmootherMonitor") {
+        need(a.c_str());
+        velSmootherMonitor = std::atoi(argv[++i]);
       } else if (a == "-p-maxit") {
         need("-p-maxit");
         pMaxit = std::atoi(argv[++i]);
       } else if (a == "-p-tol") {
         need("-p-tol");
         pAbsTol = std::atof(argv[++i]);
+      } else if (a == "-p-reltol") {
+        need("-p-reltol");
+        pRelTol = std::atof(argv[++i]);
+      } else if (a == "-p-amg-maxit") {
+        need("-p-amg-maxit");
+        pAmgMaxit = std::atoi(argv[++i]);
+      } else if (a == "-p-amg-relax-type") {
+        need("-p-amg-relax-type");
+        pAmgRelaxType = std::atoi(argv[++i]);
+      } else if (a == "-p-amg-coarsen-type") {
+        need("-p-amg-coarsen-type");
+        pAmgCoarsenType = std::atoi(argv[++i]);
+      } else if (a == "-p-amg-interp-type") {
+        need("-p-amg-interp-type");
+        pAmgInterpType = std::atoi(argv[++i]);
+      } else if (a == "-p-amg-agg-levels") {
+        need("-p-amg-agg-levels");
+        pAmgAggLevels = std::atoi(argv[++i]);
+      } else if (a == "-p-amg-agg-interp-type") {
+        need("-p-amg-agg-interp-type");
+        pAmgAggInterpType = std::atoi(argv[++i]);
+      } else if (a == "-p-amg-pmax") {
+        need("-p-amg-pmax");
+        pAmgPmax = std::atoi(argv[++i]);
+      } else if (a == "-p-amg-keep-transpose") {
+        need("-p-amg-keep-transpose");
+        pAmgKeepTranspose = std::atoi(argv[++i]);
+      } else if (a == "-p-amg-trunc-factor") {
+        need("-p-amg-trunc-factor");
+        pAmgTruncFactor = std::atof(argv[++i]);
+      } else if (a == "-p-amg-rebuild-every") {
+        need("-p-amg-rebuild-every");
+        pAmgRebuildEvery = std::atoi(argv[++i]);
+      } else if (a == "-p-use-amg" || a == "-p-amg-setup-scope") {
+        // Accepted for serial command-line compatibility. This MPI pressure path
+        // currently always uses PCG+BoomerAMG and rebuilds the host-IJ matrix each solve.
+        need(a.c_str());
+        ++i;
       } else {
         if (rank == 0) {
           std::printf("simple_gpu_mpi_port: ignoring unimplemented option %s\n", a.c_str());
@@ -1437,6 +1503,8 @@ int main(int argc, char** argv) {
       std::printf("rho/mu/uMean   : %.6e / %.6e / %.6e\n", rho, mu, uMean);
       std::printf("relax U/P      : %.6e / %.6e\n", uRelax, pRelax);
       std::printf("pCoeffScale    : %.6e\n", pCoeffScale);
+      std::printf("velSolver      : %s restart=%d\n", velSolver.c_str(), velGmresRestart);
+      std::printf("lsqWeightPower : %.6e\n", lsqWeightPower);
       std::printf("modes          : pMode=%s pSolveMode=%s rcMode=%s pGradScheme=%s rAUMode=%s pDeltaMode=%s pDeltaMinCos=%.6g momentumConvection=%s momNonOrthScale=%.6g pNonOrthScale=%.6g\n",
                   pMode.c_str(), pSolveMode.c_str(), rcMode.c_str(), pGradScheme.c_str(),
                   rAUMode.c_str(), pDeltaMode.c_str(), pDeltaMinCos,
@@ -1488,6 +1556,12 @@ int main(int argc, char** argv) {
     momOpt.solver.absTol = velAbsTol;
     momOpt.solver.relTol = velRelTol;
     momOpt.solver.monitor = 0;
+    momOpt.solver.solverType = velSolver;
+    momOpt.solver.gmresRestart = velGmresRestart;
+    momOpt.solver.smootherSweeps = velSweeps;
+    momOpt.solver.smootherOmega = velSmootherOmega;
+    momOpt.solver.smootherSymmetric = velGsSymmetric;
+    momOpt.solver.smootherMonitor = velSmootherMonitor;
 
     DistEllipticOptions pOpt;
     pOpt.gradScheme = "lsq";
@@ -1498,16 +1572,18 @@ int main(int argc, char** argv) {
     pOpt.referenceValue = 0.0;
     pOpt.hypre.maxIter = pMaxit;
     pOpt.hypre.absTol = pAbsTol;
-    pOpt.hypre.relTol = 0.0;
+    pOpt.hypre.relTol = pRelTol;
     pOpt.hypre.tol = pAbsTol;
     pOpt.hypre.monitor = 0;
-    pOpt.hypre.amgMaxIter = 1;
-    pOpt.hypre.amgRelaxType = 18;
-    pOpt.hypre.amgCoarsenType = 8;
-    pOpt.hypre.amgInterpType = 6;
-    pOpt.hypre.amgAggLevels = 1;
-    pOpt.hypre.amgPmax = 4;
-    pOpt.hypre.amgKeepTranspose = 1;
+    pOpt.hypre.amgMaxIter = pAmgMaxit;
+    pOpt.hypre.amgRelaxType = pAmgRelaxType;
+    pOpt.hypre.amgCoarsenType = pAmgCoarsenType;
+    pOpt.hypre.amgInterpType = pAmgInterpType;
+    pOpt.hypre.amgAggLevels = pAmgAggLevels;
+    pOpt.hypre.amgAggInterpType = pAmgAggInterpType;
+    pOpt.hypre.amgPmax = pAmgPmax;
+    pOpt.hypre.amgKeepTranspose = pAmgKeepTranspose;
+    pOpt.hypre.amgTruncFactor = pAmgTruncFactor;
 
     std::vector<double> phi = build_face_flux_mpi_port(
         dm, meshBC, bcUType,
@@ -1526,7 +1602,7 @@ int main(int argc, char** argv) {
       std::vector<double> pOld = pField;
 
       std::vector<std::array<double,3>> gradP;
-      compute_pressure_gradient_selected_mpi_port(dm, meshBC, pField, pBCData, pGradScheme, gradP);
+      compute_pressure_gradient_selected_mpi_port(dm, meshBC, pField, pBCData, pGradScheme, lsqWeightPower, gradP);
       if (iter <= 3 || iter % 10 == 0) {
         print_minmax_abs_rank0_mpi_port(rank, "pOld", pField, MPI_COMM_WORLD);
         print_minmax_abs_grad_rank0_mpi_port(rank, "gradPold", gradP, MPI_COMM_WORLD);
@@ -1589,39 +1665,39 @@ int main(int argc, char** argv) {
           uFaceBC, vFaceBC, wFaceBC,
           rho, rcModeInt, pDeltaModeInt, pDeltaMinCos);
 
-      const auto pGammaFace = build_pressure_gamma_faces_mpi_port(
+      const auto pCoeffFace = build_pressure_coeff_faces_v11b_mpi_port(
           dm, rAU, rho, pCoeffScale, pDeltaModeInt, pDeltaMinCos);
 
       const auto divPred = compute_cell_div_sum_mpi_port(dm, phiPred);
 
       if (iter <= 3 || iter % 10 == 0) {
         print_minmax_abs_rank0_mpi_port(rank, "rAU", rAU, MPI_COMM_WORLD);
-        print_minmax_abs_rank0_mpi_port(rank, "pGammaFace", pGammaFace, MPI_COMM_WORLD);
+        print_minmax_abs_rank0_mpi_port(rank, "pCoeffFace", pCoeffFace, MPI_COMM_WORLD);
         print_minmax_abs_rank0_mpi_port(rank, "phiPred", phiPred, MPI_COMM_WORLD);
         print_minmax_abs_rank0_mpi_port(rank, "divPred", divPred, MPI_COMM_WORLD);
       }
 
-      std::vector<double> pCorrSource(mesh.nCells, 0.0);
+      std::vector<double> pRhsFlux(mesh.nCells, 0.0);
       for (int c = 0; c < mesh.nCells; ++c) {
-        // libpoisson_decomp treats cellSource as source per volume and internally
-        // multiplies by cell volume. To match serial simple_gpu rhs=-div(phi),
-        // pass -div(phi)/V here.
-        pCorrSource[c] = -divPred[c] / std::max(mesh.vol[c], 1.0e-300);
+        // Strict v1.1b pressure RHS: flux-divergence units directly.
+        // Do not divide by volume; the direct-coefficient solver does not
+        // multiply this RHS by volume internally.
+        pRhsFlux[c] = -divPred[c];
       }
 
       if (iter <= 3 || iter % 10 == 0) {
-        print_minmax_abs_rank0_mpi_port(rank, "pRHS_source", pCorrSource, MPI_COMM_WORLD);
+        print_minmax_abs_rank0_mpi_port(rank, "pRHS_flux", pRhsFlux, MPI_COMM_WORLD);
       }
 
-      auto pCorrRes = solve_scalar_elliptic_decomp(
-          dm, pGammaFace, pCorrSource, pCorrBC, pOpt);
+      auto pCorrRes = solve_scalar_elliptic_direct_coeff_decomp(
+          dm, pCoeffFace, pRhsFlux, pCorrBC, pOpt);
 
       if (iter <= 3 || iter % 10 == 0) {
         print_minmax_abs_rank0_mpi_port(rank, "pSolved_or_pCorr", pCorrRes.phi, MPI_COMM_WORLD);
       }
 
-      const auto phiCorr = correct_flux_orthogonal_pcorr_mpi_port(
-          dm, meshBC, bcPType, phiPred, pCorrRes.phi, pGammaFace);
+      const auto phiCorr = correct_flux_v11b_coeff_mpi_port(
+          dm, meshBC, bcPType, phiPred, pCorrRes.phi, pCoeffFace);
 
       PressureBCFaceData pCorrBCData;
       pCorrBCData.type.assign(mesh.nFaces, ScalarBCType::Neumann);
@@ -1636,7 +1712,7 @@ int main(int argc, char** argv) {
       }
 
       std::vector<std::array<double,3>> gradPCorr;
-      compute_pressure_gradient_selected_mpi_port(dm, meshBC, pCorrRes.phi, pCorrBCData, pGradScheme, gradPCorr);
+      compute_pressure_gradient_selected_mpi_port(dm, meshBC, pCorrRes.phi, pCorrBCData, pGradScheme, lsqWeightPower, gradPCorr);
 
       // ofAbsolute path:
       // pCorrRes.phi is the newly solved absolute pressure candidate.
@@ -1646,7 +1722,7 @@ int main(int argc, char** argv) {
       }
 
       std::vector<std::array<double,3>> gradPNew;
-      compute_pressure_gradient_selected_mpi_port(dm, meshBC, pField, pBCData, pGradScheme, gradPNew);
+      compute_pressure_gradient_selected_mpi_port(dm, meshBC, pField, pBCData, pGradScheme, lsqWeightPower, gradPNew);
 
       for (int c = 0; c < mesh.nCells; ++c) {
         U[c] = Hx[c] - rAU[c] * gradPNew[c][0];

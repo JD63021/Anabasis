@@ -28,6 +28,22 @@ struct DistBiCGSTABOptions {
   double relTol = 0.0;
   double absTol = 1e-8;
   int monitor = 0;
+
+  // Momentum Krylov solver:
+  //   bicgstab = current default
+  //   gmres    = restarted GMRES + same cheap DiagScale preconditioner
+  std::string solverType = "bicgstab";
+  int gmresRestart = 30;
+  // Lightweight inexact momentum smoothers.
+  // mcgs = local multi-color Gauss-Seidel per rank with MPI halo exchange
+  //        between sweeps. This is block-Jacobi across ranks and GS inside
+  //        each rank; it is intended for SIMPLE momentum updates, not exact
+  //        global solves.
+  int smootherSweeps = 3;
+  double smootherOmega = 0.8;
+  int smootherSymmetric = 0;
+  int smootherMonitor = 0;
+
 };
 
 struct DistScalarTransportInputs {

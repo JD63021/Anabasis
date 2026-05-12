@@ -108,6 +108,68 @@ static std::vector<int> read_foam_labels(const std::string& filename) {
   return vals;
 }
 
+
+struct FaceGeomCalc {
+  std::array<double,3> centre{0.0, 0.0, 0.0};
+  std::array<double,3> areaVec{0.0, 0.0, 0.0};
+  double area = 0.0;
+};
+
+static FaceGeomCalc calc_face_geom_robust_mpi_reader(
+    const std::vector<std::array<double,3>>& P,
+    const std::vector<int>& fv) {
+  // Same robust face treatment used by serial simple_gpu v1.1b:
+  // triangulate around an internal point, iteratively move that point to the
+  // area-weighted triangle centroid, then accumulate the final area vector.
+  FaceGeomCalc fg;
+
+  for (int v : fv) fg.centre = add3(fg.centre, P[v]);
+  fg.centre = mul3(1.0 / std::max(static_cast<int>(fv.size()), 1), fg.centre);
+
+  for (int iter = 0; iter < 4; ++iter) {
+    std::array<double,3> areaVec{0.0, 0.0, 0.0};
+
+    for (std::size_t i = 0; i < fv.size(); ++i) {
+      const auto& ri = P[fv[i]];
+      const auto& rj = P[fv[(i + 1) % fv.size()]];
+      areaVec = add3(areaVec, mul3(0.5, cross3(sub3(ri, fg.centre), sub3(rj, fg.centre))));
+    }
+
+    const double amag = norm3(areaVec);
+    if (amag <= 1.0e-300) break;
+
+    const auto nhat = mul3(1.0 / amag, areaVec);
+
+    std::array<double,3> csum{0.0, 0.0, 0.0};
+    double asum = 0.0;
+
+    for (std::size_t i = 0; i < fv.size(); ++i) {
+      const auto& ri = P[fv[i]];
+      const auto& rj = P[fv[(i + 1) % fv.size()]];
+
+      const auto avec = mul3(0.5, cross3(sub3(ri, fg.centre), sub3(rj, fg.centre)));
+      const double aSigned = dot3(avec, nhat);
+      const auto ctri = mul3(1.0 / 3.0, add3(add3(ri, rj), fg.centre));
+
+      csum = add3(csum, mul3(aSigned, ctri));
+      asum += aSigned;
+    }
+
+    if (std::fabs(asum) <= 1.0e-300) break;
+    fg.centre = mul3(1.0 / asum, csum);
+  }
+
+  for (std::size_t i = 0; i < fv.size(); ++i) {
+    const auto& ri = P[fv[i]];
+    const auto& rj = P[fv[(i + 1) % fv.size()]];
+    fg.areaVec = add3(fg.areaVec, mul3(0.5, cross3(sub3(ri, fg.centre), sub3(rj, fg.centre))));
+  }
+
+  fg.area = norm3(fg.areaVec);
+  return fg;
+}
+
+
 static std::vector<PatchInfo> read_foam_boundary(const std::string& filename) {
   std::string inside = extract_main_list(strip_comments(read_file_to_string(filename)));
   std::vector<PatchInfo> patches;
@@ -198,65 +260,96 @@ Mesh read_openfoam_polymesh(const std::string& polyMeshDir) {
     mesh.cellOrient[N].push_back(-1);
   }
 
+  // ---------------------------------------------------------------------------
+  // Robust geometry path matching serial simple_gpu v1.1b geomMethod=robust.
+  //
+  // The older libpoisson reader used vertex-average face centers and a first-
+  // vertex fan. That is acceptable for simple pipe meshes but is not equivalent
+  // to the robust serial path on warped/skewed industrial polyhedra.
+  // ---------------------------------------------------------------------------
+
+  // Face geometry first: robust area-weighted triangulated face centers.
+  mesh.xf.assign(mesh.nFaces, {0,0,0});
+  mesh.Af.assign(mesh.nFaces, 0.0);
+  mesh.nf.assign(mesh.nFaces, {0,0,0});
+  mesh.Sf.assign(mesh.nFaces, {0,0,0});
+
+  for (int f = 0; f < mesh.nFaces; ++f) {
+    FaceGeomCalc fg = calc_face_geom_robust_mpi_reader(mesh.P, mesh.faces[f]);
+
+    if (fg.area <= 1.0e-30) {
+      throw std::runtime_error("Degenerate face area at face " + std::to_string(f));
+    }
+
+    mesh.xf[f] = fg.centre;
+    mesh.Af[f] = fg.area;
+    mesh.nf[f] = mul3(1.0 / fg.area, fg.areaVec);
+    mesh.Sf[f] = fg.areaVec;
+  }
+
+  // Robust cell volume and centroid by tetrahedralizing each oriented face
+  // about its own robust face center.
   mesh.cc.assign(mesh.nCells, {0,0,0});
   mesh.vol.assign(mesh.nCells, 0.0);
+
   for (int c = 0; c < mesh.nCells; ++c) {
     std::set<int> vertsSet;
-    for (int f : mesh.cellFaces[c]) for (int v : mesh.faces[f]) vertsSet.insert(v);
+    for (int f : mesh.cellFaces[c]) {
+      for (int v : mesh.faces[f]) vertsSet.insert(v);
+    }
+
     std::array<double,3> c0{0,0,0};
     for (int v : vertsSet) c0 = add3(c0, mesh.P[v]);
     c0 = mul3(1.0 / std::max(static_cast<int>(vertsSet.size()), 1), c0);
 
     double V = 0.0;
     std::array<double,3> M{0,0,0};
-    for (std::size_t j = 0; j < mesh.cellFaces[c].size(); ++j) {
-      int f = mesh.cellFaces[c][j];
-      int ori = mesh.cellOrient[c][j];
+
+    for (std::size_t jf = 0; jf < mesh.cellFaces[c].size(); ++jf) {
+      const int f = mesh.cellFaces[c][jf];
+      const int ori = mesh.cellOrient[c][jf];
+
       std::vector<int> fv = mesh.faces[f];
       if (ori < 0) std::reverse(fv.begin(), fv.end());
-      auto a = mesh.P[fv[0]];
-      for (std::size_t i = 1; i + 1 < fv.size(); ++i) {
-        auto b = mesh.P[fv[i]];
-        auto d = mesh.P[fv[i+1]];
-        double vTet = dot3(sub3(a, c0), cross3(sub3(b, c0), sub3(d, c0))) / 6.0;
-        auto cTet = mul3(0.25, add3(add3(c0, a), add3(b, d)));
+
+      const auto fc = mesh.xf[f];
+
+      for (std::size_t i = 0; i < fv.size(); ++i) {
+        const auto b = mesh.P[fv[i]];
+        const auto d = mesh.P[fv[(i + 1) % fv.size()]];
+
+        const double vTet = dot3(sub3(fc, c0), cross3(sub3(b, c0), sub3(d, c0))) / 6.0;
+        const auto cTet = mul3(0.25, add3(add3(c0, fc), add3(b, d)));
+
         V += vTet;
         M = add3(M, mul3(vTet, cTet));
       }
     }
-    if (V <= 0.0) throw std::runtime_error("Non-positive cell volume at cell " + std::to_string(c));
+
+    if (V <= 0.0) {
+      throw std::runtime_error("Non-positive cell volume at cell " + std::to_string(c));
+    }
+
     mesh.vol[c] = V;
     mesh.cc[c] = mul3(1.0 / V, M);
   }
 
-  mesh.xf.assign(mesh.nFaces, {0,0,0});
-  mesh.Af.assign(mesh.nFaces, 0.0);
-  mesh.nf.assign(mesh.nFaces, {0,0,0});
-  mesh.Sf.assign(mesh.nFaces, {0,0,0});
+  // Orient face normals from owner to neighbour / boundary face centre after
+  // cell centres are available. Keep Sf consistent with nf and Af.
   for (int f = 0; f < mesh.nFaces; ++f) {
-    std::array<double,3> xfc{0,0,0};
-    for (int v : mesh.faces[f]) xfc = add3(xfc, mesh.P[v]);
-    xfc = mul3(1.0 / std::max(static_cast<int>(mesh.faces[f].size()), 1), xfc);
-    mesh.xf[f] = xfc;
+    const int P = mesh.owner[f];
 
-    auto a = mesh.P[mesh.faces[f][0]];
-    std::array<double,3> areaVec{0,0,0};
-    for (std::size_t i = 1; i + 1 < mesh.faces[f].size(); ++i) {
-      auto b = mesh.P[mesh.faces[f][i]];
-      auto d = mesh.P[mesh.faces[f][i+1]];
-      areaVec = add3(areaVec, mul3(0.5, cross3(sub3(b,a), sub3(d,a))));
+    std::array<double,3> dtest;
+    if (f < mesh.nInternalFaces) {
+      dtest = sub3(mesh.cc[mesh.neigh[f]], mesh.cc[P]);
+    } else {
+      dtest = sub3(mesh.xf[f], mesh.cc[P]);
     }
-    double areaMag = norm3(areaVec);
-    if (areaMag <= 1e-30) throw std::runtime_error("Degenerate face area at face " + std::to_string(f));
-    auto nloc = mul3(1.0 / areaMag, areaVec);
-    int P = mesh.owner[f];
-    std::array<double,3> dtest = (f < mesh.nInternalFaces)
-      ? sub3(mesh.cc[mesh.neigh[f]], mesh.cc[P])
-      : sub3(mesh.xf[f], mesh.cc[P]);
-    if (dot3(nloc, dtest) < 0.0) nloc = mul3(-1.0, nloc);
-    mesh.Af[f] = areaMag;
-    mesh.nf[f] = nloc;
-    mesh.Sf[f] = mul3(areaMag, nloc);
+
+    if (dot3(mesh.nf[f], dtest) < 0.0) {
+      mesh.nf[f] = mul3(-1.0, mesh.nf[f]);
+      mesh.Sf[f] = mul3(-1.0, mesh.Sf[f]);
+    }
   }
 
   mesh.cellNbrs.assign(mesh.nCells, {});

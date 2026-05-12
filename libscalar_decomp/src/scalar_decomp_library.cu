@@ -451,6 +451,339 @@ struct DistSolverInfoLocal {
   double relRes = 0.0;
 };
 
+
+
+static std::string lower_solver_name_scalar_decomp(std::string v) {
+  for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return v;
+}
+
+static bool is_local_global_col_scalar_decomp(
+    const DecompMesh& dm,
+    HYPRE_BigInt g,
+    int& jLocal) {
+  if (g >= dm.ilower && g <= dm.iupper) {
+    jLocal = static_cast<int>(g - dm.ilower);
+    return true;
+  }
+  jLocal = -1;
+  return false;
+}
+
+static std::map<HYPRE_BigInt, double> build_remote_value_map_scalar_decomp(
+    const DecompMesh& dm,
+    const std::vector<double>& x) {
+  std::map<HYPRE_BigInt, double> remote;
+
+  if (dm.procPatches.empty()) return remote;
+
+  const auto remoteFaceValues = exchange_proc_face_scalar_owner_values(dm, x);
+
+  for (const auto& pp : dm.procPatches) {
+    for (int i = 0; i < pp.nFaces; ++i) {
+      const int f = pp.startFace + i;
+      if (f < 0 || f >= dm.mesh.nFaces) continue;
+      const HYPRE_BigInt rg = dm.remoteRowForFace[f];
+      if (rg >= 0) remote[rg] = remoteFaceValues[f];
+    }
+  }
+
+  return remote;
+}
+
+static double value_for_global_col_scalar_decomp(
+    const DecompMesh& dm,
+    const std::vector<double>& x,
+    const std::map<HYPRE_BigInt, double>& remote,
+    HYPRE_BigInt g) {
+  int j = -1;
+  if (is_local_global_col_scalar_decomp(dm, g, j)) {
+    return x[j];
+  }
+
+  auto it = remote.find(g);
+  if (it != remote.end()) return it->second;
+
+  // Should not happen for a correct processor-face pattern. Keep safe.
+  return 0.0;
+}
+
+static std::vector<int> build_local_mcgs_colors_scalar_decomp(
+    const DecompMesh& dm,
+    const DistCSRPattern& pat,
+    std::vector<int>& colorOffsets,
+    std::vector<int>& colorCells) {
+  const int n = pat.nRows;
+  std::vector<int> color(n, -1);
+  std::vector<int> mark(64, -1);
+
+  int nColors = 0;
+  int tag = 1;
+
+  for (int i = 0; i < n; ++i) {
+    ++tag;
+    if (tag == 0x3fffffff) {
+      std::fill(mark.begin(), mark.end(), -1);
+      tag = 1;
+    }
+
+    for (int p = pat.rowOffsets[i]; p < pat.rowOffsets[i + 1]; ++p) {
+      int j = -1;
+      if (!is_local_global_col_scalar_decomp(dm, pat.cols[p], j)) continue;
+      if (j == i) continue;
+
+      const int cj = color[j];
+      if (cj >= 0) {
+        if (cj >= static_cast<int>(mark.size())) mark.resize(cj + 64, -1);
+        mark[cj] = tag;
+      }
+    }
+
+    int c = 0;
+    while (c < nColors) {
+      if (c >= static_cast<int>(mark.size())) mark.resize(c + 64, -1);
+      if (mark[c] != tag) break;
+      ++c;
+    }
+
+    color[i] = c;
+    if (c == nColors) ++nColors;
+  }
+
+  long long localConflicts = 0;
+  long long localEdges = 0;
+  int localMaxDegree = 0;
+
+  for (int i = 0; i < n; ++i) {
+    int deg = 0;
+
+    for (int p = pat.rowOffsets[i]; p < pat.rowOffsets[i + 1]; ++p) {
+      int j = -1;
+      if (!is_local_global_col_scalar_decomp(dm, pat.cols[p], j)) continue;
+      if (j == i) continue;
+
+      ++deg;
+      if (color[i] == color[j]) ++localConflicts;
+    }
+
+    localMaxDegree = std::max(localMaxDegree, deg);
+    localEdges += deg;
+  }
+
+  long long globalConflicts = 0;
+  long long globalEdges = 0;
+  int globalMaxDegree = 0;
+
+  MPI_Allreduce(&localConflicts, &globalConflicts, 1, MPI_LONG_LONG, MPI_SUM, dm.comm);
+  MPI_Allreduce(&localEdges, &globalEdges, 1, MPI_LONG_LONG, MPI_SUM, dm.comm);
+  MPI_Allreduce(&localMaxDegree, &globalMaxDegree, 1, MPI_INT, MPI_MAX, dm.comm);
+
+  if (globalConflicts != 0) {
+    int r = 0;
+    MPI_Comm_rank(dm.comm, &r);
+    if (r == 0) {
+      std::fprintf(stderr, "ERROR: host MCGS local coloring has %lld conflicts.\n", globalConflicts);
+    }
+    MPI_Abort(dm.comm, 3);
+  }
+
+  std::vector<int> counts(nColors, 0);
+  for (int i = 0; i < n; ++i) counts[color[i]]++;
+
+  colorOffsets.assign(nColors + 1, 0);
+  for (int c = 0; c < nColors; ++c) colorOffsets[c + 1] = colorOffsets[c] + counts[c];
+
+  std::vector<int> cursor = colorOffsets;
+  colorCells.assign(n, 0);
+
+  for (int i = 0; i < n; ++i) {
+    const int c = color[i];
+    colorCells[cursor[c]++] = i;
+  }
+
+  int localMinColorCount = n > 0 ? n : 0;
+  int localMaxColorCount = 0;
+  for (int c = 0; c < nColors; ++c) {
+    localMinColorCount = std::min(localMinColorCount, counts[c]);
+    localMaxColorCount = std::max(localMaxColorCount, counts[c]);
+  }
+
+  int globalMaxColors = 0;
+  MPI_Allreduce(&nColors, &globalMaxColors, 1, MPI_INT, MPI_MAX, dm.comm);
+
+  int rank = 0;
+  MPI_Comm_rank(dm.comm, &rank);
+  if (rank == 0) {
+    std::printf("host MPI MCGS coloring: maxColorsAcrossRanks=%d localRank0Colors=%d "
+                "rank0MinCells/color=%d rank0MaxCells/color=%d maxDegree=%d globalLocalEdges=%lld\n",
+                globalMaxColors, nColors, localMinColorCount, localMaxColorCount,
+                globalMaxDegree, globalEdges);
+  }
+
+  return color;
+}
+
+static double compute_residual_rel_host_mcgs_scalar_decomp(
+    const DecompMesh& dm,
+    const DistCSRPattern& pat,
+    const std::vector<HYPRE_Complex>& values,
+    const std::vector<HYPRE_Complex>& rhs,
+    const std::vector<double>& x) {
+  const auto remote = build_remote_value_map_scalar_decomp(dm, x);
+
+  double localR2 = 0.0;
+  double localB2 = 0.0;
+
+  for (int i = 0; i < pat.nRows; ++i) {
+    double Ax = 0.0;
+
+    for (int p = pat.rowOffsets[i]; p < pat.rowOffsets[i + 1]; ++p) {
+      const double a = static_cast<double>(values[p]);
+      const HYPRE_BigInt g = pat.cols[p];
+      Ax += a * value_for_global_col_scalar_decomp(dm, x, remote, g);
+    }
+
+    const double bi = static_cast<double>(rhs[i]);
+    const double ri = bi - Ax;
+
+    localR2 += ri * ri;
+    localB2 += bi * bi;
+  }
+
+  double globalR2 = 0.0;
+  double globalB2 = 0.0;
+
+  MPI_Allreduce(&localR2, &globalR2, 1, MPI_DOUBLE, MPI_SUM, dm.comm);
+  MPI_Allreduce(&localB2, &globalB2, 1, MPI_DOUBLE, MPI_SUM, dm.comm);
+
+  return std::sqrt(globalR2 / std::max(globalB2, 1.0e-300));
+}
+
+static DistSolverInfoLocal solve_mcgs_host_decomp(
+    const DecompMesh& dm,
+    const DistCSRPattern& pat,
+    const std::vector<HYPRE_Complex>& values,
+    const std::vector<HYPRE_Complex>& rhs,
+    const std::vector<double>& x0,
+    const DistBiCGSTABOptions& opt) {
+  if (static_cast<int>(rhs.size()) != pat.nRows) {
+    throw std::runtime_error("solve_mcgs_host_decomp: rhs size mismatch");
+  }
+
+  std::vector<double> x(pat.nRows, 0.0);
+  if (!x0.empty()) {
+    if (static_cast<int>(x0.size()) != pat.nRows) {
+      throw std::runtime_error("solve_mcgs_host_decomp: x0 size mismatch");
+    }
+    x = x0;
+  }
+
+  const int sweeps = std::max(opt.smootherSweeps, 0);
+  const double omega = opt.smootherOmega;
+
+  if (!(omega > 0.0)) {
+    throw std::runtime_error("solve_mcgs_host_decomp: smootherOmega must be > 0");
+  }
+
+  std::vector<int> colorOffsets;
+  std::vector<int> colorCells;
+  build_local_mcgs_colors_scalar_decomp(dm, pat, colorOffsets, colorCells);
+
+  const int nColors = static_cast<int>(colorOffsets.size()) - 1;
+
+  double rel0 = -1.0;
+  if (opt.smootherMonitor) {
+    rel0 = compute_residual_rel_host_mcgs_scalar_decomp(dm, pat, values, rhs, x);
+  }
+
+  for (int sweep = 0; sweep < sweeps; ++sweep) {
+    auto remote = build_remote_value_map_scalar_decomp(dm, x);
+
+    for (int c = 0; c < nColors; ++c) {
+      for (int kk = colorOffsets[c]; kk < colorOffsets[c + 1]; ++kk) {
+        const int i = colorCells[kk];
+
+        double diag = 0.0;
+        double sumOff = 0.0;
+
+        for (int p = pat.rowOffsets[i]; p < pat.rowOffsets[i + 1]; ++p) {
+          const double a = static_cast<double>(values[p]);
+          const HYPRE_BigInt g = pat.cols[p];
+
+          int j = -1;
+          if (is_local_global_col_scalar_decomp(dm, g, j)) {
+            if (j == i) {
+              diag = a;
+            } else {
+              sumOff += a * x[j];
+            }
+          } else {
+            sumOff += a * value_for_global_col_scalar_decomp(dm, x, remote, g);
+          }
+        }
+
+        if (std::abs(diag) > 1.0e-300) {
+          const double gs = (static_cast<double>(rhs[i]) - sumOff) / diag;
+          x[i] = (1.0 - omega) * x[i] + omega * gs;
+        }
+      }
+    }
+
+    if (opt.smootherSymmetric) {
+      remote = build_remote_value_map_scalar_decomp(dm, x);
+
+      for (int c = nColors - 1; c >= 0; --c) {
+        for (int kk = colorOffsets[c]; kk < colorOffsets[c + 1]; ++kk) {
+          const int i = colorCells[kk];
+
+          double diag = 0.0;
+          double sumOff = 0.0;
+
+          for (int p = pat.rowOffsets[i]; p < pat.rowOffsets[i + 1]; ++p) {
+            const double a = static_cast<double>(values[p]);
+            const HYPRE_BigInt g = pat.cols[p];
+
+            int j = -1;
+            if (is_local_global_col_scalar_decomp(dm, g, j)) {
+              if (j == i) {
+                diag = a;
+              } else {
+                sumOff += a * x[j];
+              }
+            } else {
+              sumOff += a * value_for_global_col_scalar_decomp(dm, x, remote, g);
+            }
+          }
+
+          if (std::abs(diag) > 1.0e-300) {
+            const double gs = (static_cast<double>(rhs[i]) - sumOff) / diag;
+            x[i] = (1.0 - omega) * x[i] + omega * gs;
+          }
+        }
+      }
+    }
+  }
+
+  double rel = -1.0;
+  if (opt.smootherMonitor) {
+    rel = compute_residual_rel_host_mcgs_scalar_decomp(dm, pat, values, rhs, x);
+
+    int rank = 0;
+    MPI_Comm_rank(dm.comm, &rank);
+    if (rank == 0) {
+      std::printf("host MPI MCGS smoother: sweeps=%d omega=%.6g symmetric=%d rel0=%.6e rel=%.6e\n",
+                  sweeps, omega, opt.smootherSymmetric, rel0, rel);
+    }
+  }
+
+  DistSolverInfoLocal out;
+  out.x = std::move(x);
+  out.iterations = sweeps;
+  out.relRes = rel;
+  return out;
+}
+
+
 DistSolverInfoLocal solve_bicgstab_jacobi_decomp(
     const DecompMesh& dm,
     const DistCSRPattern& pat,
@@ -458,6 +791,18 @@ DistSolverInfoLocal solve_bicgstab_jacobi_decomp(
     const std::vector<HYPRE_Complex>& rhs,
     const std::vector<double>& x0,
     const DistBiCGSTABOptions& opt) {
+  {
+    const std::string solverType = lower_solver_name_scalar_decomp(opt.solverType);
+    if (solverType == "mcgs" ||
+        solverType == "colored-gs" ||
+        solverType == "multicolor-gs" ||
+        solverType == "multi-color-gs" ||
+        solverType == "mcgs-host" ||
+        solverType == "host-mcgs") {
+      return solve_mcgs_host_decomp(dm, pat, values, rhs, x0, opt);
+    }
+  }
+
   static bool hypreInitialized = false;
 
   if (!hypreInitialized) {
@@ -493,12 +838,42 @@ DistSolverInfoLocal solve_bicgstab_jacobi_decomp(
 #endif
   HYPRE_CALL_SCALAR_DECOMP(HYPRE_IJMatrixGetObject(Aij, reinterpret_cast<void**>(&Apar)));
 
-  std::vector<HYPRE_Complex> xinit(pat.nRows, 0.0);
-  if (!x0.empty()) {
-    if (static_cast<int>(x0.size()) != pat.nRows) {
-      throw std::runtime_error("x0 must have size local nRows");
+  int hybridPreSweeps = 0;
+  double hybridPreRel = -1.0;
+  std::vector<double> krylovX0 = x0;
+
+  {
+    const std::string solverTypeHybrid = lower_solver_name_scalar_decomp(opt.solverType);
+    const bool useMcgsThenKrylov =
+        (solverTypeHybrid == "mcgs-bicgstab" ||
+         solverTypeHybrid == "mcgs+bicgstab" ||
+         solverTypeHybrid == "mcgs_then_bicgstab" ||
+         solverTypeHybrid == "hybrid" ||
+         solverTypeHybrid == "hybrid-bicgstab");
+
+    if (useMcgsThenKrylov) {
+      DistSolverInfoLocal pre =
+          solve_mcgs_host_decomp(dm, pat, values, rhs, x0, opt);
+
+      krylovX0 = std::move(pre.x);
+      hybridPreSweeps = pre.iterations;
+      hybridPreRel = pre.relRes;
+
+      int rankPrint = 0;
+      MPI_Comm_rank(dm.comm, &rankPrint);
+      if (rankPrint == 0) {
+        std::printf("hybrid momentum pre-smoother: MCGS sweeps=%d rel=%.6e, then BiCGSTAB+DiagScale\n",
+                    hybridPreSweeps, hybridPreRel);
+      }
     }
-    for (int i = 0; i < pat.nRows; ++i) xinit[i] = static_cast<HYPRE_Complex>(x0[i]);
+  }
+
+  std::vector<HYPRE_Complex> xinit(pat.nRows, 0.0);
+  if (!krylovX0.empty()) {
+    if (static_cast<int>(krylovX0.size()) != pat.nRows) {
+      throw std::runtime_error("krylovX0 must have size local nRows");
+    }
+    for (int i = 0; i < pat.nRows; ++i) xinit[i] = static_cast<HYPRE_Complex>(krylovX0[i]);
   }
 
   HYPRE_CALL_SCALAR_DECOMP(HYPRE_IJVectorCreate(dm.comm, dm.ilower, dm.iupper, &bij));
@@ -525,54 +900,88 @@ DistSolverInfoLocal solve_bicgstab_jacobi_decomp(
 #endif
   HYPRE_CALL_SCALAR_DECOMP(HYPRE_IJVectorGetObject(xij, reinterpret_cast<void**>(&xpar)));
 
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABCreate(dm.comm, &solver));
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetTol(solver, std::max(opt.relTol, 0.0)));
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetAbsoluteTol(solver, std::max(opt.absTol, 0.0)));
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetMaxIter(solver, opt.maxIter));
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetPrintLevel(solver, opt.monitor ? 2 : 0));
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetLogging(solver, 1));
+  std::string solverType = opt.solverType;
+  for (char& c : solverType) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetPrecond(
-      solver,
-      reinterpret_cast<HYPRE_PtrToParSolverFcn>(HYPRE_ParCSRDiagScale),
-      reinterpret_cast<HYPRE_PtrToParSolverFcn>(HYPRE_ParCSRDiagScaleSetup),
-      nullptr));
+  const bool useGMRES =
+      (solverType == "gmres" || solverType == "fgmres" || solverType == "flexgmres");
 
-  HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetup(solver, Apar, bpar, xpar));
-  HYPRE_Int solveIerr = HYPRE_ParCSRBiCGSTABSolve(solver, Apar, bpar, xpar);
+  if (useGMRES) {
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRGMRESCreate(dm.comm, &solver));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRGMRESSetTol(solver, std::max(opt.relTol, 0.0)));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRGMRESSetAbsoluteTol(solver, std::max(opt.absTol, 0.0)));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRGMRESSetMaxIter(solver, opt.maxIter));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRGMRESSetKDim(solver, std::max(opt.gmresRestart, 2)));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRGMRESSetPrintLevel(solver, opt.monitor ? 2 : 0));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRGMRESSetLogging(solver, 1));
+
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRGMRESSetPrecond(
+        solver,
+        reinterpret_cast<HYPRE_PtrToParSolverFcn>(HYPRE_ParCSRDiagScale),
+        reinterpret_cast<HYPRE_PtrToParSolverFcn>(HYPRE_ParCSRDiagScaleSetup),
+        nullptr));
+
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRGMRESSetup(solver, Apar, bpar, xpar));
+  } else {
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABCreate(dm.comm, &solver));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetTol(solver, std::max(opt.relTol, 0.0)));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetAbsoluteTol(solver, std::max(opt.absTol, 0.0)));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetMaxIter(solver, opt.maxIter));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetPrintLevel(solver, opt.monitor ? 2 : 0));
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetLogging(solver, 1));
+
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetPrecond(
+        solver,
+        reinterpret_cast<HYPRE_PtrToParSolverFcn>(HYPRE_ParCSRDiagScale),
+        reinterpret_cast<HYPRE_PtrToParSolverFcn>(HYPRE_ParCSRDiagScaleSetup),
+        nullptr));
+
+    HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABSetup(solver, Apar, bpar, xpar));
+  }
+
+  HYPRE_Int solveIerr = useGMRES
+      ? HYPRE_ParCSRGMRESSolve(solver, Apar, bpar, xpar)
+      : HYPRE_ParCSRBiCGSTABSolve(solver, Apar, bpar, xpar);
+
   if (solveIerr) {
     int wrank = 0;
     MPI_Comm_rank(dm.comm, &wrank);
     std::fprintf(stderr,
-                 "[%d] WARNING: HYPRE_ParCSRBiCGSTABSolve returned code=%d; "
+                 "[%d] WARNING: HYPRE_ParCSR%sSolve returned code=%d; "
                  "continuing to inspect iterations/residual and current iterate.\n",
-                 wrank, (int)solveIerr);
+                 wrank, useGMRES ? "GMRES" : "BiCGSTAB", (int)solveIerr);
     HYPRE_ClearAllErrors();
   }
 
   HYPRE_Int its = 0;
   HYPRE_Real rel = 0.0;
 
-  HYPRE_Int itsIerr = HYPRE_ParCSRBiCGSTABGetNumIterations(solver, &its);
+  HYPRE_Int itsIerr = useGMRES
+      ? HYPRE_ParCSRGMRESGetNumIterations(solver, &its)
+      : HYPRE_ParCSRBiCGSTABGetNumIterations(solver, &its);
+
   if (itsIerr) {
     int wrank = 0;
     MPI_Comm_rank(dm.comm, &wrank);
     std::fprintf(stderr,
-                 "[%d] WARNING: HYPRE_ParCSRBiCGSTABGetNumIterations returned code=%d; "
+                 "[%d] WARNING: HYPRE_ParCSR%sGetNumIterations returned code=%d; "
                  "setting iterations=-1 and continuing.\n",
-                 wrank, (int)itsIerr);
+                 wrank, useGMRES ? "GMRES" : "BiCGSTAB", (int)itsIerr);
     its = -1;
     HYPRE_ClearAllErrors();
   }
 
-  HYPRE_Int relIerr = HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(solver, &rel);
+  HYPRE_Int relIerr = useGMRES
+      ? HYPRE_ParCSRGMRESGetFinalRelativeResidualNorm(solver, &rel)
+      : HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(solver, &rel);
+
   if (relIerr) {
     int wrank = 0;
     MPI_Comm_rank(dm.comm, &wrank);
     std::fprintf(stderr,
-                 "[%d] WARNING: HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm returned code=%d; "
+                 "[%d] WARNING: HYPRE_ParCSR%sGetFinalRelativeResidualNorm returned code=%d; "
                  "setting rel=1e300 and continuing.\n",
-                 wrank, (int)relIerr);
+                 wrank, useGMRES ? "GMRES" : "BiCGSTAB", (int)relIerr);
     rel = 1.0e300;
     HYPRE_ClearAllErrors();
   }
@@ -591,10 +1000,16 @@ DistSolverInfoLocal solve_bicgstab_jacobi_decomp(
   DistSolverInfoLocal out;
   out.x.assign(pat.nRows, 0.0);
   for (int i = 0; i < pat.nRows; ++i) out.x[i] = static_cast<double>(xhost[i]);
-  out.iterations = static_cast<int>(its);
+  out.iterations = hybridPreSweeps + static_cast<int>(its);
   out.relRes = static_cast<double>(rel);
 
-  if (solver) HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABDestroy(solver));
+  if (solver) {
+    if (useGMRES) {
+      HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRGMRESDestroy(solver));
+    } else {
+      HYPRE_CALL_SCALAR_DECOMP(HYPRE_ParCSRBiCGSTABDestroy(solver));
+    }
+  }
   if (xij)    HYPRE_CALL_SCALAR_DECOMP(HYPRE_IJVectorDestroy(xij));
   if (bij)    HYPRE_CALL_SCALAR_DECOMP(HYPRE_IJVectorDestroy(bij));
   if (Aij)    HYPRE_CALL_SCALAR_DECOMP(HYPRE_IJMatrixDestroy(Aij));

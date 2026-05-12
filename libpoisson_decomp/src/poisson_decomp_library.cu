@@ -380,6 +380,81 @@ void assemble_scalar_elliptic_decomp(
   }
 }
 
+
+void assemble_direct_coeff_elliptic_decomp(
+    const DecompMesh& dm,
+    const DistCSRPattern& pat,
+    const std::vector<double>& faceCoeff,
+    const std::vector<double>& rhsFlux,
+    const BoundaryFaceData& bcFaceData,
+    std::vector<HYPRE_Complex>& values,
+    std::vector<HYPRE_Complex>& rhs,
+    bool useReferenceCell,
+    HYPRE_BigInt refGlobalCell,
+    double refValue) {
+  const Mesh& mesh = dm.mesh;
+
+  if (static_cast<int>(faceCoeff.size()) != mesh.nFaces) {
+    throw std::runtime_error("faceCoeff must have size local mesh.nFaces");
+  }
+  if (static_cast<int>(rhsFlux.size()) != mesh.nCells) {
+    throw std::runtime_error("rhsFlux must have size local mesh.nCells");
+  }
+
+  values.assign(pat.nnz, 0.0);
+  rhs.assign(mesh.nCells, 0.0);
+
+  // v1.1b SIMPLE pressure RHS is in flux-divergence units directly:
+  //   rhs = -div(phiHbyA)
+  // Do not multiply by volume here.
+  for (int c = 0; c < mesh.nCells; ++c) {
+    rhs[c] = static_cast<HYPRE_Complex>(rhsFlux[c]);
+  }
+
+  for (int f = 0; f < mesh.nInternalFaces; ++f) {
+    const int P = mesh.owner[f];
+    const int N = mesh.neigh[f];
+    const double coeff = faceCoeff[f];
+
+    values[pat.facePP[f]] += static_cast<HYPRE_Complex>( coeff);
+    values[pat.facePN[f]] += static_cast<HYPRE_Complex>(-coeff);
+    values[pat.faceNP[f]] += static_cast<HYPRE_Complex>(-coeff);
+    values[pat.faceNN[f]] += static_cast<HYPRE_Complex>( coeff);
+  }
+
+  for (size_t i = 0; i < pat.procFace.size(); ++i) {
+    const int f = pat.procFace[i];
+    const double coeff = faceCoeff[f];
+
+    values[pat.procDiag[i]] += static_cast<HYPRE_Complex>( coeff);
+    values[pat.procOff[i]]  += static_cast<HYPRE_Complex>(-coeff);
+  }
+
+  for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
+    if (dm.isProcFace[f]) continue;
+
+    const int P = mesh.owner[f];
+    const double coeff = faceCoeff[f];
+
+    if (bcFaceData.type[f] == ScalarBCType::Dirichlet) {
+      values[pat.diagPos[P]] += static_cast<HYPRE_Complex>(coeff);
+      rhs[P] += static_cast<HYPRE_Complex>(coeff * bcFaceData.value[f]);
+    } else {
+      rhs[P] += static_cast<HYPRE_Complex>(-bcFaceData.value[f] * mesh.Af[f]);
+    }
+  }
+
+  if (useReferenceCell && refGlobalCell >= dm.ilower && refGlobalCell <= dm.iupper) {
+    const int refCell = static_cast<int>(refGlobalCell - dm.ilower);
+    const int rowStart = pat.rowOffsets[refCell];
+    const int rowEnd = pat.rowOffsets[refCell + 1];
+
+    for (int k = rowStart; k < rowEnd; ++k) values[k] = 0.0;
+    values[pat.diagPos[refCell]] = 1.0;
+    rhs[refCell] = static_cast<HYPRE_Complex>(refValue);
+  }
+}
+
 HypreSolveInfo solve_distributed_hypre_gpu_hostij(
     const DecompMesh& dm,
     const DistCSRPattern& pat,
@@ -559,6 +634,7 @@ DecompMesh read_decomposed_openfoam_case(
 
   dm.remoteRowForFace.assign(dm.mesh.nFaces, -1);
   dm.remoteCCForFace.assign(dm.mesh.nFaces, {0.0, 0.0, 0.0});
+  dm.remoteSlotForFace.assign(dm.mesh.nFaces, -1);
 
   for (size_t ipp = 0; ipp < dm.procPatches.size(); ++ipp) {
     const auto& pp = dm.procPatches[ipp];
@@ -567,6 +643,7 @@ DecompMesh read_decomposed_openfoam_case(
 
     std::vector<long long> sendRows(pp.nFaces, -1);
     std::vector<double> sendCC(3 * pp.nFaces, 0.0);
+    std::vector<double> sendXf(3 * pp.nFaces, 0.0);
 
     for (int i = 0; i < pp.nFaces; ++i) {
       const int f = pp.startFace + i;
@@ -576,6 +653,10 @@ DecompMesh read_decomposed_openfoam_case(
       sendCC[3*i + 0] = dm.mesh.cc[P][0];
       sendCC[3*i + 1] = dm.mesh.cc[P][1];
       sendCC[3*i + 2] = dm.mesh.cc[P][2];
+
+      sendXf[3*i + 0] = dm.mesh.xf[f][0];
+      sendXf[3*i + 1] = dm.mesh.xf[f][1];
+      sendXf[3*i + 2] = dm.mesh.xf[f][2];
     }
 
     int recvN = 0;
@@ -589,6 +670,7 @@ DecompMesh read_decomposed_openfoam_case(
 
     std::vector<long long> recvRows(recvN, -1);
     std::vector<double> recvCC(3 * recvN, 0.0);
+    std::vector<double> recvXf(3 * recvN, 0.0);
 
     MPI_Sendrecv(sendRows.data(), pp.nFaces, MPI_LONG_LONG, nbr, tagBase + 1,
                  recvRows.data(), recvN, MPI_LONG_LONG, nbr, tagBase + 1,
@@ -598,10 +680,114 @@ DecompMesh read_decomposed_openfoam_case(
                  recvCC.data(), 3 * recvN, MPI_DOUBLE, nbr, tagBase + 2,
                  comm, MPI_STATUS_IGNORE);
 
+    MPI_Sendrecv(sendXf.data(), 3 * pp.nFaces, MPI_DOUBLE, nbr, tagBase + 3,
+                 recvXf.data(), 3 * recvN, MPI_DOUBLE, nbr, tagBase + 3,
+                 comm, MPI_STATUS_IGNORE);
+
+    // Build a robust same-geometric-face map between local processor-patch
+    // slots and neighbour receive slots using face centers. This avoids assuming
+    // identical OpenFOAM processor-patch ordering across ranks.
+    std::vector<int> slotMap(pp.nFaces, -1);
+    std::vector<char> used(recvN, 0);
+
+    double localMaxD2 = 0.0;
+    double localSumD2 = 0.0;
+    int localIdentity = 0;
+
+    for (int i = 0; i < pp.nFaces; ++i) {
+      int best = -1;
+      double bestD2 = 1.0e300;
+
+      const double lx = sendXf[3*i + 0];
+      const double ly = sendXf[3*i + 1];
+      const double lz = sendXf[3*i + 2];
+
+      for (int j = 0; j < recvN; ++j) {
+        if (used[j]) continue;
+
+        const double dx = lx - recvXf[3*j + 0];
+        const double dy = ly - recvXf[3*j + 1];
+        const double dz = lz - recvXf[3*j + 2];
+        const double d2 = dx*dx + dy*dy + dz*dz;
+
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          best = j;
+        }
+      }
+
+      if (best < 0) {
+        throw std::runtime_error("Could not build processor face slot map for patch " + pp.name);
+      }
+
+      used[best] = 1;
+      slotMap[i] = best;
+
+      if (best == i) ++localIdentity;
+      localMaxD2 = std::max(localMaxD2, bestD2);
+      localSumD2 += bestD2;
+    }
+
+    const double localMaxDist = std::sqrt(localMaxD2);
+    const double localRmsDist = std::sqrt(localSumD2 / std::max(pp.nFaces, 1));
+
+    std::printf("[rank %d] proc patch match %s -> proc %d: faces=%d identity=%d/%d maxFaceCenterDist=%.12e rmsFaceCenterDist=%.12e\n",
+                dm.rank, pp.name.c_str(), nbr, pp.nFaces,
+                localIdentity, pp.nFaces, localMaxDist, localRmsDist);
+
     for (int i = 0; i < pp.nFaces; ++i) {
       const int f = pp.startFace + i;
-      dm.remoteRowForFace[f] = static_cast<HYPRE_BigInt>(recvRows[i]);
-      dm.remoteCCForFace[f] = {recvCC[3*i + 0], recvCC[3*i + 1], recvCC[3*i + 2]};
+      const int slot = slotMap[i];
+
+      dm.remoteSlotForFace[f] = slot;
+      dm.remoteRowForFace[f] = static_cast<HYPRE_BigInt>(recvRows[slot]);
+      dm.remoteCCForFace[f] = {recvCC[3*slot + 0], recvCC[3*slot + 1], recvCC[3*slot + 2]};
+    }
+
+    // procFaceOrientAudit:
+    // Processor faces must be oriented from the local owner cell toward the
+    // remote owner cell. Physical boundary orientation via xf-cc[P] can be
+    // insufficient for processor faces on curved/skewed decompositions.
+    int localFlips = 0;
+    int localBadAfter = 0;
+    double localMinDotBefore = 1.0e300;
+    double localMinDotAfter = 1.0e300;
+
+    for (int i = 0; i < pp.nFaces; ++i) {
+      const int f = pp.startFace + i;
+      const int P = dm.mesh.owner[f];
+
+      const auto d = sub3(dm.remoteCCForFace[f], dm.mesh.cc[P]);
+      const double dotBefore = dot3(d, dm.mesh.Sf[f]);
+      localMinDotBefore = std::min(localMinDotBefore, dotBefore);
+
+      if (dotBefore < 0.0) {
+        dm.mesh.Sf[f] = mul3(-1.0, dm.mesh.Sf[f]);
+        dm.mesh.nf[f] = mul3(-1.0, dm.mesh.nf[f]);
+        ++localFlips;
+      }
+
+      const double dotAfter = dot3(d, dm.mesh.Sf[f]);
+      localMinDotAfter = std::min(localMinDotAfter, dotAfter);
+
+      if (!(dotAfter > 1.0e-300)) ++localBadAfter;
+    }
+
+    int globalFlips = 0;
+    int globalBadAfter = 0;
+    double globalMinDotBefore = 0.0;
+    double globalMinDotAfter = 0.0;
+
+    MPI_Allreduce(&localFlips, &globalFlips, 1, MPI_INT, MPI_SUM, comm);
+    MPI_Allreduce(&localBadAfter, &globalBadAfter, 1, MPI_INT, MPI_SUM, comm);
+    MPI_Allreduce(&localMinDotBefore, &globalMinDotBefore, 1, MPI_DOUBLE, MPI_MIN, comm);
+    MPI_Allreduce(&localMinDotAfter, &globalMinDotAfter, 1, MPI_DOUBLE, MPI_MIN, comm);
+
+    if (dm.rank == 0) {
+      std::printf("procFaceOrientAudit patch=%s neigh=%d faces=%d globalFlips=%d globalBadAfter=%d minDotBefore=%.12e minDotAfter=%.12e\n",
+                  pp.name.c_str(), nbr, pp.nFaces,
+                  globalFlips, globalBadAfter,
+                  globalMinDotBefore, globalMinDotAfter);
     }
   }
 
@@ -643,7 +829,9 @@ std::vector<double> exchange_proc_face_scalar_owner_values(
 
     for (int i = 0; i < pp.nFaces; ++i) {
       const int f = pp.startFace + i;
-      remote[f] = recv[i];
+      int slot = dm.remoteSlotForFace[f];
+      if (slot < 0) slot = i;
+      remote[f] = recv[slot];
     }
   }
 
@@ -681,7 +869,9 @@ std::vector<std::array<double,3>> exchange_proc_face_vector_owner_values(
 
     for (int i = 0; i < pp.nFaces; ++i) {
       const int f = pp.startFace + i;
-      remote[f] = {recv[3*i + 0], recv[3*i + 1], recv[3*i + 2]};
+      int slot = dm.remoteSlotForFace[f];
+      if (slot < 0) slot = i;
+      remote[f] = {recv[3*slot + 0], recv[3*slot + 1], recv[3*slot + 2]};
     }
   }
 
@@ -836,3 +1026,62 @@ DistEllipticResult solve_scalar_elliptic_decomp(
   out.globalNnz = globalNnz;
   return out;
 }
+
+DistEllipticResult solve_scalar_elliptic_direct_coeff_decomp(
+    const DecompMesh& dm,
+    const std::vector<double>& faceCoeff,
+    const std::vector<double>& rhsFlux,
+    const ScalarBCSet& bcSet,
+    const DistEllipticOptions& opts) {
+  const Mesh& mesh = dm.mesh;
+
+  if (static_cast<int>(faceCoeff.size()) != mesh.nFaces) {
+    throw std::runtime_error("faceCoeff must have size local mesh.nFaces");
+  }
+  if (static_cast<int>(rhsFlux.size()) != mesh.nCells) {
+    throw std::runtime_error("rhsFlux must have size local mesh.nCells");
+  }
+
+  BoundaryFaceData bcFaceData = build_physical_boundary_face_data_decomp(dm, bcSet);
+
+  int localAnyDirichlet = 0;
+  for (int f = mesh.nInternalFaces; f < mesh.nFaces; ++f) {
+    if (!dm.isProcFace[f] && bcFaceData.type[f] == ScalarBCType::Dirichlet) {
+      localAnyDirichlet = 1;
+      break;
+    }
+  }
+
+  int globalAnyDirichlet = 0;
+  MPI_Allreduce(&localAnyDirichlet, &globalAnyDirichlet, 1, MPI_INT, MPI_MAX, dm.comm);
+
+  if (!globalAnyDirichlet && !opts.useReferenceCell) {
+    throw std::runtime_error("Pure-Neumann direct coefficient elliptic problem needs useReferenceCell=true.");
+  }
+
+  DistCSRPattern pat = build_decomp_scalar_pattern(dm);
+
+  long long localNnz = static_cast<long long>(pat.nnz);
+  long long globalNnz = 0;
+  MPI_Allreduce(&localNnz, &globalNnz, 1, MPI_LONG_LONG, MPI_SUM, dm.comm);
+
+  std::vector<HYPRE_Complex> values;
+  std::vector<HYPRE_Complex> rhs;
+
+  assemble_direct_coeff_elliptic_decomp(
+      dm, pat, faceCoeff, rhsFlux, bcFaceData,
+      values, rhs,
+      opts.useReferenceCell, opts.referenceGlobalCell, opts.referenceValue);
+
+  std::vector<double> phi(mesh.nCells, 0.0);
+  HypreSolveInfo lastInfo =
+      solve_distributed_hypre_gpu_hostij(dm, pat, values, rhs, phi, opts.hypre);
+
+  DistEllipticResult out;
+  out.phi = std::move(phi);
+  out.lastSolveInfo = lastInfo;
+  out.nOuter = 1;
+  out.globalNnz = globalNnz;
+  return out;
+}
+
