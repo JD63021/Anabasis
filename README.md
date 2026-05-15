@@ -247,3 +247,34 @@ The plots below compare v1.1b single-HYPRE and double-HYPRE A100 runs.
 Memory note: `/usr/bin/time -v` reports host process RSS, not GPU VRAM. GPU VRAM should be measured separately with `nvidia-smi` or explicit in-code GPU memory logging.
 
 <!-- ANABASIS_V1_1B_BUILD_END -->
+
+## SIMPLE and PIMPLE GPU applications
+
+This repository keeps the steady SIMPLE solver and transient PIMPLE solver as separate applications:
+
+    apps/simple_gpu/      steady SIMPLE GPU solver
+    apps/pimple_gpu/      transient PIMPLE GPU solver with BDF2 momentum time stepping
+
+Reference cases are split accordingly:
+
+    cases/simple/cylinder_re20_steady_simple.case
+    cases/pimple/cylinder_3d3z_sine_re100_bdf2_800k.case
+    cases/pimple/cylinder_3d3z_sine_re100_bdf2_lsq_p005.case
+
+Build both finalized double-precision applications with:
+
+    ./build_v1_1d_final_hypre31_double.sh
+
+Expected executables:
+
+    ./simple_gpu_dp
+    ./pimple_gpu_bdf2_dp
+
+The validated transient reference path is the BDF2-momentum PIMPLE solver with fixed outlet pressure:
+
+    velocity patch_2_0 zero_gradient
+    pressure patch_2_0 fixed_value 0.0
+    timeScheme BDF2
+    ddtCorr 0
+
+The experimental OpenFOAM-like ddtCorr branch and open-pressure outlet/reference-cell branch are intentionally not part of this finalized baseline.

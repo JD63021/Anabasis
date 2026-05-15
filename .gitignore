@@ -9,13 +9,11 @@ runs/
 
 # Direct-build executable
 /simple_gpu
-
 # Local/editor/backup files
 *.bak*
 *.generated.bc
 __pycache__/
 .DS_Store
-
 # Anabasis generated outputs
 **/runs/
 *.pvd
@@ -23,7 +21,20 @@ __pycache__/
 *.xdmf
 *.h5
 *.o
-simple_gpu
-simple_gpu_dp
+/simple_gpu_dp
 simple_gpu_sp
 cmake-build-*/
+# Runtime outputs
+*.bak
+*.tar
+*.tar.xz
+*.zip
+# Local binaries
+/pimple_gpu
+/pimple_gpu_bdf2_dp
+/pimple_gpu_bdf2_oflike_dp
+/generic_simple*_direct
+# Handover / generated notes
+*KNOWLEDGE_TRANSFER*
+*HANDOVER*
+ANABASIS_v*_PIMPLE*
