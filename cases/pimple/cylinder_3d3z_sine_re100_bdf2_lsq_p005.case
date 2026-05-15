@@ -1,0 +1,174 @@
+# ======================================================================
+# Optional comparison: LSQ pressure gradient + pDeltaMinCos 0.05. Not the final robust default.
+# Anabasis v1.1d-final — reference PIMPLE/BDF2 3D cylinder benchmark
+# ======================================================================
+# Expected patches:
+#   patch_0_0 = channel walls
+#   patch_1_0 = inlet
+#   patch_2_0 = outlet
+#   patch_3_0 = cylinder wall / force patch
+#
+# Benchmark inlet:
+#   U(0,y,z,t) = 16 Um y z (H-y)(H-z) sin(pi*t/8) / H^4,
+#   V = W = 0, 0 <= t <= 8.
+#
+# With H=0.41, D=0.1, rho=1, mu=0.001, Um=2.25 gives
+# max cross-section-average speed Ubar=(4/9)Um=1.0 and max Re=100.
+#
+# This is the validated v1.1d.2 path: BDF2 momentum, ddtCorr OFF.
+# The later ddtCorr/OpenFOAM-like branch is not included in this final base.
+# ======================================================================
+
+# [mesh/output]
+polyMeshDir /tmp/meshCase/constant/polyMesh
+outPrefix runs/pimple_cylinder_3d3z_sine_re100_bdf2_lsq_p005/case
+
+device 0
+writeVtu 1
+writeEvery 0
+monitor 1
+profileSteps 0
+
+# [PIMPLE/BDF2 controls]
+startTime 0.0
+dt 0.002
+nsteps 4000
+printEvery 20
+nOuterCorrectors 2
+nCorrectors 2
+momentumPredictor 1
+transientMomentum 1
+timeScheme BDF2
+
+# [physics/fluid]
+rho 1.0
+mu 0.001
+Umean 2.25
+
+# Reference dimensions used by the cylinder force coefficient postprocess.
+pipeD 0.1
+pipeL 2.5
+
+# [patch aliases]
+wallPatch patch_0_0
+inletPatch patch_1_0
+outletPatch patch_2_0
+
+# [outer convergence / residual monitoring]
+corrTol 1e-10
+tolMass 1e-9
+tolVel 1e-9
+
+# PIMPLE-style intermediate/final relaxation.
+uRelax 0.7
+pRelax 0.3
+uRelaxFinal 1.0
+pRelaxFinal 1.0
+
+# [geometry / reconstruction]
+geomMethod robust
+lsqStencil compact
+lsqWeightPower 1
+
+# [pressure-velocity coupling]
+pMode absolute
+pSolveMode ofAbsolute
+rcMode oflike
+pGradScheme lsq
+rAUMode raw
+pCoeffScale 1
+pDeltaMode of
+pDeltaMinCos 0.05
+
+# [momentum / pressure discretization]
+momNonOrthScale 0
+momentumConvectionScheme central
+pNonOrthScale 0
+nVelNonOrthCorr 0
+nNonOrthCorr 0
+nPressureCorr 0
+
+# [initialization]
+# At t=0 the sine inlet is zero, so uniform initialization gives U=V=W=P=0.
+initMode uniform
+potentialInitRAU 1.0
+potentialInitMaxit 4000
+potentialInitTol 1e-10
+potentialInitRelTol 0.0
+potentialInitWrite 0
+
+# [linear solvers]
+velMaxit 2000
+velTol 0
+velRelTol 1e-8
+velMaxitFinal 3000
+velTolFinal 0
+velRelTolFinal 1e-10
+
+pUseAmg 1
+pMaxit 8000
+pTol 1e-10
+pRelTol 1e-6
+pMaxitFinal 8000
+pTolFinal 1e-10
+pRelTolFinal 0.0
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgRelaxType 7
+pAmgKeepTranspose 1
+pAmgRebuildEvery 1
+
+# [Poisson module options]
+poissonGradientScheme gauss
+poissonLaplacianScheme nonorth
+poissonNonOrthCorr 2
+
+# [Scalar transport module options]
+scalarEnable 0
+scalarSolveMode afterFlow
+scalarName T
+scalarConvectionScheme upwind
+scalarDiffusionScheme nonorth
+scalarGamma 1.0
+scalarRelax 1.0
+scalarNonOrthCorr 2
+scalarMaxit 4000
+scalarTol 1e-10
+scalarRelTol 0.0
+
+# [velocity boundary conditions]
+velocity patch_0_0 wall_noslip
+velocity patch_3_0 wall_noslip
+velocity patch_1_0 parabolic_box_sine_inlet 0.41 2.25 y z 8.0 average_patch_normal
+velocity patch_2_0 zero_gradient
+
+# [pressure boundary conditions]
+pressure patch_0_0 zero_gradient
+pressure patch_3_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0
+
+# [force postprocessing]
+# forceEvery=5 with dt=0.002 logs every 0.01 seconds.
+# CSV columns include time, CD_vector and CL_z_vector.
+forceEnable 1
+forcePatch patch_3_0
+forceEvery 5
+forceLogPath runs/pimple_cylinder_3d3z_sine_re100_bdf2_lsq_p005/case_force_timeseries.csv
+forceLogAppend 0
+forceNormalSign -1
+forceUref 1.0
+forceAreaRef 0.041
+forceDragDir 1,0,0
+forceLiftDir 0,0,1
+forceSpanDir 0,1,0
+
+# [diagnostics]
+badCellAuditEvery 0
+badCellAuditTop 15
+badCellAuditStart 1
+badCellAuditOnGrowth 0
+badCellAuditGrowthFactor 1.2
+badCellAuditMassFloor 1e-8
+badCellAuditWriteCsv 0
