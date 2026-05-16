@@ -1,0 +1,211 @@
+# ======================================================================
+# Anabasis v1.1e — EXPERIMENTAL Darwish-style steady coupled cylinder case
+# ======================================================================
+# Uses apps/coupled_gpu. Mesh path remains the same as the SIMPLE case.
+# The coupled solver reuses p* linear-solver knobs for FlexGMRES + BoomerAMG.
+# Start with a small/easy cylinder mesh and debug signs before large runs.
+# ======================================================================
+
+# [mesh/output]
+polyMeshDir /tmp/meshCase/constant/polyMesh
+
+device 0
+writeVtu 1
+writeEvery 0
+monitor 1
+profileSteps 0
+
+# [physics/fluid]
+rho 1.0
+mu 0.001
+Umean 0.45
+pipeD 0.1
+pipeL 2.5
+
+# [patch aliases]
+wallPatch patch_0_0
+inletPatch patch_1_0
+outletPatch patch_2_0
+
+# [coupled nonlinear controls]
+printEvery 1
+corrTol 1e-10
+
+# First debug setting: conservative field relaxation after each monolithic solve.
+
+# [geometry / reconstruction]
+geomMethod robust
+lsqStencil compact
+lsqWeightPower 1
+
+# [pressure-velocity coupling]
+pMode absolute
+pSolveMode ofAbsolute
+rcMode old
+pGradScheme lsq
+rAUMode raw
+pCoeffScale 1
+pDeltaMode of
+pDeltaMinCos 0.05
+
+# [momentum / pressure discretization]
+momentumConvectionScheme central
+nVelNonOrthCorr 0
+nNonOrthCorr 0
+nPressureCorr 0
+
+# [initialization]
+initMode uniform
+potentialInitRAU 1.0
+potentialInitMaxit 4000
+potentialInitTol 1e-10
+potentialInitRelTol 0.0
+potentialInitWrite 0
+
+# [coupled FlexGMRES + BoomerAMG]
+# coupled_gpu v1.1e uses these p* settings for the monolithic [u,v,w,p] solve.
+velRestart 200
+pUseAmg 1
+pTol 1e-12
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgKeepTranspose 1
+#pAmgTruncFactor 0.2
+#pAmgPmax 4
+
+# [unused SIMPLE velocity-solver settings retained for parser compatibility]
+velMaxit 100
+velTol 1e-10
+velRelTol 0
+
+# [Poisson/scalar module options retained for parser compatibility]
+poissonGradientScheme gauss
+poissonLaplacianScheme nonorth
+poissonNonOrthCorr 2
+scalarEnable 0
+scalarSolveMode afterFlow
+scalarName T
+scalarConvectionScheme upwind
+scalarDiffusionScheme nonorth
+scalarGamma 1.0
+scalarRelax 1.0
+scalarNonOrthCorr 2
+scalarMaxit 4000
+scalarTol 1e-10
+scalarRelTol 0.0
+
+# [velocity boundary conditions]
+velocity patch_0_0 wall_noslip
+velocity patch_3_0 wall_noslip
+velocity patch_1_0 parabolic_box_inlet 0.41 0.45 y z average_patch_normal
+velocity patch_2_0 zero_gradient
+
+# [pressure boundary conditions]
+pressure patch_0_0 zero_gradient
+pressure patch_3_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0
+
+# [force postprocessing metadata; coupled branch currently writes flow fields and summary]
+forceEnable 1
+forcePatch patch_3_0
+forceNormalSign -1
+forceUref 0.2
+forceAreaRef 0.041
+forceDragDir 1,0,0
+forceLiftDir 0,0,1
+forceSpanDir 0,1,0
+
+# [diagnostics]
+badCellAuditEvery 0
+badCellAuditTop 15
+badCellAuditStart 1
+badCellAuditOnGrowth 0
+badCellAuditGrowthFactor 1.2
+badCellAuditMassFloor 1e-8
+badCellAuditWriteCsv 0
+
+# Coupled Darwish linear solver options
+# coupledKrylov choices: fgmres, gmres, bicgstab
+
+# ------------------------------------------------------------
+# v1.1e pseudo-transient Darwish coupled solver options
+# ------------------------------------------------------------
+
+# Krylov choices: fgmres, gmres, bicgstab
+
+# Start with Jacobi smoother as requested
+
+# Linear tolerance: early pseudo-time steps do not need ultra-exact solves
+
+# Pseudo-time mass term in momentum equations
+pseudoTime 1
+
+# Let pseudo-time provide damping first
+
+# ------------------------------------------------------------
+# Real transient BDF1 + Picard-corrected Darwish coupled solver
+# ------------------------------------------------------------
+
+# Physical time stepping
+
+# Picard correction inside each physical time step
+
+# Continuity and Picard convergence
+
+# Keep momentum BDF1 mass term active
+pseudoTime 1
+
+# Healthy linear setup from corrected pseudo-coupled runs
+
+# Usually no extra relaxation for real implicit transient Picard
+
+# Coupled transient Picard: make RC grad(p).d correction pressure-row implicit
+
+# Keep RC gradient correction explicit; implicit LSQ version is unstable.
+
+# ------------------------------------------------------------
+# Pseudo-time coupled deferred-nonorth run
+# Uses transient BDF1 machinery as pseudo-time stepping.
+# One Picard per pseudo step; do not fully converge each physical step.
+# ------------------------------------------------------------
+outPrefix runs/coupled_pseudo_deferred_nonorth/case
+
+# Pseudo-time stepping
+transientDt 1e-2
+transientNSteps 300
+timeStart 0.0
+
+# One nonlinear correction per pseudo step
+maxPicard 1
+minPicard 1
+picardTol 1e-6
+picardPrintEvery 1
+
+# Final steady convergence criteria
+tolMass 1e-6
+tolVel 1e-6
+
+# Keep BDF1/pseudo mass term active
+pseudoTime 1
+
+# Accurate coupled flux: this is needed for the correct CD/CL fixed point
+pNonOrthScale 1.0
+coupledRcGradImplicit 0
+
+# Momentum non-orthogonal correction: start with 0 if you want speed,
+# then test 1.0 for final force validation.
+momNonOrthScale 0.0
+
+# Linear solver
+coupledKrylov bicgstab
+pAmgRelaxType 7
+pAmgNumSweeps 1
+pAmgRebuildEvery 1
+pMaxit 300
+pRelTol 1e-8
+
+# No extra field relaxation initially
+uRelax 1.0
+pRelax 1.0

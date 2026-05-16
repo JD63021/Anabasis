@@ -1,0 +1,166 @@
+# ======================================================================
+# Anabasis v1.1e.7 — coupled BDF2 3D cylinder sine-inlet benchmark
+# ======================================================================
+# Expected patches:
+#   patch_0_0 = channel walls
+#   patch_1_0 = inlet
+#   patch_2_0 = outlet
+#   patch_3_0 = cylinder wall / force patch
+#
+# Inlet:
+#   U(0,y,z,t) = 16 Um y z (H-y)(H-z) sin(pi*t/8) / H^4
+#   with H=0.41, Um=2.25.  Peak cross-section-average Ubar=(4/9)Um=1.
+#
+# This case is for apps/coupled_transient_nonorth_gpu, not pimple_gpu.
+# ======================================================================
+
+# [mesh/output]
+polyMeshDir /tmp/meshCase/constant/polyMesh
+outPrefix runs/coupled_cylinder_3d3z_sine_re100_bdf2/case
+
+device 0
+writeVtu 1
+writeEvery 0
+monitor 1
+profileSteps 0
+
+# [physics/fluid]
+rho 1.0
+mu 0.001
+Umean 2.25
+pipeD 0.1
+pipeL 2.5
+
+# [patch aliases]
+wallPatch patch_0_0
+inletPatch patch_1_0
+outletPatch patch_2_0
+
+# [coupled transient controls]
+timeStart 0.0
+transientDt 0.002
+transientNSteps 4000
+timeScheme BDF2
+printEvery 20
+maxPicard 8
+minPicard 1
+picardConvergenceMode mass
+picardTol 1e-6
+tolMass 1e-5
+tolVel 1e-5
+corrTol 1e-10
+
+# Field relaxation after monolithic solve. Start with no extra relaxation.
+uRelax 1.0
+pRelax 1.0
+pseudoTime 1
+
+# Optional pressure-only cleanup. Keep conservative initially.
+coupledPressureNonOrthCorr 0
+coupledCompactPressureSolve 0
+coupledPressureCorrectVelocity 0
+coupledPressureCorrRelax 0.25
+coupledPressureCorrRelTol -1
+coupledPressureCorrMaxit 300
+
+# [geometry / reconstruction]
+geomMethod robust
+lsqStencil compact
+lsqWeightPower 1
+
+# [pressure-velocity coupling]
+pMode absolute
+pSolveMode ofAbsolute
+rcMode old
+pGradScheme lsq
+rAUMode raw
+pCoeffScale 1
+pDeltaMode of
+pDeltaMinCos 0.05
+coupledRcGradImplicit 0
+
+# [momentum / pressure discretization]
+momNonOrthScale 1
+momentumConvectionScheme central
+pNonOrthScale 1
+nVelNonOrthCorr 0
+nNonOrthCorr 0
+nPressureCorr 0
+
+# [initialization]
+# At t=0 sine inlet is zero, so uniform initialization gives U=V=W=P=0.
+initMode uniform
+potentialInitRAU 1.0
+potentialInitMaxit 4000
+potentialInitTol 1e-10
+potentialInitRelTol 0.0
+potentialInitWrite 0
+
+# [coupled Krylov + BoomerAMG]
+coupledKrylov bicgstab
+velRestart 200
+pUseAmg 1
+pMaxit 300
+pTol 1e-10
+pRelTol 1e-8
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgRelaxType 7
+pAmgKeepTranspose 1
+pAmgRebuildEvery 1
+
+# [unused SIMPLE velocity-solver settings retained for parser compatibility]
+velMaxit 100
+velTol 1e-10
+velRelTol 0
+
+# [Poisson/scalar module options retained for parser compatibility]
+poissonGradientScheme gauss
+poissonLaplacianScheme nonorth
+poissonNonOrthCorr 2
+scalarEnable 0
+scalarSolveMode afterFlow
+scalarName T
+scalarConvectionScheme upwind
+scalarDiffusionScheme nonorth
+scalarGamma 1.0
+scalarRelax 1.0
+scalarNonOrthCorr 2
+scalarMaxit 4000
+scalarTol 1e-10
+scalarRelTol 0.0
+
+# [velocity boundary conditions]
+velocity patch_0_0 wall_noslip
+velocity patch_3_0 wall_noslip
+velocity patch_1_0 parabolic_box_sine_inlet 0.41 2.25 y z 8.0 average_patch_normal
+velocity patch_2_0 zero_gradient
+
+# [pressure boundary conditions]
+pressure patch_0_0 zero_gradient
+pressure patch_3_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0
+
+# [force postprocessing]
+forceEnable 1
+forcePatch patch_3_0
+forceEvery 5
+forceLogPath runs/coupled_cylinder_3d3z_sine_re100_bdf2/case_force_timeseries.csv
+forceLogAppend 0
+forceNormalSign -1
+forceUref 1.0
+forceAreaRef 0.041
+forceDragDir 1,0,0
+forceLiftDir 0,0,1
+forceSpanDir 0,1,0
+
+# [diagnostics]
+badCellAuditEvery 0
+badCellAuditTop 15
+badCellAuditStart 1
+badCellAuditOnGrowth 0
+badCellAuditGrowthFactor 1.2
+badCellAuditMassFloor 1e-8
+badCellAuditWriteCsv 0
