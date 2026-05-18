@@ -1,17 +1,16 @@
-# Anabasis `simple_gpu`
+# apps/simple_gpu
 
-`simple_gpu` is the current CUDA/HYPRE finite-volume SIMPLE solver app in Anabasis v1.1.
+Steady incompressible SIMPLE solver app for OpenFOAM `polyMesh` input.
 
-It reads an OpenFOAM `polyMesh`, runtime boundary conditions from a flat `.case` file, and solves steady incompressible flow with a GPU-assembled/GPU-solved segregated SIMPLE loop. It also exposes Poisson and passive-scalar module options for the modular PDE-solver direction of the codebase.
+Build:
 
-Recommended robust pressure-velocity mode:
-
-```text
-pMode absolute
-pSolveMode ofAbsolute
-rcMode oflike
-pGradScheme gauss
-pDeltaMode of
+```bash
+./build_simple_gpu_hypre31_double.sh
 ```
 
-Do not use `pSolveMode ofAbsolute` with `rcMode old`.
+Run reference case:
+
+```bash
+mpirun -n 1 ./simple_gpu_dp \
+  -case-config cases/simple/cylinder_re20_steady_simple.case
+```

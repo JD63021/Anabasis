@@ -1079,10 +1079,100 @@ static Mesh read_openfoam_polymesh(const std::string &polyMeshDir, int geomMetho
   std::vector<int> neigh0 = read_foam_labels(polyMeshDir+"/neighbour");
 
   mesh.nFaces=(int)mesh.faces.size();
-  mesh.nInternalFaces=(int)neigh0.size();
+
+  if((int)owner0.size() != mesh.nFaces){
+    throw std::runtime_error(
+      "polyMesh owner count does not match faces count: owner=" +
+      std::to_string(owner0.size()) + " faces=" + std::to_string(mesh.nFaces));
+  }
+
+  // Standard OpenFOAM polyMesh:
+  //     neighbour has exactly nInternalFaces entries.
+  //
+  // Some cfMesh-generated polyMesh directories encountered here instead write
+  //     neighbour with one entry per face,
+  //     and use -1 for boundary faces.
+  //
+  // In OpenFOAM boundary, the first boundary patch startFace is the true
+  // nInternalFaces.  Use that as authoritative when boundary patches exist.
+  int nInternalFromBoundary = -1;
+  int maxPatchEnd = 0;
+  if(!patches.empty()){
+    nInternalFromBoundary = mesh.nFaces;
+    for(const auto &bp : patches){
+      if(bp.startFace < 0 || bp.nFaces < 0 ||
+         bp.startFace > mesh.nFaces ||
+         bp.startFace + bp.nFaces > mesh.nFaces){
+        throw std::runtime_error(
+          "Invalid boundary patch range for patch " + bp.name +
+          ": startFace=" + std::to_string(bp.startFace) +
+          " nFaces=" + std::to_string(bp.nFaces) +
+          " nFacesTotal=" + std::to_string(mesh.nFaces));
+      }
+      nInternalFromBoundary = std::min(nInternalFromBoundary, bp.startFace);
+      maxPatchEnd = std::max(maxPatchEnd, bp.startFace + bp.nFaces);
+    }
+    if(maxPatchEnd != mesh.nFaces){
+      throw std::runtime_error(
+        "Boundary patch ranges do not end at nFaces: maxPatchEnd=" +
+        std::to_string(maxPatchEnd) + " nFaces=" + std::to_string(mesh.nFaces));
+    }
+  }
+
+  int trueNInternalFaces = (int)neigh0.size();
+
+  if(nInternalFromBoundary >= 0){
+    trueNInternalFaces = nInternalFromBoundary;
+
+    if((int)neigh0.size() == trueNInternalFaces){
+      // Normal OpenFOAM layout.
+    } else if((int)neigh0.size() == mesh.nFaces){
+      // cfMesh-style full neighbour list. Internal entries must be real cells;
+      // boundary entries must be negative, normally -1.
+      for(int f=0; f<trueNInternalFaces; ++f){
+        if(neigh0[f] < 0){
+          throw std::runtime_error(
+            "Negative neighbour inside internal-face range at face " +
+            std::to_string(f));
+        }
+      }
+      for(int f=trueNInternalFaces; f<mesh.nFaces; ++f){
+        if(neigh0[f] >= 0){
+          throw std::runtime_error(
+            "Non-negative neighbour on boundary-face range at face " +
+            std::to_string(f) +
+            ". Cannot decide cfMesh full-neighbour layout safely.");
+        }
+      }
+      std::printf(
+        "Detected cfMesh-style full neighbour list: neighbour entries=%zu, "
+        "using nInternalFaces=%d from boundary startFace\n",
+        neigh0.size(), trueNInternalFaces);
+    } else {
+      throw std::runtime_error(
+        "neighbour count is neither nInternalFaces nor nFaces: neighbour=" +
+        std::to_string(neigh0.size()) +
+        " boundary-derived nInternalFaces=" +
+        std::to_string(trueNInternalFaces) +
+        " nFaces=" + std::to_string(mesh.nFaces));
+    }
+  } else {
+    if((int)neigh0.size() > mesh.nFaces){
+      throw std::runtime_error(
+        "neighbour count exceeds faces count: neighbour=" +
+        std::to_string(neigh0.size()) +
+        " nFaces=" + std::to_string(mesh.nFaces));
+    }
+  }
+
+  mesh.nInternalFaces = trueNInternalFaces;
+
   mesh.nCells=0;
   for(int v:owner0) mesh.nCells=std::max(mesh.nCells,v+1);
-  for(int v:neigh0) mesh.nCells=std::max(mesh.nCells,v+1);
+  for(int i=0;i<mesh.nInternalFaces;++i){
+    mesh.nCells=std::max(mesh.nCells,neigh0[i]+1);
+  }
+
   mesh.owner.resize(mesh.nFaces);
   mesh.neigh.assign(mesh.nInternalFaces,0);
   for(int i=0;i<mesh.nFaces;++i) mesh.owner[i]=owner0[i];
@@ -1092,7 +1182,9 @@ static Mesh read_openfoam_polymesh(const std::string &polyMeshDir, int geomMetho
   mesh.patchNames.resize(patches.size());
   for(std::size_t k=0;k<patches.size();++k){
     mesh.patchNames[k]=patches[k].name;
-    for(int f=patches[k].startFace; f<patches[k].startFace+patches[k].nFaces; ++f) mesh.bPatch[f]=(int)k+1;
+    for(int f=patches[k].startFace; f<patches[k].startFace+patches[k].nFaces; ++f){
+      mesh.bPatch[f]=(int)k+1;
+    }
   }
 
   mesh.cellFaces.assign(mesh.nCells,{});
@@ -3928,7 +4020,7 @@ static void solve_momentum_gpu_device_x0_xout(
   tsolve += MPI_Wtime()-t0;
 
   its=-1; relres=0.0;
-  HYPRE_Int itsTmp=-1; HYPRE_Real relTmp = (HYPRE_Real)(0.0);
+  HYPRE_Int itsTmp=-1; double relTmp=0.0;
   HYPRE_Int itsErr = HYPRE_ParCSRBiCGSTABGetNumIterations(mom.lin.solver,&itsTmp);
   HYPRE_Int relErr = HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(mom.lin.solver,&relTmp);
   if(itsErr == 0) its = itsTmp;
@@ -3978,7 +4070,7 @@ static void solve_momentum_gpu_device_defect_x0_xout(
   tsolve += MPI_Wtime()-t0;
 
   its=-1; relres=0.0;
-  HYPRE_Int itsTmp=-1; HYPRE_Real relTmp = (HYPRE_Real)(0.0);
+  HYPRE_Int itsTmp=-1; double relTmp=0.0;
   HYPRE_Int itsErr = HYPRE_ParCSRBiCGSTABGetNumIterations(mom.lin.solver,&itsTmp);
   HYPRE_Int relErr = HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(mom.lin.solver,&relTmp);
   if(itsErr == 0) its = itsTmp;
@@ -4617,7 +4709,7 @@ static void solve_momentum_gpu(GPUMomentumAssembler &mom, const Params &par, con
   tsolve += MPI_Wtime()-t0;
 
   its=-1; relres=0.0;
-  HYPRE_Int itsTmp=-1; HYPRE_Real relTmp = (HYPRE_Real)(0.0);
+  HYPRE_Int itsTmp=-1; double relTmp=0.0;
   HYPRE_Int itsErr = HYPRE_ParCSRBiCGSTABGetNumIterations(mom.lin.solver,&itsTmp);
   HYPRE_Int relErr = HYPRE_ParCSRBiCGSTABGetFinalRelativeResidualNorm(mom.lin.solver,&relTmp);
   if(itsErr == 0) its = itsTmp;
@@ -4636,11 +4728,7 @@ static void solve_pressure_gpu(GPULinearSystem &ps, const std::vector<double> &r
   tsolve += MPI_Wtime()-t0;
   its=0; relres=0.0;
   HYPRE_CALL(HYPRE_ParCSRPCGGetNumIterations(ps.solver,&its));
-  do {
-    HYPRE_Real relres_hypre_tmp = (HYPRE_Real)0.0;
-    HYPRE_CALL(HYPRE_ParCSRPCGGetFinalRelativeResidualNorm(ps.solver, &relres_hypre_tmp));
-    relres = (double)relres_hypre_tmp;
-  } while(0);
+  HYPRE_CALL(HYPRE_ParCSRPCGGetFinalRelativeResidualNorm(ps.solver,&relres));
   copy_solution_from_hypre(ps, xout);
 }
 
@@ -4659,11 +4747,7 @@ static void solve_pressure_gpu_device_rhs(GPULinearSystem &ps, const std::vector
   tsolve += MPI_Wtime()-t0;
   its=0; relres=0.0;
   HYPRE_CALL(HYPRE_ParCSRPCGGetNumIterations(ps.solver,&its));
-  do {
-    HYPRE_Real relres_hypre_tmp = (HYPRE_Real)0.0;
-    HYPRE_CALL(HYPRE_ParCSRPCGGetFinalRelativeResidualNorm(ps.solver, &relres_hypre_tmp));
-    relres = (double)relres_hypre_tmp;
-  } while(0);
+  HYPRE_CALL(HYPRE_ParCSRPCGGetFinalRelativeResidualNorm(ps.solver,&relres));
   copy_solution_from_hypre(ps, xout);
 }
 
@@ -4704,7 +4788,7 @@ static void solve_pressure_gpu_device_rhs_device_x0(
   relres = 0.0;
 
   HYPRE_Int itsTmp = -1;
-  HYPRE_Real relTmp = (HYPRE_Real)0.0;
+  double relTmp = 0.0;
 
   HYPRE_Int itsErr = HYPRE_ParCSRPCGGetNumIterations(ps.solver, &itsTmp);
   HYPRE_Int relErr = HYPRE_ParCSRPCGGetFinalRelativeResidualNorm(ps.solver, &relTmp);
@@ -5175,12 +5259,22 @@ CUDA_CALL(cudaFree(0));
   for(const auto &p:mesh.P){ xmin=std::min(xmin,p[0]); xmax=std::max(xmax,p[0]); ymin=std::min(ymin,p[1]); ymax=std::max(ymax,p[1]); zmin=std::min(zmin,p[2]); zmax=std::max(zmax,p[2]); }
   for(double v:mesh.vol){ vmin=std::min(vmin,v); vmax=std::max(vmax,v); }
   int wallPatch=-1, inletPatch=-1, outletPatch=-1;
-  int cylinderPatch=-1; // optional separated cylinder wall patch, e.g. patch_3_0
+  int cylinderPatch=-1; // optional separated cylinder/force wall patch
+
+  // Prefer the user-specified forcePatch.  Older cylinder cases used patch_3_0,
+  // but snappyHexMesh/CfdOF can create patch names such as patch_3_1.
   for(std::size_t k=0;k<mesh.patchNames.size();++k){
     if(mesh.patchNames[k]==par.wallPatchName) wallPatch=(int)k;
-    if(mesh.patchNames[k]=="patch_3_0") cylinderPatch=(int)k;
+    if(!par.forcePatchName.empty() && mesh.patchNames[k]==par.forcePatchName) cylinderPatch=(int)k;
     if(mesh.patchNames[k]==par.inletPatchName) inletPatch=(int)k;
     if(mesh.patchNames[k]==par.outletPatchName) outletPatch=(int)k;
+  }
+
+  // Backward-compatible fallback for older benchmark meshes.
+  if(cylinderPatch < 0){
+    for(std::size_t k=0;k<mesh.patchNames.size();++k){
+      if(mesh.patchNames[k]=="patch_3_0") cylinderPatch=(int)k;
+    }
   }
   if(wallPatch<0 || inletPatch<0 || outletPatch<0){ if(rank==0) std::fprintf(stderr,"Could not find wall/inlet/outlet patch.\n"); MPI_Abort(MPI_COMM_WORLD,1); }
   double mu = par.muExplicit ? par.mu : (par.rho*par.Umean*par.pipeDiameter/par.Re);
@@ -5663,7 +5757,8 @@ CUDA_CALL(cudaFree(0));
   }
 
 
-  const bool usePressureAnchor = false;
+  const bool usePressureAnchor = pressureReferenceNeeded;
+  if(rank==0) std::printf("Pressure anchor enabled : %s\n", usePressureAnchor ? "yes" : "no");
 
   DeviceMesh dmesh; build_device_mesh(mesh, dmesh);
   DeviceBC dbcP = make_device_bc(mesh.nFaces, bcPType, pFaceBC);
