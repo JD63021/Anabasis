@@ -1,0 +1,142 @@
+# ======================================================================
+# Anabasis v1.1 cylinder benchmark case
+# ======================================================================
+# Expected patches:
+#   patch_0_0 = channel walls
+#   patch_1_0 = inlet
+#   patch_2_0 = outlet
+#   patch_3_0 = cylinder wall / force patch
+# ======================================================================
+
+# [mesh/output]
+polyMeshDir /tmp/meshCase/constant/polyMesh
+outPrefix runs/cylinder/case
+
+device 0
+writeVtu 1
+writeEvery 0
+monitor 1
+profileSteps 0
+
+# [physics/fluid]
+rho 1.0
+mu 0.05
+Umean 1
+
+# Reference dimensions used by the cylinder force coefficient postprocess.
+pipeD 0.1
+pipeL 2.5
+
+# [patch aliases]
+wallPatch patch_0_0
+inletPatch patch_1_0
+outletPatch patch_2_0
+
+# [SIMPLE controls]
+nsteps 500
+printEvery 10
+corrTol 1e-10
+tolMass 1e-4
+tolVel 1e-4
+
+uRelax 0.7
+pRelax 0.3
+
+# [geometry / reconstruction]
+geomMethod robust
+lsqStencil compact
+lsqWeightPower 1
+
+# [pressure-velocity coupling]
+pMode absolute
+pSolveMode ofAbsolute
+rcMode oflike
+pGradScheme lsq
+rAUMode raw
+pCoeffScale 1
+pDeltaMode of
+pDeltaMinCos 0.05
+
+# [momentum / pressure discretization]
+momNonOrthScale 1
+momentumConvectionScheme central
+pNonOrthScale 1
+nVelNonOrthCorr 1
+nNonOrthCorr 4
+nPressureCorr 0
+
+# [initialization]
+initMode uniform
+potentialInitRAU 1.0
+potentialInitMaxit 4000
+potentialInitTol 1e-10
+potentialInitRelTol 0.0
+potentialInitWrite 0
+
+# [linear solvers]
+velMaxit 3
+velTol 1e-10
+velRelTol 0
+
+pUseAmg 1
+pMaxit 4000
+pTol 1e-10
+pRelTol 0.01
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgRelaxType 7
+pAmgKeepTranspose 1
+pAmgRebuildEvery 1
+
+# [Poisson module options]
+poissonGradientScheme gauss
+poissonLaplacianScheme nonorth
+poissonNonOrthCorr 2
+
+# [Scalar transport module options]
+scalarEnable 0
+scalarSolveMode afterFlow
+scalarName T
+scalarConvectionScheme upwind
+scalarDiffusionScheme nonorth
+scalarGamma 1.0
+scalarRelax 1.0
+scalarNonOrthCorr 2
+scalarMaxit 4000
+scalarTol 1e-10
+scalarRelTol 0.0
+
+# [velocity boundary conditions]
+velocity patch_0_0 wall_noslip
+#velocity patch_3_0 wall_noslip
+velocity patch_1_0 fixed_normal_speed -1 average_patch_normal
+velocity patch_2_0 zero_gradient
+
+# [pressure boundary conditions]
+pressure patch_0_0 zero_gradient
+#pressure patch_3_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0
+
+# [force postprocessing]
+# forceEnable 0 disables all force integration output.
+forceEnable 0
+forcePatch patch_3_1
+forceNormalSign -1
+forceUref 0.2
+forceAreaRef 0.041
+forceDragDir 1,0,0
+forceLiftDir 0,0,1
+forceSpanDir 0,1,0
+
+# [diagnostics]
+badCellAuditEvery 0
+badCellAuditTop 15
+badCellAuditStart 1
+badCellAuditOnGrowth 0
+badCellAuditGrowthFactor 1.2
+badCellAuditMassFloor 1e-8
+badCellAuditWriteCsv 0
+velocity patch_3_1 wall_noslip
+pressure patch_3_1 zero_gradient
