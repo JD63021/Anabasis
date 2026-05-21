@@ -221,9 +221,156 @@ struct Params {
   int scalarMaxit = 4000;
   double scalarTol = 1.0e-10;
   double scalarRelTol = 0.0;
+
+  // Ethier-Steinman exact 3D Navier-Stokes verification mode.
+  // When enabled, the coupled app ignores runtime velocity/pressure BC lines
+  // and imposes exact Dirichlet U,p on every boundary patch.
+  int ethierEnable = 0;
+  double ethierA = 0.78539816339744830962;  // pi/4
+  double ethierD = 1.57079632679489661923;  // pi/2
+  int ethierPressureDirichlet = 1;
+  int ethierFluxCompatible = 1;
+  int ethierBDF2ExactHistory = 1;
 };
 
 // add3/sub3/mul3/dot3/cross3/norm3 are provided by libpoisson/common.h via mesh.h.
+
+// -----------------------------------------------------------------------------
+// Ethier-Steinman exact solution and verification helpers.
+// -----------------------------------------------------------------------------
+struct EthierExactValue {
+  double u = 0.0, v = 0.0, w = 0.0, p = 0.0;
+};
+
+static inline EthierExactValue ethier_exact_value(
+    double x, double y, double z, double t, double a, double d)
+{
+  const double E1 = std::exp(-d*d*t);
+  const double E2 = std::exp(-2.0*d*d*t);
+
+  EthierExactValue q;
+  q.u = -a * ( std::exp(a*x) * std::sin(a*y + d*z)
+             + std::exp(a*z) * std::cos(a*x + d*y) ) * E1;
+  q.v = -a * ( std::exp(a*y) * std::sin(a*z + d*x)
+             + std::exp(a*x) * std::cos(a*y + d*z) ) * E1;
+  q.w = -a * ( std::exp(a*z) * std::sin(a*x + d*y)
+             + std::exp(a*y) * std::cos(a*z + d*x) ) * E1;
+
+  q.p = -0.5*a*a * (
+        std::exp(2.0*a*x) + std::exp(2.0*a*y) + std::exp(2.0*a*z)
+      + 2.0*std::sin(a*x + d*y)*std::cos(a*z + d*x)*std::exp(a*(y+z))
+      + 2.0*std::sin(a*y + d*z)*std::cos(a*x + d*y)*std::exp(a*(z+x))
+      + 2.0*std::sin(a*z + d*x)*std::cos(a*y + d*z)*std::exp(a*(x+y))
+      ) * E2;
+  return q;
+}
+
+static void ethier_fill_cell_fields(
+    const Mesh& mesh, double time, double a, double d,
+    std::vector<double>& u, std::vector<double>& v,
+    std::vector<double>& w, std::vector<double>& p)
+{
+  u.assign(mesh.nCells, 0.0);
+  v.assign(mesh.nCells, 0.0);
+  w.assign(mesh.nCells, 0.0);
+  p.assign(mesh.nCells, 0.0);
+  for(int c=0; c<mesh.nCells; ++c){
+    const auto q = ethier_exact_value(mesh.cc[c][0], mesh.cc[c][1], mesh.cc[c][2], time, a, d);
+    u[c] = q.u; v[c] = q.v; w[c] = q.w; p[c] = q.p;
+  }
+}
+
+static double ethier_boundary_volume_flux(
+    const Mesh& mesh,
+    const std::vector<double>& uFaceBC,
+    const std::vector<double>& vFaceBC,
+    const std::vector<double>& wFaceBC)
+{
+  double flux = 0.0;
+  for(int f=mesh.nInternalFaces; f<mesh.nFaces; ++f){
+    flux += uFaceBC[f]*mesh.Sf[f][0] + vFaceBC[f]*mesh.Sf[f][1] + wFaceBC[f]*mesh.Sf[f][2];
+  }
+  return flux;
+}
+
+static double ethier_make_boundary_flux_compatible(
+    const Mesh& mesh,
+    const std::vector<std::string>& bcUType,
+    const std::vector<std::string>& bcVType,
+    const std::vector<std::string>& bcWType,
+    std::vector<double>& uFaceBC,
+    std::vector<double>& vFaceBC,
+    std::vector<double>& wFaceBC)
+{
+  const double before = ethier_boundary_volume_flux(mesh, uFaceBC, vFaceBC, wFaceBC);
+  double areaSum = 0.0;
+  for(int f=mesh.nInternalFaces; f<mesh.nFaces; ++f){
+    const int pidx = mesh.bPatch[f] - 1;
+    if(pidx >= 0 && pidx < (int)bcUType.size() &&
+       bcUType[pidx] == "Dirichlet" &&
+       bcVType[pidx] == "Dirichlet" &&
+       bcWType[pidx] == "Dirichlet"){
+      areaSum += mesh.Af[f];
+    }
+  }
+  if(areaSum <= 1.0e-300) return 0.0;
+
+  const double deltaUn = -before / areaSum;
+  for(int f=mesh.nInternalFaces; f<mesh.nFaces; ++f){
+    const int pidx = mesh.bPatch[f] - 1;
+    if(pidx >= 0 && pidx < (int)bcUType.size() &&
+       bcUType[pidx] == "Dirichlet" &&
+       bcVType[pidx] == "Dirichlet" &&
+       bcWType[pidx] == "Dirichlet"){
+      uFaceBC[f] += deltaUn * mesh.nf[f][0];
+      vFaceBC[f] += deltaUn * mesh.nf[f][1];
+      wFaceBC[f] += deltaUn * mesh.nf[f][2];
+    }
+  }
+  return deltaUn;
+}
+
+static void ethier_report_error(
+    const Mesh& mesh, const std::vector<double>& u, const std::vector<double>& v,
+    const std::vector<double>& w, const std::vector<double>& p,
+    double time, double a, double d,
+    double& U_abs_L2, double& U_rel_L2,
+    double& p_abs_L2_mf, double& p_rel_L2_mf, double& p_mean_offset)
+{
+  double volTot = 0.0;
+  double pNumMeanNum = 0.0, pExMeanNum = 0.0;
+  for(int c=0; c<mesh.nCells; ++c){
+    const auto q = ethier_exact_value(mesh.cc[c][0], mesh.cc[c][1], mesh.cc[c][2], time, a, d);
+    const double V = mesh.vol[c];
+    volTot += V;
+    pNumMeanNum += V * p[c];
+    pExMeanNum  += V * q.p;
+  }
+  const double pNumMean = pNumMeanNum / std::max(volTot, 1.0e-300);
+  const double pExMean  = pExMeanNum  / std::max(volTot, 1.0e-300);
+  p_mean_offset = pNumMean - pExMean;
+
+  double eU2 = 0.0, nU2 = 0.0, eP2 = 0.0, nP2 = 0.0;
+  for(int c=0; c<mesh.nCells; ++c){
+    const auto q = ethier_exact_value(mesh.cc[c][0], mesh.cc[c][1], mesh.cc[c][2], time, a, d);
+    const double V = mesh.vol[c];
+    const double du = u[c] - q.u;
+    const double dv = v[c] - q.v;
+    const double dw = w[c] - q.w;
+    eU2 += V * (du*du + dv*dv + dw*dw);
+    nU2 += V * (q.u*q.u + q.v*q.v + q.w*q.w);
+
+    const double pn = p[c] - pNumMean;
+    const double pe = q.p - pExMean;
+    const double dp = pn - pe;
+    eP2 += V * dp*dp;
+    nP2 += V * pe*pe;
+  }
+  U_abs_L2 = std::sqrt(eU2);
+  U_rel_L2 = std::sqrt(eU2 / std::max(nU2, 1.0e-300));
+  p_abs_L2_mf = std::sqrt(eP2);
+  p_rel_L2_mf = std::sqrt(eP2 / std::max(nP2, 1.0e-300));
+}
 
 // OpenFOAM-like stabilized normal delta coefficient used by nonOrthDeltaCoeffs:
 //   1/max(nHat.d, 0.05*|d|)
@@ -254,7 +401,13 @@ static inline double of_delta_coeff_stabilised(const std::array<double,3>& n,
 // Default mode 1 preserves current simple_gpu robust behavior.
 __device__ __managed__ int g_pDeltaMode = 1;
 __device__ __managed__ double g_pDeltaMinCos = 0.05;
+__device__ __managed__ double g_coupledRcBoundaryScale = 1.0;
 
+__device__ __managed__ int g_coupledRcFullNonOrth = 0;
+__device__ __managed__ int g_coupledRcGradMidpoint = 0;
+__device__ __managed__ int g_coupledRauDiagMode = 0;
+__device__ __managed__ int g_coupledSubtriContinuity = 0;
+__device__ __managed__ int g_coupledSubtriPressureBC = 0;
 static __host__ __device__ __forceinline__ double pressure_delta_coeff_runtime(
     double dx, double dy, double dz,
     double nfx, double nfy, double nfz)
@@ -459,6 +612,12 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
     {"startTime", "-time-start"},
     {"timeScheme", "-time-scheme"},
     {"time-scheme", "-time-scheme"},
+    {"ethierEnable", "-ethier-enable"},
+    {"ethierA", "-ethier-a"},
+    {"ethierD", "-ethier-d"},
+    {"ethierPressureDirichlet", "-ethier-pressure-dirichlet"},
+    {"ethierFluxCompatible", "-ethier-flux-compatible"},
+    {"ethierBDF2ExactHistory", "-ethier-bdf2-exact-history"},
     {"pseudoDeltaT", "-pseudo-dt"},
     {"dtPseudo", "-pseudo-dt"},
 
@@ -951,6 +1110,12 @@ static void parse_args(int argc, char** argv, Params &par){
     else if(!std::strcmp(argv[i],"-coupled-pressure-corr-reltol")){need(argv[i]); par.coupledPressureCorrRelTol=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-coupled-pressure-corr-maxit")){need(argv[i]); par.coupledPressureCorrMaxit=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-time-start")){need(argv[i]); par.timeStart=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-ethier-enable")){need(argv[i]); par.ethierEnable=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-ethier-a")){need(argv[i]); par.ethierA=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-ethier-d")){need(argv[i]); par.ethierD=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-ethier-pressure-dirichlet")){need(argv[i]); par.ethierPressureDirichlet=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-ethier-flux-compatible")){need(argv[i]); par.ethierFluxCompatible=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-ethier-bdf2-exact-history")){need(argv[i]); par.ethierBDF2ExactHistory=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-amg-coarsen-type")){need(argv[i]); par.pAmgCoarsenType=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-amg-interp-type")){need(argv[i]); par.pAmgInterpType=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-amg-agg-levels")){need(argv[i]); par.pAmgAggLevels=std::atoi(argv[++i]);}
@@ -1954,6 +2119,13 @@ static void write_vtu_polyhedron_cell_data(const std::string &filename,const Mes
   for(int c=0;c<nCells;++c){ const auto &fids=mesh.cellFaces[c]; const auto &oris=mesh.cellOrient[c]; std::vector<std::vector<int>> cellFacePts(fids.size()); std::vector<int> allPts; for(std::size_t j=0;j<fids.size();++j){ int f=fids[j]; cellFacePts[j]=mesh.faces[f]; if(oris[j]<0) std::reverse(cellFacePts[j].begin(),cellFacePts[j].end()); allPts.insert(allPts.end(),cellFacePts[j].begin(),cellFacePts[j].end()); } std::vector<int> uniqPts; std::set<int> seen; for(int p:allPts) if(seen.insert(p).second) uniqPts.push_back(p); for(int p:uniqPts) connectivity.push_back((long long)p); connCount += (long long)uniqPts.size(); offsets[c]=connCount; facesStream.push_back((long long)fids.size()); for(const auto &fv:cellFacePts){ facesStream.push_back((long long)fv.size()); for(int p:fv) facesStream.push_back((long long)p); } faceCount += 1; for(const auto &fv:cellFacePts) faceCount += 1 + (long long)fv.size(); faceoffsets[c]=faceCount; }
   std::ofstream fid(filename.c_str()); if(!fid) throw std::runtime_error("Could not open "+filename+" for writing");
   fid << "<?xml version=\"1.0\"?>\n<VTKFile type=\"UnstructuredGrid\" version=\"1.0\" byte_order=\"LittleEndian\">\n  <UnstructuredGrid>\n    <Piece NumberOfPoints=\""<<nPts<<"\" NumberOfCells=\""<<nCells<<"\">\n      <Points>\n        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n"; for(const auto &p:mesh.P) fid<<"          "<<std::setprecision(15)<<p[0]<<" "<<p[1]<<" "<<p[2]<<"\n"; fid<<"        </DataArray>\n      </Points>\n      <Cells>\n        <DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">\n          "; for(auto v:connectivity) fid<<v<<" "; fid<<"\n        </DataArray>\n        <DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">\n          "; for(auto v:offsets) fid<<v<<" "; fid<<"\n        </DataArray>\n        <DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">\n          "; for(auto v:types) fid<<v<<" "; fid<<"\n        </DataArray>\n        <DataArray type=\"Int64\" Name=\"faces\" format=\"ascii\">\n          "; for(auto v:facesStream) fid<<v<<" "; fid<<"\n        </DataArray>\n        <DataArray type=\"Int64\" Name=\"faceoffsets\" format=\"ascii\">\n          "; for(auto v:faceoffsets) fid<<v<<" "; fid<<"\n        </DataArray>\n      </Cells>\n      <CellData>\n";
+  // Write the actual FV cell centres used by the solver.  This is essential
+  // for manufactured-solution error checks on polyhedral meshes; VTK/vertex
+  // centroids are not generally equal to FV cell centroids.
+  fid<<"        <DataArray type=\"Float64\" Name=\"cell_center\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+  for(int c=0;c<nCells;++c)
+    fid<<"          "<<std::setprecision(15)<<mesh.cc[c][0]<<" "<<mesh.cc[c][1]<<" "<<mesh.cc[c][2]<<"\n";
+  fid<<"        </DataArray>\n";
   if(vecData){ fid<<"        <DataArray type=\"Float64\" Name=\""<<vecName<<"\" NumberOfComponents=\"3\" format=\"ascii\">\n"; for(const auto &v:*vecData) fid<<"          "<<std::setprecision(15)<<v[0]<<" "<<v[1]<<" "<<v[2]<<"\n"; fid<<"        </DataArray>\n"; }
   for(std::size_t k=0;k<scalarNames.size();++k){ fid<<"        <DataArray type=\"Float64\" Name=\""<<scalarNames[k]<<"\" NumberOfComponents=\"1\" format=\"ascii\">\n"; for(double v:scalarData[k]) fid<<"          "<<std::setprecision(15)<<v<<"\n"; fid<<"        </DataArray>\n"; }
   fid<<"      </CellData>\n    </Piece>\n  </UnstructuredGrid>\n</VTKFile>\n";
@@ -2183,6 +2355,13 @@ static void run_bad_cell_audit(
 }
 
 struct DeviceMesh {
+  // Optional subtriangle quadrature for non-planar poly faces.
+  // Each subtriangle belongs to one parent OpenFOAM face.
+  int nSubTris = 0;
+  int *d_subFace = nullptr;
+  double *d_subx = nullptr, *d_suby = nullptr, *d_subz = nullptr;
+  double *d_subsx = nullptr, *d_subsy = nullptr, *d_subsz = nullptr;
+
   int nCells=0, nFaces=0, nInternalFaces=0;
   int *d_owner=nullptr, *d_neigh=nullptr, *d_bPatch=nullptr;
   double *d_ccx=nullptr, *d_ccy=nullptr, *d_ccz=nullptr;
@@ -2277,6 +2456,72 @@ static void build_device_mesh(const Mesh &mesh, DeviceMesh &dm){
   std::vector<double> xfx(mesh.nFaces), xfy(mesh.nFaces), xfz(mesh.nFaces), nfx(mesh.nFaces), nfy(mesh.nFaces), nfz(mesh.nFaces), sfx(mesh.nFaces), sfy(mesh.nFaces), sfz(mesh.nFaces), Af(mesh.nFaces);
   for(int c=0;c<mesh.nCells;++c){ ccx[c]=mesh.cc[c][0]; ccy[c]=mesh.cc[c][1]; ccz[c]=mesh.cc[c][2]; vol[c]=mesh.vol[c]; }
   for(int f=0;f<mesh.nFaces;++f){ xfx[f]=mesh.xf[f][0]; xfy[f]=mesh.xf[f][1]; xfz[f]=mesh.xf[f][2]; nfx[f]=mesh.nf[f][0]; nfy[f]=mesh.nf[f][1]; nfz[f]=mesh.nf[f][2]; sfx[f]=mesh.Sf[f][0]; sfy[f]=mesh.Sf[f][1]; sfz[f]=mesh.Sf[f][2]; Af[f]=mesh.Af[f]; }
+
+  // Build subtriangle quadrature arrays from poly faces.
+  // For each face polygon, use fan triangles around vertex-average center:
+  //   triangle i = (faceCenterVertexAverage, vertex_i, vertex_{i+1})
+  // The area vector orientation follows the parent OpenFOAM face orientation.
+  std::vector<int> h_subFace;
+  std::vector<double> h_subx, h_suby, h_subz;
+  std::vector<double> h_subsx, h_subsy, h_subsz;
+
+  h_subFace.reserve(mesh.nFaces * 2);
+  h_subx.reserve(mesh.nFaces * 2);
+  h_suby.reserve(mesh.nFaces * 2);
+  h_subz.reserve(mesh.nFaces * 2);
+  h_subsx.reserve(mesh.nFaces * 2);
+  h_subsy.reserve(mesh.nFaces * 2);
+  h_subsz.reserve(mesh.nFaces * 2);
+
+  for(int f=0; f<mesh.nFaces; ++f){
+    const std::vector<int> &fv = mesh.faces[f];
+    const int nv = (int)fv.size();
+    if(nv < 3) continue;
+
+    double cx = 0.0, cy = 0.0, cz = 0.0;
+    for(int ii=0; ii<nv; ++ii){
+      const auto &pp = mesh.P[fv[ii]];
+      cx += pp[0]; cy += pp[1]; cz += pp[2];
+    }
+    cx /= (double)nv; cy /= (double)nv; cz /= (double)nv;
+
+    for(int ii=0; ii<nv; ++ii){
+      const auto &pa = mesh.P[fv[ii]];
+      const auto &pb = mesh.P[fv[(ii+1)%nv]];
+
+      const double ax = pa[0] - cx;
+      const double ay = pa[1] - cy;
+      const double az = pa[2] - cz;
+
+      const double bx = pb[0] - cx;
+      const double by = pb[1] - cy;
+      const double bz = pb[2] - cz;
+
+      const double sx = 0.5*(ay*bz - az*by);
+      const double sy = 0.5*(az*bx - ax*bz);
+      const double sz = 0.5*(ax*by - ay*bx);
+
+      const double tx = (cx + pa[0] + pb[0]) / 3.0;
+      const double ty = (cy + pa[1] + pb[1]) / 3.0;
+      const double tz = (cz + pa[2] + pb[2]) / 3.0;
+
+      h_subFace.push_back(f);
+      h_subx.push_back(tx); h_suby.push_back(ty); h_subz.push_back(tz);
+      h_subsx.push_back(sx); h_subsy.push_back(sy); h_subsz.push_back(sz);
+    }
+  }
+
+  dm.nSubTris = (int)h_subFace.size();
+  if(dm.nSubTris > 0){
+    device_alloc(dm.d_subFace, h_subFace.size()); copy_vec_to_device(h_subFace, dm.d_subFace);
+    device_alloc(dm.d_subx, h_subx.size()); copy_vec_to_device(h_subx, dm.d_subx);
+    device_alloc(dm.d_suby, h_suby.size()); copy_vec_to_device(h_suby, dm.d_suby);
+    device_alloc(dm.d_subz, h_subz.size()); copy_vec_to_device(h_subz, dm.d_subz);
+    device_alloc(dm.d_subsx, h_subsx.size()); copy_vec_to_device(h_subsx, dm.d_subsx);
+    device_alloc(dm.d_subsy, h_subsy.size()); copy_vec_to_device(h_subsy, dm.d_subsy);
+    device_alloc(dm.d_subsz, h_subsz.size()); copy_vec_to_device(h_subsz, dm.d_subsz);
+  }
+
   device_alloc(dm.d_owner, mesh.owner.size()); copy_vec_to_device(mesh.owner, dm.d_owner);
   device_alloc(dm.d_neigh, mesh.neigh.size()); copy_vec_to_device(mesh.neigh, dm.d_neigh);
   device_alloc(dm.d_bPatch, mesh.bPatch.size()); copy_vec_to_device(mesh.bPatch, dm.d_bPatch);
@@ -2297,6 +2542,11 @@ static void build_device_mesh(const Mesh &mesh, DeviceMesh &dm){
 }
 
 static void destroy_device_mesh(DeviceMesh &dm){
+  device_free(dm.d_subFace);
+  device_free(dm.d_subx); device_free(dm.d_suby); device_free(dm.d_subz);
+  device_free(dm.d_subsx); device_free(dm.d_subsy); device_free(dm.d_subsz);
+  dm.nSubTris = 0;
+
   device_free(dm.d_owner); device_free(dm.d_neigh); device_free(dm.d_bPatch);
   device_free(dm.d_ccx); device_free(dm.d_ccy); device_free(dm.d_ccz);
   device_free(dm.d_xfx); device_free(dm.d_xfy); device_free(dm.d_xfz);
@@ -2315,6 +2565,61 @@ static DeviceBC make_device_bc(int nFaces, const std::vector<std::string> &bcTyp
   return bc;
 }
 static void destroy_device_bc(DeviceBC &bc){ device_free(bc.d_type); device_free(bc.d_faceValue); bc=DeviceBC{}; }
+
+static void update_runtime_bc_face_values(
+    const Mesh& mesh,
+    const pipebc::LegacyBCMeshView& legacyBCMesh,
+    const std::vector<pipebc::PatchGeometrySummary>& patchGeometryTable,
+    const std::vector<pipebc::VelocityPatchBCSpec>& velocityPatchSpecs,
+    const std::vector<pipebc::PressurePatchBCSpec>& pressurePatchSpecs,
+    double time,
+    int ethierFluxCompatible,
+    int rank,
+    std::vector<std::string>& bcUType,
+    std::vector<std::string>& bcVType,
+    std::vector<std::string>& bcWType,
+    std::vector<std::string>& bcPType,
+    std::vector<double>& uFaceBC,
+    std::vector<double>& vFaceBC,
+    std::vector<double>& wFaceBC,
+    std::vector<double>& pFaceBC,
+    DeviceBC* dbcU,
+    DeviceBC* dbcV,
+    DeviceBC* dbcW,
+    DeviceBC* dbcP)
+{
+  std::fill(bcUType.begin(), bcUType.end(), "Neumann");
+  std::fill(bcVType.begin(), bcVType.end(), "Neumann");
+  std::fill(bcWType.begin(), bcWType.end(), "Neumann");
+  std::fill(bcPType.begin(), bcPType.end(), "Neumann");
+  std::fill(uFaceBC.begin(), uFaceBC.end(), 0.0);
+  std::fill(vFaceBC.begin(), vFaceBC.end(), 0.0);
+  std::fill(wFaceBC.begin(), wFaceBC.end(), 0.0);
+  std::fill(pFaceBC.begin(), pFaceBC.end(), 0.0);
+
+  pipebc::apply_bc_specs_to_legacy_face_arrays(
+      legacyBCMesh, patchGeometryTable,
+      velocityPatchSpecs, pressurePatchSpecs,
+      time,
+      bcUType, bcVType, bcWType, bcPType,
+      uFaceBC, vFaceBC, wFaceBC, pFaceBC);
+
+  if(ethierFluxCompatible){
+    const double before = ethier_boundary_volume_flux(mesh, uFaceBC, vFaceBC, wFaceBC);
+    const double deltaUn = ethier_make_boundary_flux_compatible(
+        mesh, bcUType, bcVType, bcWType, uFaceBC, vFaceBC, wFaceBC);
+    const double after = ethier_boundary_volume_flux(mesh, uFaceBC, vFaceBC, wFaceBC);
+    if(rank == 0){
+      std::printf("Ethier boundary flux compatibility t=%.12e: before=% .12e after=% .12e deltaUn=% .12e\n",
+                  time, before, after, deltaUn);
+    }
+  }
+
+  if(dbcU){ dbcU->faceValue = uFaceBC; copy_vec_to_device(dbcU->faceValue, dbcU->d_faceValue); }
+  if(dbcV){ dbcV->faceValue = vFaceBC; copy_vec_to_device(dbcV->faceValue, dbcV->d_faceValue); }
+  if(dbcW){ dbcW->faceValue = wFaceBC; copy_vec_to_device(dbcW->faceValue, dbcW->d_faceValue); }
+  if(dbcP){ dbcP->faceValue = pFaceBC; copy_vec_to_device(dbcP->faceValue, dbcP->d_faceValue); }
+}
 
 struct DeviceTimeSineVelocityBC {
   int nFaces = 0;
@@ -2649,6 +2954,185 @@ static void compute_pressure_gradient_gpu(const Params &par, const DeviceGradien
   if(par.pGradScheme == 1) compute_gauss_linear_gradient_gpu(dm, bc, d_phi, d_gx, d_gy, d_gz);
   else compute_lsq_gradient_gpu(gop, dm, bc, d_phi, d_gx, d_gy, d_gz);
 }
+
+
+__global__ static void kernel_fill_ethier_exact_pressure_gradient(
+    int nCells,
+    const double *ccx, const double *ccy, const double *ccz,
+    double time,
+    double *gx, double *gy, double *gz)
+{
+  const int c = blockIdx.x*blockDim.x + threadIdx.x;
+  if(c >= nCells) return;
+
+  const double x = ccx[c];
+  const double y = ccy[c];
+  const double z = ccz[c];
+
+  const double a = 0.78539816339744830962;   // pi/4
+  const double d = 1.57079632679489661923;   // pi/2
+  const double E2 = exp(-2.0*d*d*time);
+
+  const double A = a*x + d*y;
+  const double B = a*z + d*x;
+
+  const double C = a*y + d*z;
+  const double D = a*x + d*y;
+
+  const double E = a*z + d*x;
+  const double G = a*y + d*z;
+
+  const double e1 = exp(a*(y+z));
+  const double e2 = exp(a*(z+x));
+  const double e3 = exp(a*(x+y));
+
+  double dFdx = 2.0*a*exp(2.0*a*x);
+  dFdx += 2.0*e1*(a*cos(A)*cos(B) - d*sin(A)*sin(B));
+  dFdx += 2.0*e2*(-a*sin(C)*sin(D) + a*sin(C)*cos(D));
+  dFdx += 2.0*e3*(d*cos(E)*cos(G) + a*sin(E)*cos(G));
+
+  double dFdy = 2.0*a*exp(2.0*a*y);
+  dFdy += 2.0*e1*(d*cos(A)*cos(B) + a*sin(A)*cos(B));
+  dFdy += 2.0*e2*(a*cos(C)*cos(D) - d*sin(C)*sin(D));
+  dFdy += 2.0*e3*(-a*sin(E)*sin(G) + a*sin(E)*cos(G));
+
+  double dFdz = 2.0*a*exp(2.0*a*z);
+  dFdz += 2.0*e1*(-a*sin(A)*sin(B) + a*sin(A)*cos(B));
+  dFdz += 2.0*e2*(d*cos(C)*cos(D) + a*sin(C)*cos(D));
+  dFdz += 2.0*e3*(a*cos(E)*cos(G) - d*sin(E)*sin(G));
+
+  const double pref = -0.5*a*a*E2;
+
+  gx[c] = pref*dFdx;
+  gy[c] = pref*dFdy;
+  gz[c] = pref*dFdz;
+}
+
+static void fill_ethier_exact_pressure_gradient_gpu(
+    const DeviceMesh &dm,
+    double time,
+    double *d_gx, double *d_gy, double *d_gz)
+{
+  const int block = 256;
+  kernel_fill_ethier_exact_pressure_gradient<<<(dm.nCells + block - 1)/block, block>>>(
+      dm.nCells, dm.d_ccx, dm.d_ccy, dm.d_ccz,
+      time, d_gx, d_gy, d_gz);
+  CUDA_CHECK_LAST();
+}
+
+
+__global__ static void kernel_fill_ethier_exact_coupled_x(
+    int nCells,
+    const double *ccx, const double *ccy, const double *ccz,
+    double time,
+    double *xExact)
+{
+  const int c = blockIdx.x*blockDim.x + threadIdx.x;
+  if(c >= nCells) return;
+
+  const double x = ccx[c];
+  const double y = ccy[c];
+  const double z = ccz[c];
+
+  const double a = 0.78539816339744830962;   // pi/4
+  const double d = 1.57079632679489661923;   // pi/2
+
+  const double E1 = exp(-d*d*time);
+  const double E2 = exp(-2.0*d*d*time);
+
+  const double u = -a*(exp(a*x)*sin(a*y+d*z)
+                    + exp(a*z)*cos(a*x+d*y))*E1;
+
+  const double v = -a*(exp(a*y)*sin(a*z+d*x)
+                    + exp(a*x)*cos(a*y+d*z))*E1;
+
+  const double w = -a*(exp(a*z)*sin(a*x+d*y)
+                    + exp(a*y)*cos(a*z+d*x))*E1;
+
+  const double pr = -0.5*a*a*(
+      exp(2.0*a*x) + exp(2.0*a*y) + exp(2.0*a*z)
+    + 2.0*sin(a*x+d*y)*cos(a*z+d*x)*exp(a*(y+z))
+    + 2.0*sin(a*y+d*z)*cos(a*x+d*y)*exp(a*(z+x))
+    + 2.0*sin(a*z+d*x)*cos(a*y+d*z)*exp(a*(x+y))
+  )*E2;
+
+  xExact[4*c + 0] = u;
+  xExact[4*c + 1] = v;
+  xExact[4*c + 2] = w;
+  xExact[4*c + 3] = pr;
+}
+
+__global__ static void kernel_fill_ethier_exact_fields_cellwise(
+    int nCells,
+    const double *ccx, const double *ccy, const double *ccz,
+    double time,
+    double *u, double *v, double *w, double *pr)
+{
+  const int c = blockIdx.x*blockDim.x + threadIdx.x;
+  if(c >= nCells) return;
+
+  const double x = ccx[c];
+  const double y = ccy[c];
+  const double z = ccz[c];
+
+  const double a = 0.78539816339744830962;
+  const double d = 1.57079632679489661923;
+
+  const double E1 = exp(-d*d*time);
+  const double E2 = exp(-2.0*d*d*time);
+
+  u[c] = -a*(exp(a*x)*sin(a*y+d*z)
+          + exp(a*z)*cos(a*x+d*y))*E1;
+
+  v[c] = -a*(exp(a*y)*sin(a*z+d*x)
+          + exp(a*x)*cos(a*y+d*z))*E1;
+
+  w[c] = -a*(exp(a*z)*sin(a*x+d*y)
+          + exp(a*y)*cos(a*z+d*x))*E1;
+
+  pr[c] = -0.5*a*a*(
+      exp(2.0*a*x) + exp(2.0*a*y) + exp(2.0*a*z)
+    + 2.0*sin(a*x+d*y)*cos(a*z+d*x)*exp(a*(y+z))
+    + 2.0*sin(a*y+d*z)*cos(a*x+d*y)*exp(a*(z+x))
+    + 2.0*sin(a*z+d*x)*cos(a*y+d*z)*exp(a*(x+y))
+  )*E2;
+}
+
+__global__ static void kernel_exact_pressure_row_residual(
+    int nCells,
+    const int *rowOffsets,
+    const int *cols,
+    const HYPRE_Complex *vals,
+    const HYPRE_Complex *rhs,
+    const double *xExact,
+    double *pRowResidual)
+{
+  const int c = blockIdx.x*blockDim.x + threadIdx.x;
+  if(c >= nCells) return;
+
+  const int row = 4*c + 3;
+  double r = 0.0;
+
+  for(int k=rowOffsets[row]; k<rowOffsets[row+1]; ++k){
+    r += ((double)vals[k]) * xExact[cols[k]];
+  }
+
+  r -= (double)rhs[row];
+  pRowResidual[c] = r;
+}
+
+static void fill_ethier_exact_fields_cellwise_gpu(
+    const DeviceMesh &dm,
+    double time,
+    double *d_u, double *d_v, double *d_w, double *d_p)
+{
+  const int block = 256;
+  kernel_fill_ethier_exact_fields_cellwise<<<(dm.nCells + block - 1)/block, block>>>(
+      dm.nCells, dm.d_ccx, dm.d_ccy, dm.d_ccz,
+      time, d_u, d_v, d_w, d_p);
+  CUDA_CHECK_LAST();
+}
+
 
 static double maxabs_device(const double *d_x, int n, double *d_reduce, int reduceSize){
   const int block = 256;
@@ -3164,7 +3648,7 @@ __global__ static void kernel_correct_face_fluxes_simple_nonorth(
       double dz = xfz[f] - ccz[P];
       double dpn = nfx[f]*dx + nfy[f]*dy + nfz[f]*dz;
       (void)dpn;
-      double coeff = pCoeffScale * rho * Af[f] * rAU[P] * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
+      double coeff = (pCoeffScale * g_coupledRcBoundaryScale) * rho * Af[f] * rAU[P] * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
       // Matrix-consistent fixed-pressure boundary flux.  Zero-gradient
       // boundaries are handled by the else branch below and have pEqnFlux=0.
       double pEqnFlux = coeff*(pFaceBC[f] - pCorr[P]) + nonOrthScale * phiNonOrth[f];
@@ -3509,7 +3993,7 @@ __global__ static void kernel_pressure_boundary_faces_rau(
   double dz = xfz[f] - ccz[P];
   double dpn = nfx[f]*dx + nfy[f]*dy + nfz[f]*dz;
   (void)dpn;
-  double coeff = pCoeffScale * rho * Af[f] * rAU[P] * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
+  double coeff = (pCoeffScale * g_coupledRcBoundaryScale) * rho * Af[f] * rAU[P] * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
   hypreAtomicAdd(&vals[diagPos[P]], (HYPRE_Complex)coeff);
 }
 
@@ -5661,7 +6145,19 @@ __global__ static void kernel_extract_rAU_from_coupled(
   int c = blockIdx.x*blockDim.x + threadIdx.x;
   if(c < nCells){
     const int rowU = 4*c + 0;
-    const double a = ((double)vals[diagPos[rowU]]) * diagScale;
+    const int rowV = 4*c + 1;
+    const int rowW = 4*c + 2;
+
+    const double aU = ((double)vals[diagPos[rowU]]) * diagScale;
+    const double aV = ((double)vals[diagPos[rowV]]) * diagScale;
+    const double aW = ((double)vals[diagPos[rowW]]) * diagScale;
+
+    // mode 0: original U-row-only rAU
+    // mode 1: diagnostic scalar average of U/V/W momentum diagonals
+    const double a = (g_coupledRauDiagMode == 1)
+        ? (aU + aV + aW) / 3.0
+        : aU;
+
     rAU[c] = (fabs(a) > 1.0e-30) ? rAUScale * vol[c] / a : 0.0;
   }
 }
@@ -5800,6 +6296,7 @@ __global__ static void kernel_coupled_momentum_component_internal_faces_phi(
     const double *uConv, const double *vConv, const double *wConv,
     const double *phiConv, int usePhiConv,
     double rho, double mu, double corrPsi, int momentumConvectionScheme,
+    double faceSkewScale,
     const int *rowOffsets,
     const int *slotPP, const int *slotPN, const int *slotNP, const int *slotNN,
     HYPRE_Complex *vals, HYPRE_Complex *rhs)
@@ -5834,6 +6331,17 @@ __global__ static void kernel_coupled_momentum_component_internal_faces_phi(
   const double gradfz = (1.0-lam)*gradQz[P] + lam*gradQz[N];
   const double corr = corrPsi * (gradfx*tcorx + gradfy*tcory + gradfz*tcorz);
 
+  // ANABASIS_COUPLED_FACE_SKEW_SAFE_PATCH
+  // Deferred correction for skewed polyhedral faces:
+  // q_f = q_lin + grad(q)_f dot (x_f - x_lin).
+  const double xlinx = ccx[P] + lam*dx;
+  const double xliny = ccy[P] + lam*dy;
+  const double xlinz = ccz[P] + lam*dz;
+  const double skx = xfx[f] - xlinx;
+  const double sky = xfy[f] - xliny;
+  const double skz = xfz[f] - xlinz;
+  const double qSkew = faceSkewScale * (gradfx*skx + gradfy*sky + gradfz*skz);
+
   double F = 0.0;
   if(momentumConvectionScheme == 2){
     F = 0.0;
@@ -5855,6 +6363,14 @@ __global__ static void kernel_coupled_momentum_component_internal_faces_phi(
     cPN += F*lam;
     cNP -= F*(1.0-lam);
     cNN -= F*lam;
+
+    // Known deferred convective contribution div(phi*qSkew).
+    // Owner row sees +F*qSkew, neighbour row sees -F*qSkew.
+    // Move known LHS contribution to RHS.
+    if(faceSkewScale != 0.0){
+      hypreAtomicAdd(&rhs[4*P + rowVar], (HYPRE_Complex)(-F*qSkew));
+      hypreAtomicAdd(&rhs[4*N + rowVar], (HYPRE_Complex)(+F*qSkew));
+    }
   }
 
   hypreAtomicAdd(&vals[coupled_pos(rowOffsets, P, rowVar, slotPP[f], rowVar)], (HYPRE_Complex)( alpha + cPP));
@@ -6048,9 +6564,11 @@ __global__ static void kernel_coupled_pressure_gradient_internal_faces(
     const double *ccx, const double *ccy, const double *ccz,
     const double *xfx, const double *xfy, const double *xfz,
     const double *sfx, const double *sfy, const double *sfz,
+    const double *gradPx, const double *gradPy, const double *gradPz,
+    double faceSkewScale,
     const int *rowOffsets,
     const int *slotPP, const int *slotPN, const int *slotNP, const int *slotNN,
-    HYPRE_Complex *vals)
+    HYPRE_Complex *vals, HYPRE_Complex *rhs)
 {
   const int f = blockIdx.x*blockDim.x + threadIdx.x;
   if(f >= nInternalFaces) return;
@@ -6063,6 +6581,18 @@ __global__ static void kernel_coupled_pressure_gradient_internal_faces(
   double lam = ((xfx[f]-ccx[P])*dx + (xfy[f]-ccy[P])*dy + (xfz[f]-ccz[P])*dz) / (denom > 1.0e-30 ? denom : 1.0e-30);
   lam = fmin(1.0, fmax(0.0, lam));
 
+  const double xlinx = ccx[P] + lam*dx;
+  const double xliny = ccy[P] + lam*dy;
+  const double xlinz = ccz[P] + lam*dz;
+  const double skx = xfx[f] - xlinx;
+  const double sky = xfy[f] - xliny;
+  const double skz = xfz[f] - xlinz;
+
+  const double gpx = (1.0-lam)*gradPx[P] + lam*gradPx[N];
+  const double gpy = (1.0-lam)*gradPy[P] + lam*gradPy[N];
+  const double gpz = (1.0-lam)*gradPz[P] + lam*gradPz[N];
+  const double pSkew = faceSkewScale * (gpx*skx + gpy*sky + gpz*skz);
+
   const double S[3] = {sfx[f], sfy[f], sfz[f]};
   for(int rv=0; rv<3; ++rv){
     const double cP = (1.0-lam)*S[rv];
@@ -6071,6 +6601,14 @@ __global__ static void kernel_coupled_pressure_gradient_internal_faces(
     hypreAtomicAdd(&vals[coupled_pos(rowOffsets, P, rv, slotPN[f], 3)], (HYPRE_Complex)cN);
     hypreAtomicAdd(&vals[coupled_pos(rowOffsets, N, rv, slotNP[f], 3)], (HYPRE_Complex)(-cP));
     hypreAtomicAdd(&vals[coupled_pos(rowOffsets, N, rv, slotNN[f], 3)], (HYPRE_Complex)(-cN));
+
+    // Known deferred p_f skew contribution:
+    // owner momentum row gets +pSkew*S, neighbour gets -pSkew*S.
+    // Move known LHS contribution to RHS.
+    if(faceSkewScale != 0.0){
+      hypreAtomicAdd(&rhs[4*P + rv], (HYPRE_Complex)(-pSkew*S[rv]));
+      hypreAtomicAdd(&rhs[4*N + rv], (HYPRE_Complex)(+pSkew*S[rv]));
+    }
   }
 }
 
@@ -6114,6 +6652,51 @@ __global__ static void kernel_coupled_pressure_gradient_boundary_zero_gradient_w
   for(int rv=0; rv<3; ++rv){
     hypreAtomicAdd(&vals[coupled_pos(rowOffsets, P, rv, s, 3)], (HYPRE_Complex)S[rv]);
   }
+}
+
+
+__device__ __forceinline__ double ethier_exact_pressure_device(
+    double x, double y, double z, double t, double a, double d)
+{
+  const double E2 = exp(-2.0*d*d*t);
+  return -0.5*a*a * (
+        exp(2.0*a*x) + exp(2.0*a*y) + exp(2.0*a*z)
+      + 2.0*sin(a*x + d*y)*cos(a*z + d*x)*exp(a*(y+z))
+      + 2.0*sin(a*y + d*z)*cos(a*x + d*y)*exp(a*(z+x))
+      + 2.0*sin(a*z + d*x)*cos(a*y + d*z)*exp(a*(x+y))
+      ) * E2;
+}
+
+// Experimental Ethier-only pressure Dirichlet quadrature on subtriangles.
+// This replaces parent-face pBC*S in the Gauss pressure-gradient boundary block with
+//   sum_q p_exact(x_q,t) S_q
+// for boundary subtriangles q.  It is selected only when
+// ANABASIS_COUPLED_SUBTRI_PRESSURE_BC=1.
+__global__ static void kernel_coupled_pressure_gradient_boundary_subtris_ethier(
+    int nSubTris, int faceStart,
+    const int *subFace,
+    const double *subx, const double *suby, const double *subz,
+    const double *subsx, const double *subsy, const double *subsz,
+    const int *owner, const int *bPatch,
+    const int *bcPType,
+    double time, double ethierA, double ethierD,
+    HYPRE_Complex *rhs)
+{
+  const int q = blockIdx.x*blockDim.x + threadIdx.x;
+  if(q >= nSubTris) return;
+
+  const int f = subFace[q];
+  if(f < faceStart) return;
+
+  const int patch = bPatch[f] - 1;
+  if(patch < 0 || bcPType[patch] != 1) return;
+
+  const int P = owner[f];
+  const double pf = ethier_exact_pressure_device(subx[q], suby[q], subz[q],
+                                                 time, ethierA, ethierD);
+  hypreAtomicAdd(&rhs[4*P + 0], (HYPRE_Complex)(-pf * subsx[q]));
+  hypreAtomicAdd(&rhs[4*P + 1], (HYPRE_Complex)(-pf * subsy[q]));
+  hypreAtomicAdd(&rhs[4*P + 2], (HYPRE_Complex)(-pf * subsz[q]));
 }
 
 __global__ static void kernel_coupled_continuity_velocity_internal_faces(
@@ -6182,6 +6765,174 @@ __global__ static void kernel_coupled_continuity_velocity_boundary_faces(
 }
 
 
+__global__ static void kernel_coupled_continuity_velocity_internal_subtris(
+    int nSubTris, int nInternalFaces,
+    const int *subFace,
+    const double *subx, const double *suby, const double *subz,
+    const double *subsx, const double *subsy, const double *subsz,
+    const int *owner, const int *neigh,
+    const double *ccx, const double *ccy, const double *ccz,
+    double rho,
+    const int *rowOffsets,
+    const int *slotPP, const int *slotPN, const int *slotNP, const int *slotNN,
+    HYPRE_Complex *vals)
+{
+  const int q = blockIdx.x*blockDim.x + threadIdx.x;
+  if(q >= nSubTris) return;
+
+  const int f = subFace[q];
+  if(f >= nInternalFaces) return;
+
+  const int P = owner[f];
+  const int N = neigh[f];
+
+  const double dx = ccx[N] - ccx[P];
+  const double dy = ccy[N] - ccy[P];
+  const double dz = ccz[N] - ccz[P];
+  const double denom = fmax(dx*dx + dy*dy + dz*dz, 1.0e-30);
+
+  double lam = ((subx[q]-ccx[P])*dx + (suby[q]-ccy[P])*dy + (subz[q]-ccz[P])*dz) / denom;
+  lam = fmin(1.0, fmax(0.0, lam));
+
+  const double S[3] = {subsx[q], subsy[q], subsz[q]};
+
+  for(int cv=0; cv<3; ++cv){
+    const double cP = rho*S[cv]*(1.0-lam);
+    const double cN = rho*S[cv]*lam;
+
+    hypreAtomicAdd(&vals[coupled_pos(rowOffsets, P, 3, slotPP[f], cv)], (HYPRE_Complex)cP);
+    hypreAtomicAdd(&vals[coupled_pos(rowOffsets, P, 3, slotPN[f], cv)], (HYPRE_Complex)cN);
+    hypreAtomicAdd(&vals[coupled_pos(rowOffsets, N, 3, slotNP[f], cv)], (HYPRE_Complex)(-cP));
+    hypreAtomicAdd(&vals[coupled_pos(rowOffsets, N, 3, slotNN[f], cv)], (HYPRE_Complex)(-cN));
+  }
+}
+
+__global__ static void kernel_coupled_continuity_velocity_boundary_subtris(
+    int nSubTris, int faceStart,
+    const int *subFace,
+    const double *subsx, const double *subsy, const double *subsz,
+    const int *owner, const int *bPatch,
+    double rho,
+    const int *bcUType, const double *uFaceBC,
+    const int *bcVType, const double *vFaceBC,
+    const int *bcWType, const double *wFaceBC,
+    const int *rowOffsets, const int *cellSelfSlot,
+    HYPRE_Complex *vals, HYPRE_Complex *rhs)
+{
+  const int q = blockIdx.x*blockDim.x + threadIdx.x;
+  if(q >= nSubTris) return;
+
+  const int f = subFace[q];
+  if(f < faceStart) return;
+
+  const int P = owner[f];
+  const int patch = bPatch[f] - 1;
+  if(patch < 0) return;
+
+  const int row = 4*P + 3;
+  const int s = cellSelfSlot[P];
+
+  const double S[3] = {subsx[q], subsy[q], subsz[q]};
+  const int *bcT[3] = {bcUType, bcVType, bcWType};
+  const double *bcVv[3] = {uFaceBC, vFaceBC, wFaceBC};
+
+  for(int cv=0; cv<3; ++cv){
+    const double coeff = rho*S[cv];
+    if(bcT[cv][patch] == 1){
+      // Parent-face Dirichlet value part. Tangential/subface correction is
+      // added separately by kernel_coupled_continuity_velocity_boundary_subtri_skew_rhs_component.
+      hypreAtomicAdd(&rhs[row], (HYPRE_Complex)(-coeff*bcVv[cv][f]));
+    } else {
+      hypreAtomicAdd(&vals[coupled_pos(rowOffsets, P, 3, s, cv)], (HYPRE_Complex)coeff);
+    }
+  }
+}
+
+__global__ static void kernel_coupled_continuity_velocity_internal_subtri_skew_rhs_component(
+    int nSubTris, int nInternalFaces, int comp,
+    const int *subFace,
+    const double *subx, const double *suby, const double *subz,
+    const double *subsx, const double *subsy, const double *subsz,
+    const int *owner, const int *neigh,
+    const double *ccx, const double *ccy, const double *ccz,
+    const double *gradx, const double *grady, const double *gradz,
+    double rho, double faceSkewScale,
+    HYPRE_Complex *rhs)
+{
+  const int q = blockIdx.x*blockDim.x + threadIdx.x;
+  if(q >= nSubTris) return;
+
+  const int f = subFace[q];
+  if(f >= nInternalFaces) return;
+
+  const int P = owner[f];
+  const int N = neigh[f];
+
+  const double dx = ccx[N] - ccx[P];
+  const double dy = ccy[N] - ccy[P];
+  const double dz = ccz[N] - ccz[P];
+  const double denom = fmax(dx*dx + dy*dy + dz*dz, 1.0e-30);
+
+  double lam = ((subx[q]-ccx[P])*dx + (suby[q]-ccy[P])*dy + (subz[q]-ccz[P])*dz) / denom;
+  lam = fmin(1.0, fmax(0.0, lam));
+
+  const double xlinx = ccx[P] + lam*dx;
+  const double xliny = ccy[P] + lam*dy;
+  const double xlinz = ccz[P] + lam*dz;
+
+  const double skx = subx[q] - xlinx;
+  const double sky = suby[q] - xliny;
+  const double skz = subz[q] - xlinz;
+
+  const double gx = (1.0-lam)*gradx[P] + lam*gradx[N];
+  const double gy = (1.0-lam)*grady[P] + lam*grady[N];
+  const double gz = (1.0-lam)*gradz[P] + lam*gradz[N];
+
+  const double qSkew = faceSkewScale * (gx*skx + gy*sky + gz*skz);
+  const double Scomp = (comp == 0 ? subsx[q] : (comp == 1 ? subsy[q] : subsz[q]));
+  const double flux = rho * qSkew * Scomp;
+
+  // Matrix row is div(phi)=RHS. Skew flux is known and added to LHS,
+  // so move it to RHS with opposite sign.
+  hypreAtomicAdd(&rhs[4*P + 3], (HYPRE_Complex)(-flux));
+  hypreAtomicAdd(&rhs[4*N + 3], (HYPRE_Complex)(+flux));
+}
+
+__global__ static void kernel_coupled_continuity_velocity_boundary_subtri_skew_rhs_component(
+    int nSubTris, int faceStart, int comp,
+    const int *subFace,
+    const double *subx, const double *suby, const double *subz,
+    const double *subsx, const double *subsy, const double *subsz,
+    const int *owner, const int *bPatch,
+    const double *xfx, const double *xfy, const double *xfz,
+    const double *gradx, const double *grady, const double *gradz,
+    const int *bcType,
+    double rho, double faceSkewScale,
+    HYPRE_Complex *rhs)
+{
+  const int q = blockIdx.x*blockDim.x + threadIdx.x;
+  if(q >= nSubTris) return;
+
+  const int f = subFace[q];
+  if(f < faceStart) return;
+
+  const int P = owner[f];
+  const int patch = bPatch[f] - 1;
+  if(patch < 0 || bcType[patch] != 1) return;
+
+  const double skx = subx[q] - xfx[f];
+  const double sky = suby[q] - xfy[f];
+  const double skz = subz[q] - xfz[f];
+
+  const double qSkew = faceSkewScale * (gradx[P]*skx + grady[P]*sky + gradz[P]*skz);
+  const double Scomp = (comp == 0 ? subsx[q] : (comp == 1 ? subsy[q] : subsz[q]));
+  const double flux = rho * qSkew * Scomp;
+
+  hypreAtomicAdd(&rhs[4*P + 3], (HYPRE_Complex)(-flux));
+}
+
+
+
 // Matrix-consistent coupled Rhie-Chow gradient-correction RHS.
 // This adds the explicit +a_f*(gradPbar.d) term from the flux
 //
@@ -6220,11 +6971,31 @@ __global__ static void kernel_coupled_rc_gradcorr_rhs_internal_faces(
   const double coeff = pCoeffScale * rho * Af[f] * rAUf *
       pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
 
-  const double gpx = (1.0-lam)*gradx[P] + lam*gradx[N];
-  const double gpy = (1.0-lam)*grady[P] + lam*grady[N];
-  const double gpz = (1.0-lam)*gradz[P] + lam*gradz[N];
+  // The implicit pressure jump is along the P-N segment.
+  // For the Darwish/Rhie-Chow null-block cancellation, optionally
+  // use the line-midpoint gradient 0.5*(gradP+gradN), not the
+  // face-projection lambda gradient.
+  const double gpwP = g_coupledRcGradMidpoint ? 0.5 : (1.0-lam);
+  const double gpwN = g_coupledRcGradMidpoint ? 0.5 : lam;
+  const double gpx = gpwP*gradx[P] + gpwN*gradx[N];
+  const double gpy = gpwP*grady[P] + gpwN*grady[N];
+  const double gpz = gpwP*gradz[P] + gpwN*gradz[N];
 
-  const double gradCorrFlux = pNonOrthScale * coeff * (gpx*dx + gpy*dy + gpz*dz);
+  double gradCorrFlux = pNonOrthScale * coeff * (gpx*dx + gpy*dy + gpz*dz);
+
+  // Optional full Darwish non-orthogonal RC source:
+  //   D_f grad(p)_f . S_f  -  coeff * grad(p)_f . d_PN
+  //
+  // The code stores gradCorrFlux in the form used by:
+  //   RHS_owner -= gradCorrFlux
+  //   RHS_neigh += gradCorrFlux
+  //
+  // Therefore the full term is represented as:
+  //   gradCorrFlux = coeff*grad.d - rho*rAUf*grad.S
+  if(g_coupledRcFullNonOrth){
+    const double gradDotS = Af[f] * (gpx*nfx[f] + gpy*nfy[f] + gpz*nfz[f]);
+    gradCorrFlux -= pNonOrthScale * rho * rAUf * gradDotS;
+  }
 
   // owner receives +flux in divergence, neighbour receives -flux.
   // RHS gets -div(gradCorrFlux).
@@ -6264,10 +7035,15 @@ __global__ static void kernel_coupled_rc_gradcorr_rhs_boundary_faces(
   const double dy = xfy[f] - ccy[P];
   const double dz = xfz[f] - ccz[P];
 
-  const double coeff = pCoeffScale * rho * Af[f] * rAU[P] *
+  const double coeff = (pCoeffScale * g_coupledRcBoundaryScale) * rho * Af[f] * rAU[P] *
       pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
 
-  const double gradCorrFlux = pNonOrthScale * coeff * (gradx[P]*dx + grady[P]*dy + gradz[P]*dz);
+  double gradCorrFlux = pNonOrthScale * coeff * (gradx[P]*dx + grady[P]*dy + gradz[P]*dz);
+
+  if(g_coupledRcFullNonOrth){
+    const double gradDotS = Af[f] * (gradx[P]*nfx[f] + grady[P]*nfy[f] + gradz[P]*nfz[f]);
+    gradCorrFlux -= pNonOrthScale * rho * rAU[P] * gradDotS;
+  }
 
   hypreAtomicAdd(&rhs[4*P + 3], (HYPRE_Complex)(-gradCorrFlux));
 }
@@ -6442,13 +7218,106 @@ __global__ static void kernel_coupled_rc_gradcorr_implicit_boundary_faces(
   const double dy = xfy[f] - ccy[P];
   const double dz = xfz[f] - ccz[P];
 
-  const double coeff = pCoeffScale * rho * Af[f] * rAU[P] *
+  const double coeff = (pCoeffScale * g_coupledRcBoundaryScale) * rho * Af[f] * rAU[P] *
       pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
 
   coupled_add_lsq_gradcorr_cell_to_pressure_row(P, +1.0, P, 1.0, coeff, dx, dy, dz,
       offsets, src, face, cx, cy, cz, bPatch, bcPType, pFaceBC, pOld,
       rowOffsets, cols, vals, rhs);
 }
+
+
+
+__global__ static void kernel_coupled_continuity_velocity_skew_rhs_component(
+    int nInternalFaces, int cv,
+    const int *owner, const int *neigh,
+    const double *ccx, const double *ccy, const double *ccz,
+    const double *xfx, const double *xfy, const double *xfz,
+    const double *nfx, const double *nfy, const double *nfz,
+    const double *Af,
+    const double *gradQx, const double *gradQy, const double *gradQz,
+    double rho, double faceSkewScale,
+    HYPRE_Complex *rhs)
+{
+  const int f = blockIdx.x*blockDim.x + threadIdx.x;
+  if(f >= nInternalFaces || faceSkewScale == 0.0) return;
+
+  const int P = owner[f];
+  const int N = neigh[f];
+
+  const double dx = ccx[N] - ccx[P];
+  const double dy = ccy[N] - ccy[P];
+  const double dz = ccz[N] - ccz[P];
+  const double denom = fmax(dx*dx + dy*dy + dz*dz, 1.0e-30);
+
+  double lam = ((xfx[f]-ccx[P])*dx + (xfy[f]-ccy[P])*dy + (xfz[f]-ccz[P])*dz) / denom;
+  lam = fmin(1.0, fmax(0.0, lam));
+
+  const double xlinx = ccx[P] + lam*dx;
+  const double xliny = ccy[P] + lam*dy;
+  const double xlinz = ccz[P] + lam*dz;
+
+  const double skx = xfx[f] - xlinx;
+  const double sky = xfy[f] - xliny;
+  const double skz = xfz[f] - xlinz;
+
+  const double gx = (1.0-lam)*gradQx[P] + lam*gradQx[N];
+  const double gy = (1.0-lam)*gradQy[P] + lam*gradQy[N];
+  const double gz = (1.0-lam)*gradQz[P] + lam*gradQz[N];
+
+  const double qSkew = faceSkewScale * (gx*skx + gy*sky + gz*skz);
+  const double ncomp = (cv == 0 ? nfx[f] : (cv == 1 ? nfy[f] : nfz[f]));
+  const double fluxSkew = rho * Af[f] * ncomp * qSkew;
+
+  // Owner continuity row gets +fluxSkew, neighbour gets -fluxSkew.
+  // Move known LHS contribution to RHS.
+  hypreAtomicAdd(&rhs[4*P + 3], (HYPRE_Complex)(-fluxSkew));
+  hypreAtomicAdd(&rhs[4*N + 3], (HYPRE_Complex)(+fluxSkew));
+}
+
+__global__ static void kernel_add_phi_velocity_skew_component(
+    int nInternalFaces, int cv,
+    const int *owner, const int *neigh,
+    const double *ccx, const double *ccy, const double *ccz,
+    const double *xfx, const double *xfy, const double *xfz,
+    const double *nfx, const double *nfy, const double *nfz,
+    const double *Af,
+    const double *gradQx, const double *gradQy, const double *gradQz,
+    double rho, double faceSkewScale,
+    double *phi)
+{
+  const int f = blockIdx.x*blockDim.x + threadIdx.x;
+  if(f >= nInternalFaces || faceSkewScale == 0.0) return;
+
+  const int P = owner[f];
+  const int N = neigh[f];
+
+  const double dx = ccx[N] - ccx[P];
+  const double dy = ccy[N] - ccy[P];
+  const double dz = ccz[N] - ccz[P];
+  const double denom = fmax(dx*dx + dy*dy + dz*dz, 1.0e-30);
+
+  double lam = ((xfx[f]-ccx[P])*dx + (xfy[f]-ccy[P])*dy + (xfz[f]-ccz[P])*dz) / denom;
+  lam = fmin(1.0, fmax(0.0, lam));
+
+  const double xlinx = ccx[P] + lam*dx;
+  const double xliny = ccy[P] + lam*dy;
+  const double xlinz = ccz[P] + lam*dz;
+
+  const double skx = xfx[f] - xlinx;
+  const double sky = xfy[f] - xliny;
+  const double skz = xfz[f] - xlinz;
+
+  const double gx = (1.0-lam)*gradQx[P] + lam*gradQx[N];
+  const double gy = (1.0-lam)*gradQy[P] + lam*gradQy[N];
+  const double gz = (1.0-lam)*gradQz[P] + lam*gradQz[N];
+
+  const double qSkew = faceSkewScale * (gx*skx + gy*sky + gz*skz);
+  const double ncomp = (cv == 0 ? nfx[f] : (cv == 1 ? nfy[f] : nfz[f]));
+
+  phi[f] += rho * Af[f] * ncomp * qSkew;
+}
+
 
 __global__ static void kernel_build_coupled_matrix_consistent_flux(
     int nFaces, int nInternalFaces,
@@ -6491,16 +7360,38 @@ __global__ static void kernel_build_coupled_matrix_consistent_flux(
 
     double phif = rho * Af[f] * (uf*nfx[f] + vf*nfy[f] + wf*nfz[f]);
 
-    if(rcMode == 0){
+    {
       const double rAUf = (1.0-lam)*rAU[P] + lam*rAU[N];
       const double coeff = pCoeffScale * rho * Af[f] * rAUf *
           pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
 
-      const double gpx = (1.0-lam)*gradx[P] + lam*gradx[N];
-      const double gpy = (1.0-lam)*grady[P] + lam*grady[N];
-      const double gpz = (1.0-lam)*gradz[P] + lam*gradz[N];
+      // The coupled continuity matrix always contains the pressure-difference
+      // term. rcMode only controls the extra explicit non-orthogonal/LSQ
+      // grad(p).d consistency correction.
+      double gradCorr = 0.0;
+      if(rcMode == 0 && pNonOrthScale != 0.0){
+        // The implicit pressure jump is along the P-N segment.
+        // For the Darwish/Rhie-Chow null-block cancellation, optionally
+        // use the line-midpoint gradient 0.5*(gradP+gradN), not the
+        // face-projection lambda gradient.
+        const double gpwP = g_coupledRcGradMidpoint ? 0.5 : (1.0-lam);
+        const double gpwN = g_coupledRcGradMidpoint ? 0.5 : lam;
+        const double gpx = gpwP*gradx[P] + gpwN*gradx[N];
+        const double gpy = gpwP*grady[P] + gpwN*grady[N];
+        const double gpz = gpwP*gradz[P] + gpwN*gradz[N];
+        gradCorr = pNonOrthScale*(gpx*dx + gpy*dy + gpz*dz);
 
-      phif += -coeff * ((p[N] - p[P]) - pNonOrthScale*(gpx*dx + gpy*dy + gpz*dz));
+        if(g_coupledRcFullNonOrth){
+          const double rAUf2 = (1.0-lam)*rAU[P] + lam*rAU[N];
+          const double gradDotS = Af[f] * (gpx*nfx[f] + gpy*nfy[f] + gpz*nfz[f]);
+          const double DgS = pNonOrthScale * rho * rAUf2 * gradDotS;
+          if(fabs(coeff) > 1.0e-300){
+            gradCorr -= DgS / coeff;
+          }
+        }
+      }
+
+      phif += -coeff * ((p[N] - p[P]) - gradCorr);
     }
 
     phi[f] = phif;
@@ -6514,15 +7405,28 @@ __global__ static void kernel_build_coupled_matrix_consistent_flux(
 
     double phif = rho * Af[f] * (uf*nfx[f] + vf*nfy[f] + wf*nfz[f]);
 
-    if(rcMode == 0 && patch >= 0 && bcPType[patch] == 1){
+    if(patch >= 0 && bcPType[patch] == 1){
       const double dx = xfx[f] - ccx[P];
       const double dy = xfy[f] - ccy[P];
       const double dz = xfz[f] - ccz[P];
 
-      const double coeff = pCoeffScale * rho * Af[f] * rAU[P] *
+      const double coeff = (pCoeffScale * g_coupledRcBoundaryScale) * rho * Af[f] * rAU[P] *
           pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
 
-      phif += -coeff * ((pFaceBC[f] - p[P]) - pNonOrthScale*(gradx[P]*dx + grady[P]*dy + gradz[P]*dz));
+      double gradCorr = 0.0;
+      if(rcMode == 0 && pNonOrthScale != 0.0){
+        gradCorr = pNonOrthScale*(gradx[P]*dx + grady[P]*dy + gradz[P]*dz);
+
+        if(g_coupledRcFullNonOrth){
+          const double gradDotS = Af[f] * (gradx[P]*nfx[f] + grady[P]*nfy[f] + gradz[P]*nfz[f]);
+          const double DgS = pNonOrthScale * rho * rAU[P] * gradDotS;
+          if(fabs(coeff) > 1.0e-300){
+            gradCorr -= DgS / coeff;
+          }
+        }
+      }
+
+      phif += -coeff * ((pFaceBC[f] - p[P]) - gradCorr);
     }
 
     phi[f] = phif;
@@ -6581,10 +7485,112 @@ __global__ static void kernel_coupled_rc_pressure_boundary_faces(
   const double dx = xfx[f] - ccx[P];
   const double dy = xfy[f] - ccy[P];
   const double dz = xfz[f] - ccz[P];
-  const double coeff = pCoeffScale * rho * Af[f] * rAU[P] * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
+  const double coeff = (pCoeffScale * g_coupledRcBoundaryScale) * rho * Af[f] * rAU[P] * pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
   const int prow = 4*P + 3;
   hypreAtomicAdd(&vals[diagPos[prow]], (HYPRE_Complex)coeff);
   hypreAtomicAdd(&rhs[prow], (HYPRE_Complex)(coeff * pFaceBC[f]));
+}
+
+
+
+// Experimental Ethier-only subtriangle quadrature for fixed-pressure RC boundary rows.
+// Parent-face form is coeff*(pBC - pP).  This variant sums over boundary
+// subtriangles with pBC = p_exact(x_subtri,t) and local area/normal/delta.
+__global__ static void kernel_coupled_rc_pressure_boundary_subtris_ethier(
+    int nSubTris, int faceStart,
+    const int *subFace,
+    const double *subx, const double *suby, const double *subz,
+    const double *subsx, const double *subsy, const double *subsz,
+    const int *owner, const int *bPatch,
+    const double *ccx, const double *ccy, const double *ccz,
+    const double *rAU,
+    double rho, double pCoeffScale,
+    const int *bcPType,
+    double time, double ethierA, double ethierD,
+    const int *diagPos,
+    HYPRE_Complex *vals, HYPRE_Complex *rhs)
+{
+  const int q = blockIdx.x*blockDim.x + threadIdx.x;
+  if(q >= nSubTris) return;
+
+  const int f = subFace[q];
+  if(f < faceStart) return;
+
+  const int patch = bPatch[f] - 1;
+  if(patch < 0 || bcPType[patch] != 1) return;
+
+  const int P = owner[f];
+  const double dx = subx[q] - ccx[P];
+  const double dy = suby[q] - ccy[P];
+  const double dz = subz[q] - ccz[P];
+
+  const double area = sqrt(subsx[q]*subsx[q] + subsy[q]*subsy[q] + subsz[q]*subsz[q]);
+  if(area <= 1.0e-300) return;
+
+  const double nx = subsx[q] / area;
+  const double ny = subsy[q] / area;
+  const double nz = subsz[q] / area;
+
+  const double coeff = (pCoeffScale * g_coupledRcBoundaryScale) * rho * area * rAU[P] *
+      pressure_delta_coeff_runtime(dx, dy, dz, nx, ny, nz);
+  if(coeff == 0.0) return;
+
+  const double pf = ethier_exact_pressure_device(subx[q], suby[q], subz[q],
+                                                 time, ethierA, ethierD);
+  const int prow = 4*P + 3;
+  hypreAtomicAdd(&vals[diagPos[prow]], (HYPRE_Complex)coeff);
+  hypreAtomicAdd(&rhs[prow], (HYPRE_Complex)(coeff * pf));
+}
+
+// Experimental Ethier-only subtriangle quadrature for the explicit boundary
+// RC grad(p).d correction.  Baseline verified cases use coupledRcGradImplicit=0,
+// so this is the relevant path for the curved-pipe pressure-BC diagnostic.
+__global__ static void kernel_coupled_rc_gradcorr_rhs_boundary_subtris_ethier(
+    int nSubTris, int faceStart,
+    const int *subFace,
+    const double *subx, const double *suby, const double *subz,
+    const double *subsx, const double *subsy, const double *subsz,
+    const int *owner, const int *bPatch,
+    const double *ccx, const double *ccy, const double *ccz,
+    const double *rAU,
+    const int *bcPType,
+    const double *gradx, const double *grady, const double *gradz,
+    double rho, double pCoeffScale, double pNonOrthScale, int rcMode,
+    HYPRE_Complex *rhs)
+{
+  const int q = blockIdx.x*blockDim.x + threadIdx.x;
+  if(q >= nSubTris) return;
+  if(rcMode != 0) return;
+
+  const int f = subFace[q];
+  if(f < faceStart) return;
+
+  const int patch = bPatch[f] - 1;
+  if(patch < 0 || bcPType[patch] != 1) return;
+
+  const int P = owner[f];
+  const double dx = subx[q] - ccx[P];
+  const double dy = suby[q] - ccy[P];
+  const double dz = subz[q] - ccz[P];
+
+  const double area = sqrt(subsx[q]*subsx[q] + subsy[q]*subsy[q] + subsz[q]*subsz[q]);
+  if(area <= 1.0e-300) return;
+
+  const double nx = subsx[q] / area;
+  const double ny = subsy[q] / area;
+  const double nz = subsz[q] / area;
+
+  const double coeff = (pCoeffScale * g_coupledRcBoundaryScale) * rho * area * rAU[P] *
+      pressure_delta_coeff_runtime(dx, dy, dz, nx, ny, nz);
+
+  double gradCorrFlux = pNonOrthScale * coeff * (gradx[P]*dx + grady[P]*dy + gradz[P]*dz);
+
+  if(g_coupledRcFullNonOrth){
+    const double gradDotS = gradx[P]*subsx[q] + grady[P]*subsy[q] + gradz[P]*subsz[q];
+    gradCorrFlux -= pNonOrthScale * rho * rAU[P] * gradDotS;
+  }
+
+  hypreAtomicAdd(&rhs[4*P + 3], (HYPRE_Complex)(-gradCorrFlux));
 }
 
 __global__ static void kernel_coupled_pressure_anchor_fullrow(
@@ -6733,7 +7739,8 @@ static void assemble_coupled_darwish_system(
     const double *d_pGrady,
     const double *d_pGradz,
     bool usePressureAnchor,
-    int refCell)
+    int refCell,
+    double assemblyTime)
 {
   const int block = 256;
   const int gridVals = (cpl.lin.pat.nnz + block - 1)/block;
@@ -6742,6 +7749,76 @@ static void assemble_coupled_darwish_system(
   const int gridFaces = (mesh.nInternalFaces + block - 1)/block;
   const int nBoundaryFaces = mesh.nFaces - mesh.nInternalFaces;
   const int gridBFaces = (nBoundaryFaces + block - 1)/block;
+
+  double faceSkewScale = 0.0;
+  if(const char* envSkew = std::getenv("ANABASIS_COUPLED_FACE_SKEW_CORR")){
+    faceSkewScale = std::atof(envSkew);
+  }
+
+
+  g_coupledSubtriContinuity = 0;
+  if(const char* envSubtri = std::getenv("ANABASIS_COUPLED_SUBTRI_CONTINUITY")){
+    g_coupledSubtriContinuity = std::atoi(envSubtri);
+  }
+  static int subtriContinuityPrinted = 0;
+  if(g_coupledSubtriContinuity && !subtriContinuityPrinted){
+    int subtriRank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &subtriRank);
+    if(subtriRank == 0){
+      std::printf("Coupled continuity uses subtriangle quadrature with deferred velocity-skew RHS.\n");
+    }
+    subtriContinuityPrinted = 1;
+  }
+
+
+  g_coupledSubtriPressureBC = 0;
+  if(const char* envSubtriP = std::getenv("ANABASIS_COUPLED_SUBTRI_PRESSURE_BC")){
+    g_coupledSubtriPressureBC = std::atoi(envSubtriP);
+  }
+  const int useSubtriPressureBC =
+      (g_coupledSubtriPressureBC && par.ethierEnable && par.ethierPressureDirichlet && dm.nSubTris > 0);
+  double subtriPressureBCTime = assemblyTime;
+  if(std::getenv("ANABASIS_ETHIER_EXACT_ASSEMBLY_STATE") &&
+     std::getenv("ANABASIS_ETHIER_EXACT_RESIDUAL_TIME")){
+    subtriPressureBCTime = std::atof(std::getenv("ANABASIS_ETHIER_EXACT_RESIDUAL_TIME"));
+  }
+  static int subtriPressureBCPrinted = 0;
+  if(useSubtriPressureBC && !subtriPressureBCPrinted){
+    int subtriPRank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &subtriPRank);
+    if(subtriPRank == 0){
+      std::printf("Coupled Ethier pressure Dirichlet uses subtriangle boundary quadrature.\n");
+    }
+    subtriPressureBCPrinted = 1;
+  }
+
+  g_coupledRauDiagMode = 0;
+  if(const char* envRau = std::getenv("ANABASIS_COUPLED_RAU_DIAG_MODE")){
+    g_coupledRauDiagMode = std::atoi(envRau);
+  }
+  static int rauDiagModePrinted = 0;
+  if(g_coupledRauDiagMode && !rauDiagModePrinted){
+    int rauDiagRank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rauDiagRank);
+    if(rauDiagRank == 0){
+      std::printf("Coupled rAU extraction mode: average U/V/W momentum diagonals.\n");
+    }
+    rauDiagModePrinted = 1;
+  }
+
+  g_coupledRcGradMidpoint = 0;
+  if(const char* envMid = std::getenv("ANABASIS_COUPLED_RC_GRAD_MIDPOINT")){
+    g_coupledRcGradMidpoint = std::atoi(envMid);
+  }
+  static int rcGradMidpointPrinted = 0;
+  if(g_coupledRcGradMidpoint && !rcGradMidpointPrinted){
+    int rcGradMidpointRank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rcGradMidpointRank);
+    if(rcGradMidpointRank == 0){
+      std::printf("Coupled RC grad-correction uses midpoint line gradient: 0.5*(gradP+gradN).\n");
+    }
+    rcGradMidpointPrinted = 1;
+  }
 
   HYPRE_Complex *Avals = matrix_values_ptr(cpl.lin);
   kernel_zero_values<<<gridVals, block>>>(Avals, cpl.lin.pat.nnz);
@@ -6763,6 +7840,7 @@ static void assemble_coupled_darwish_system(
         d_uOld, d_vOld, d_wOld,
         d_phiConv, usePhiConv,
         par.rho, mu, par.momNonOrthScale, par.momentumConvectionScheme,
+        faceSkewScale,
         cpl.lin.pat.d_rowOffsets,
         cpl.slots.d_slotPP, cpl.slots.d_slotPN, cpl.slots.d_slotNP, cpl.slots.d_slotNN,
         Avals, cpl.lin.d_rhs);
@@ -6803,49 +7881,432 @@ static void assemble_coupled_darwish_system(
     CUDA_CHECK_LAST();
   }
 
-  // Pressure-gradient block Gp:
-  // Use LSQ gradient operator to match SIMPLE's momentum pressure source.
-  // This replaces the first debug Darwish face-Gauss G operator.
-  kernel_coupled_pressure_gradient_lsq_terms<<<gridCells, block>>>(
-      mesh.nCells,
-      gop.d_offsets, gop.d_src, gop.d_face,
-      gop.d_cx, gop.d_cy, gop.d_cz,
-      dm.d_vol,
-      dm.d_owner, dm.d_neigh, dm.d_bPatch,
-      dbcP.d_type, dbcP.d_faceValue,
-      cpl.lin.pat.d_rowOffsets,
-      cpl.lin.pat.d_cols,
-      cpl.slots.d_cellSelfSlot,
-      Avals, cpl.lin.d_rhs);
+  // Pressure-gradient block Gp.
+  //
+  // Diagnostic correction:
+  //   pGradScheme == gauss -> use face-Gauss FV pressure force
+  //   pGradScheme == lsq   -> keep previous LSQ momentum pressure source
+  //
+  // This matters because the pressure/continuity RC block is face-based.
+  // A hardwired LSQ Gp while the case says pGradScheme=gauss can make the
+  // coupled pressure block inconsistent with the requested FV operator.
+  if(par.pGradScheme == 1){
+    kernel_coupled_pressure_gradient_internal_faces<<<gridFaces, block>>>(
+        mesh.nInternalFaces,
+        dm.d_owner, dm.d_neigh,
+        dm.d_ccx, dm.d_ccy, dm.d_ccz,
+        dm.d_xfx, dm.d_xfy, dm.d_xfz,
+        dm.d_sfx, dm.d_sfy, dm.d_sfz,
+        d_pGradx, d_pGrady, d_pGradz,
+        faceSkewScale,
+        cpl.lin.pat.d_rowOffsets,
+        cpl.slots.d_slotPP, cpl.slots.d_slotPN, cpl.slots.d_slotNP, cpl.slots.d_slotNN,
+        Avals, cpl.lin.d_rhs);
+
+    if(useSubtriPressureBC){
+      const int gridSubTrisP = (dm.nSubTris + block - 1) / block;
+      kernel_coupled_pressure_gradient_boundary_subtris_ethier<<<gridSubTrisP, block>>>(
+          dm.nSubTris, mesh.nInternalFaces,
+          dm.d_subFace,
+          dm.d_subx, dm.d_suby, dm.d_subz,
+          dm.d_subsx, dm.d_subsy, dm.d_subsz,
+          dm.d_owner, dm.d_bPatch,
+          dbcP.d_type,
+          subtriPressureBCTime, par.ethierA, par.ethierD,
+          cpl.lin.d_rhs);
+    } else {
+      kernel_coupled_pressure_gradient_boundary_faces<<<gridBFaces, block>>>(
+          nBoundaryFaces, mesh.nInternalFaces,
+          dm.d_owner, dm.d_bPatch,
+          dm.d_sfx, dm.d_sfy, dm.d_sfz,
+          dbcP.d_type, dbcP.d_faceValue,
+          cpl.lin.pat.d_rowOffsets,
+          Avals, cpl.lin.d_rhs);
+    }
+
+    kernel_coupled_pressure_gradient_boundary_zero_gradient_with_slots<<<gridBFaces, block>>>(
+        nBoundaryFaces, mesh.nInternalFaces,
+        dm.d_owner, dm.d_bPatch,
+        dm.d_sfx, dm.d_sfy, dm.d_sfz,
+        dbcP.d_type,
+        cpl.lin.pat.d_rowOffsets, cpl.slots.d_cellSelfSlot,
+        Avals);
+  } else {
+    kernel_coupled_pressure_gradient_lsq_terms<<<gridCells, block>>>(
+        mesh.nCells,
+        gop.d_offsets, gop.d_src, gop.d_face,
+        gop.d_cx, gop.d_cy, gop.d_cz,
+        dm.d_vol,
+        dm.d_owner, dm.d_neigh, dm.d_bPatch,
+        dbcP.d_type, dbcP.d_faceValue,
+        cpl.lin.pat.d_rowOffsets,
+        cpl.lin.pat.d_cols,
+        cpl.slots.d_cellSelfSlot,
+        Avals, cpl.lin.d_rhs);
+  }
   CUDA_CHECK_LAST();
 
-  kernel_coupled_continuity_velocity_internal_faces<<<gridFaces, block>>>(
-      mesh.nInternalFaces,
-      dm.d_owner, dm.d_neigh,
-      dm.d_ccx, dm.d_ccy, dm.d_ccz,
-      dm.d_xfx, dm.d_xfy, dm.d_xfz,
-      dm.d_nfx, dm.d_nfy, dm.d_nfz,
-      dm.d_Af, par.rho,
-      cpl.lin.pat.d_rowOffsets,
-      cpl.slots.d_slotPP, cpl.slots.d_slotPN, cpl.slots.d_slotNP, cpl.slots.d_slotNN,
-      Avals);
-  kernel_coupled_continuity_velocity_boundary_faces<<<gridBFaces, block>>>(
-      nBoundaryFaces, mesh.nInternalFaces,
-      dm.d_owner, dm.d_bPatch,
-      dm.d_nfx, dm.d_nfy, dm.d_nfz,
-      dm.d_Af, par.rho,
-      dbcU.d_type, dbcU.d_faceValue,
-      dbcV.d_type, dbcV.d_faceValue,
-      dbcW.d_type, dbcW.d_faceValue,
-      cpl.lin.pat.d_rowOffsets, cpl.slots.d_cellSelfSlot,
-      Avals, cpl.lin.d_rhs);
-  CUDA_CHECK_LAST();
+  if(g_coupledSubtriContinuity && dm.nSubTris > 0){
+    const int gridSubTris = (dm.nSubTris + block - 1) / block;
 
-  // Extract rAU from the relaxed U block, then assemble K_RC.
-  const double diagScale = (par.rAUMode == 0 && par.uRelax < 0.999999) ? par.uRelax : 1.0;
+    kernel_coupled_continuity_velocity_internal_subtris<<<gridSubTris, block>>>(
+        dm.nSubTris, mesh.nInternalFaces,
+        dm.d_subFace,
+        dm.d_subx, dm.d_suby, dm.d_subz,
+        dm.d_subsx, dm.d_subsy, dm.d_subsz,
+        dm.d_owner, dm.d_neigh,
+        dm.d_ccx, dm.d_ccy, dm.d_ccz,
+        par.rho,
+        cpl.lin.pat.d_rowOffsets,
+        cpl.slots.d_slotPP, cpl.slots.d_slotPN, cpl.slots.d_slotNP, cpl.slots.d_slotNN,
+        Avals);
+
+    kernel_coupled_continuity_velocity_boundary_subtris<<<gridSubTris, block>>>(
+        dm.nSubTris, mesh.nInternalFaces,
+        dm.d_subFace,
+        dm.d_subsx, dm.d_subsy, dm.d_subsz,
+        dm.d_owner, dm.d_bPatch,
+        par.rho,
+        dbcU.d_type, dbcU.d_faceValue,
+        dbcV.d_type, dbcV.d_faceValue,
+        dbcW.d_type, dbcW.d_faceValue,
+        cpl.lin.pat.d_rowOffsets, cpl.slots.d_cellSelfSlot,
+        Avals, cpl.lin.d_rhs);
+    CUDA_CHECK_LAST();
+
+    if(faceSkewScale != 0.0){
+      compute_lsq_gradient_gpu(gop, dm, dbcU, d_uOld,
+                               momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz);
+      kernel_coupled_continuity_velocity_internal_subtri_skew_rhs_component<<<gridSubTris, block>>>(
+          dm.nSubTris, mesh.nInternalFaces, 0,
+          dm.d_subFace,
+          dm.d_subx, dm.d_suby, dm.d_subz,
+          dm.d_subsx, dm.d_subsy, dm.d_subsz,
+          dm.d_owner, dm.d_neigh,
+          dm.d_ccx, dm.d_ccy, dm.d_ccz,
+          momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz,
+          par.rho, faceSkewScale, cpl.lin.d_rhs);
+      kernel_coupled_continuity_velocity_boundary_subtri_skew_rhs_component<<<gridSubTris, block>>>(
+          dm.nSubTris, mesh.nInternalFaces, 0,
+          dm.d_subFace,
+          dm.d_subx, dm.d_suby, dm.d_subz,
+          dm.d_subsx, dm.d_subsy, dm.d_subsz,
+          dm.d_owner, dm.d_bPatch,
+          dm.d_xfx, dm.d_xfy, dm.d_xfz,
+          momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz,
+          dbcU.d_type,
+          par.rho, faceSkewScale, cpl.lin.d_rhs);
+
+      compute_lsq_gradient_gpu(gop, dm, dbcV, d_vOld,
+                               momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz);
+      kernel_coupled_continuity_velocity_internal_subtri_skew_rhs_component<<<gridSubTris, block>>>(
+          dm.nSubTris, mesh.nInternalFaces, 1,
+          dm.d_subFace,
+          dm.d_subx, dm.d_suby, dm.d_subz,
+          dm.d_subsx, dm.d_subsy, dm.d_subsz,
+          dm.d_owner, dm.d_neigh,
+          dm.d_ccx, dm.d_ccy, dm.d_ccz,
+          momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz,
+          par.rho, faceSkewScale, cpl.lin.d_rhs);
+      kernel_coupled_continuity_velocity_boundary_subtri_skew_rhs_component<<<gridSubTris, block>>>(
+          dm.nSubTris, mesh.nInternalFaces, 1,
+          dm.d_subFace,
+          dm.d_subx, dm.d_suby, dm.d_subz,
+          dm.d_subsx, dm.d_subsy, dm.d_subsz,
+          dm.d_owner, dm.d_bPatch,
+          dm.d_xfx, dm.d_xfy, dm.d_xfz,
+          momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz,
+          dbcV.d_type,
+          par.rho, faceSkewScale, cpl.lin.d_rhs);
+
+      compute_lsq_gradient_gpu(gop, dm, dbcW, d_wOld,
+                               momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz);
+      kernel_coupled_continuity_velocity_internal_subtri_skew_rhs_component<<<gridSubTris, block>>>(
+          dm.nSubTris, mesh.nInternalFaces, 2,
+          dm.d_subFace,
+          dm.d_subx, dm.d_suby, dm.d_subz,
+          dm.d_subsx, dm.d_subsy, dm.d_subsz,
+          dm.d_owner, dm.d_neigh,
+          dm.d_ccx, dm.d_ccy, dm.d_ccz,
+          momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz,
+          par.rho, faceSkewScale, cpl.lin.d_rhs);
+      kernel_coupled_continuity_velocity_boundary_subtri_skew_rhs_component<<<gridSubTris, block>>>(
+          dm.nSubTris, mesh.nInternalFaces, 2,
+          dm.d_subFace,
+          dm.d_subx, dm.d_suby, dm.d_subz,
+          dm.d_subsx, dm.d_subsy, dm.d_subsz,
+          dm.d_owner, dm.d_bPatch,
+          dm.d_xfx, dm.d_xfy, dm.d_xfz,
+          momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz,
+          dbcW.d_type,
+          par.rho, faceSkewScale, cpl.lin.d_rhs);
+      CUDA_CHECK_LAST();
+    }
+  } else {
+    kernel_coupled_continuity_velocity_internal_faces<<<gridFaces, block>>>(
+        mesh.nInternalFaces,
+        dm.d_owner, dm.d_neigh,
+        dm.d_ccx, dm.d_ccy, dm.d_ccz,
+        dm.d_xfx, dm.d_xfy, dm.d_xfz,
+        dm.d_nfx, dm.d_nfy, dm.d_nfz,
+        dm.d_Af, par.rho,
+        cpl.lin.pat.d_rowOffsets,
+        cpl.slots.d_slotPP, cpl.slots.d_slotPN, cpl.slots.d_slotNP, cpl.slots.d_slotNN,
+        Avals);
+    kernel_coupled_continuity_velocity_boundary_faces<<<gridBFaces, block>>>(
+        nBoundaryFaces, mesh.nInternalFaces,
+        dm.d_owner, dm.d_bPatch,
+        dm.d_nfx, dm.d_nfy, dm.d_nfz,
+        dm.d_Af, par.rho,
+        dbcU.d_type, dbcU.d_faceValue,
+        dbcV.d_type, dbcV.d_faceValue,
+        dbcW.d_type, dbcW.d_faceValue,
+        cpl.lin.pat.d_rowOffsets, cpl.slots.d_cellSelfSlot,
+        Avals, cpl.lin.d_rhs);
+    CUDA_CHECK_LAST();
+
+    if(faceSkewScale != 0.0){
+      compute_lsq_gradient_gpu(gop, dm, dbcU, d_uOld,
+                               momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz);
+      kernel_coupled_continuity_velocity_skew_rhs_component<<<gridFaces, block>>>(
+          mesh.nInternalFaces, 0,
+          dm.d_owner, dm.d_neigh,
+          dm.d_ccx, dm.d_ccy, dm.d_ccz,
+          dm.d_xfx, dm.d_xfy, dm.d_xfz,
+          dm.d_nfx, dm.d_nfy, dm.d_nfz,
+          dm.d_Af,
+          momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz,
+          par.rho, faceSkewScale, cpl.lin.d_rhs);
+
+      compute_lsq_gradient_gpu(gop, dm, dbcV, d_vOld,
+                               momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz);
+      kernel_coupled_continuity_velocity_skew_rhs_component<<<gridFaces, block>>>(
+          mesh.nInternalFaces, 1,
+          dm.d_owner, dm.d_neigh,
+          dm.d_ccx, dm.d_ccy, dm.d_ccz,
+          dm.d_xfx, dm.d_xfy, dm.d_xfz,
+          dm.d_nfx, dm.d_nfy, dm.d_nfz,
+          dm.d_Af,
+          momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz,
+          par.rho, faceSkewScale, cpl.lin.d_rhs);
+
+      compute_lsq_gradient_gpu(gop, dm, dbcW, d_wOld,
+                               momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz);
+      kernel_coupled_continuity_velocity_skew_rhs_component<<<gridFaces, block>>>(
+          mesh.nInternalFaces, 2,
+          dm.d_owner, dm.d_neigh,
+          dm.d_ccx, dm.d_ccy, dm.d_ccz,
+          dm.d_xfx, dm.d_xfy, dm.d_xfz,
+          dm.d_nfx, dm.d_nfy, dm.d_nfz,
+          dm.d_Af,
+          momScratch.d_gradQx, momScratch.d_gradQy, momScratch.d_gradQz,
+          par.rho, faceSkewScale, cpl.lin.d_rhs);
+      CUDA_CHECK_LAST();
+    }
+  }
+
+  const double diagScale = 1.0;
+
   kernel_extract_rAU_from_coupled<<<gridCells, block>>>(
       mesh.nCells, cpl.lin.pat.d_diagPos, Avals, dm.d_vol, cpl.d_rAU, diagScale, par.rAUScale);
   CUDA_CHECK_LAST();
+
+  if(const char* envBnd = std::getenv("ANABASIS_COUPLED_RC_BOUNDARY_SCALE")){
+    g_coupledRcBoundaryScale = std::atof(envBnd);
+  } else {
+    g_coupledRcBoundaryScale = 1.0;
+  }
+
+  if(const char *envFullRc = std::getenv("ANABASIS_COUPLED_RC_FULL_NONORTH")){
+    g_coupledRcFullNonOrth = std::atoi(envFullRc);
+  } else {
+    g_coupledRcFullNonOrth = 0;
+  }
+  int rcFullRankTmp = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rcFullRankTmp);
+  if(rcFullRankTmp == 0 && g_coupledRcFullNonOrth){
+    std::printf("Coupled full Darwish RC nonorth correction enabled.\n");
+  }
+
+
+  // Diagnostic only: print coupled Rhie-Chow pressure-coefficient strength.
+  // Enable with:
+  //   ANABASIS_COUPLED_RC_AUDIT=1
+  if(const char* auditEnv = std::getenv("ANABASIS_COUPLED_RC_AUDIT")){
+    static int auditCount = 0;
+    const int auditLimit = std::max(1, std::atoi(auditEnv));
+    if(auditCount < auditLimit){
+      ++auditCount;
+
+      std::vector<double> h_rAU(mesh.nCells, 0.0);
+      CUDA_CALL(cudaMemcpy(h_rAU.data(), cpl.d_rAU,
+                           mesh.nCells*sizeof(double),
+                           cudaMemcpyDeviceToHost));
+
+      std::vector<double> rAUv;
+      std::vector<double> coeffInternal;
+      std::vector<double> coeffBoundary;
+      std::vector<double> coeffAll;
+      std::vector<double> rowAbsSum(mesh.nCells, 0.0);
+      std::vector<double> cosv;
+      std::vector<double> deltaV;
+      std::vector<double> afV;
+
+      rAUv.reserve(mesh.nCells);
+      coeffInternal.reserve(mesh.nInternalFaces);
+      coeffBoundary.reserve(mesh.nFaces - mesh.nInternalFaces);
+      coeffAll.reserve(mesh.nFaces);
+      cosv.reserve(mesh.nInternalFaces);
+      deltaV.reserve(mesh.nInternalFaces);
+      afV.reserve(mesh.nInternalFaces);
+
+      for(int c=0; c<mesh.nCells; ++c){
+        if(std::isfinite(h_rAU[c])) rAUv.push_back(h_rAU[c]);
+      }
+
+      for(int f=0; f<mesh.nInternalFaces; ++f){
+        const int P = mesh.owner[f];
+        const int N = mesh.neigh[f];
+
+        const auto d = sub3(mesh.cc[N], mesh.cc[P]);
+        const double dmag = std::max(norm3(d), 1.0e-300);
+        const double dpn = dot3(mesh.nf[f], d);
+        const double cosTheta = dpn / dmag;
+
+        const double denom = std::max(dot3(d,d), 1.0e-30);
+        double lam = dot3(sub3(mesh.xf[f], mesh.cc[P]), d) / denom;
+        lam = std::min(1.0, std::max(0.0, lam));
+
+        const double rAUf = (1.0-lam)*h_rAU[P] + lam*h_rAU[N];
+        const double deltaCoeff = pressure_delta_coeff_runtime(mesh.nf[f], d);
+        const double coeff = par.pCoeffScale * par.rho * mesh.Af[f] * rAUf * deltaCoeff;
+
+        if(std::isfinite(coeff)){
+          coeffInternal.push_back(std::fabs(coeff));
+          coeffAll.push_back(std::fabs(coeff));
+          rowAbsSum[P] += std::fabs(coeff);
+          rowAbsSum[N] += std::fabs(coeff);
+        }
+
+        if(std::isfinite(cosTheta)) cosv.push_back(cosTheta);
+        if(std::isfinite(deltaCoeff)) deltaV.push_back(deltaCoeff);
+        if(std::isfinite(mesh.Af[f])) afV.push_back(mesh.Af[f]);
+      }
+
+      for(int f=mesh.nInternalFaces; f<mesh.nFaces; ++f){
+        const int P = mesh.owner[f];
+        const int patch = mesh.bPatch[f] - 1;
+        if(patch < 0 || patch >= (int)dbcP.type.size() || dbcP.type[patch] != 1) continue;
+
+        const auto d = sub3(mesh.xf[f], mesh.cc[P]);
+        const double deltaCoeff = pressure_delta_coeff_runtime(mesh.nf[f], d);
+        const double coeff = (par.pCoeffScale * g_coupledRcBoundaryScale) * par.rho * mesh.Af[f] * h_rAU[P] * deltaCoeff;
+
+        if(std::isfinite(coeff)){
+          coeffBoundary.push_back(std::fabs(coeff));
+          coeffAll.push_back(std::fabs(coeff));
+          rowAbsSum[P] += std::fabs(coeff);
+        }
+      }
+
+      std::vector<double> rowNZ;
+      rowNZ.reserve(mesh.nCells);
+      for(double x: rowAbsSum){
+        if(std::isfinite(x) && x > 0.0) rowNZ.push_back(x);
+      }
+
+      auto printStats = [](const char* name, std::vector<double> v){
+        v.erase(std::remove_if(v.begin(), v.end(),
+          [](double x){ return !std::isfinite(x); }), v.end());
+
+        if(v.empty()){
+          std::printf("COUPLED_RC_AUDIT %-18s n=0\n", name);
+          return;
+        }
+
+        std::sort(v.begin(), v.end());
+        double sum = 0.0;
+        for(double x: v) sum += x;
+
+        auto q = [&](double a){
+          const std::size_t id = std::min<std::size_t>(
+              v.size()-1, (std::size_t)std::floor(a*(double)(v.size()-1)));
+          return v[id];
+        };
+
+        std::printf("COUPLED_RC_AUDIT %-18s n=%zu min=%.6e q50=%.6e mean=%.6e q95=%.6e q99=%.6e max=%.6e\n",
+            name, v.size(), v.front(), q(0.50), sum/(double)v.size(), q(0.95), q(0.99), v.back());
+      };
+
+      std::printf("\n================ COUPLED_RC_AUDIT ================\n");
+      std::printf("pCoeffScale=%.8g rho=%.8g rAUMode=%d rAUScale=%.8g pDeltaMode=%d pDeltaMinCos=%.8g\n",
+          par.pCoeffScale, par.rho, par.rAUMode, par.rAUScale, par.pDeltaMode, par.pDeltaMinCos);
+      std::printf("mesh: cells=%d faces=%d internal=%d boundary=%d\n",
+          mesh.nCells, mesh.nFaces, mesh.nInternalFaces, mesh.nFaces-mesh.nInternalFaces);
+
+      printStats("rAU", rAUv);
+      printStats("Af_internal", afV);
+      printStats("delta_internal", deltaV);
+      printStats("cos_internal", cosv);
+      printStats("coeff_internal", coeffInternal);
+      printStats("coeff_boundary", coeffBoundary);
+      printStats("coeff_all", coeffAll);
+      printStats("row_abs_sum", rowNZ);
+
+      // Diagnostic only: locate cells with weakest total RC pressure coupling.
+      // This helps distinguish boundary/geometry defects from a global pCoeffScale issue.
+      {
+        std::vector<int> bFaceCount(mesh.nCells, 0);
+        for(int f=mesh.nInternalFaces; f<mesh.nFaces; ++f){
+          const int P = mesh.owner[f];
+          if(P >= 0 && P < mesh.nCells) bFaceCount[P]++;
+        }
+
+        std::vector<std::pair<double,int>> weak;
+        weak.reserve(mesh.nCells);
+        for(int c=0; c<mesh.nCells; ++c){
+          const double v = rowAbsSum[c];
+          if(std::isfinite(v)) weak.push_back(std::make_pair(v, c));
+        }
+
+        std::sort(weak.begin(), weak.end(),
+            [](const std::pair<double,int>& a, const std::pair<double,int>& b){
+              return a.first < b.first;
+            });
+
+        double xmin=1.0e300, ymin=1.0e300, zmin=1.0e300;
+        double xmax=-1.0e300, ymax=-1.0e300, zmax=-1.0e300;
+        for(int c=0; c<mesh.nCells; ++c){
+          xmin = std::min(xmin, mesh.cc[c][0]);
+          ymin = std::min(ymin, mesh.cc[c][1]);
+          zmin = std::min(zmin, mesh.cc[c][2]);
+          xmax = std::max(xmax, mesh.cc[c][0]);
+          ymax = std::max(ymax, mesh.cc[c][1]);
+          zmax = std::max(zmax, mesh.cc[c][2]);
+        }
+
+        const int nprint = std::min<int>(40, weak.size());
+        std::printf("COUPLED_RC_WEAK_CELLS nprint=%d\\n", nprint);
+        std::printf("rank cell rowAbsSum rAU vol x y z distBoundary bFaces\\n");
+
+        for(int k=0; k<nprint; ++k){
+          const int c = weak[k].second;
+          const double x = mesh.cc[c][0];
+          const double y = mesh.cc[c][1];
+          const double z = mesh.cc[c][2];
+
+          const double db = std::min(
+              std::min(x-xmin, xmax-x),
+              std::min(std::min(y-ymin, ymax-y), std::min(z-zmin, zmax-z)));
+
+          std::printf("COUPLED_RC_WEAK_CELL %3d %8d %.9e %.9e %.9e %.9e %.9e %.9e %.9e %d\\n",
+              k+1, c, weak[k].first, h_rAU[c], mesh.vol[c],
+              x, y, z, db, bFaceCount[c]);
+        }
+      }
+      std::printf("==================================================\n\n");
+    }
+  }
 
   kernel_coupled_rc_pressure_internal_faces<<<gridFaces, block>>>(
       mesh.nInternalFaces,
@@ -6858,17 +8319,34 @@ static void assemble_coupled_darwish_system(
       cpl.lin.pat.d_rowOffsets,
       cpl.slots.d_slotPP, cpl.slots.d_slotPN, cpl.slots.d_slotNP, cpl.slots.d_slotNN,
       Avals);
-  kernel_coupled_rc_pressure_boundary_faces<<<gridBFaces, block>>>(
-      nBoundaryFaces, mesh.nInternalFaces,
-      dm.d_owner, dm.d_bPatch,
-      dm.d_ccx, dm.d_ccy, dm.d_ccz,
-      dm.d_xfx, dm.d_xfy, dm.d_xfz,
-      dm.d_nfx, dm.d_nfy, dm.d_nfz,
-      dm.d_Af, cpl.d_rAU,
-      par.rho, par.pCoeffScale,
-      dbcP.d_type, dbcP.d_faceValue,
-      cpl.lin.pat.d_diagPos,
-      Avals, cpl.lin.d_rhs);
+  if(useSubtriPressureBC){
+    const int gridSubTrisP = (dm.nSubTris + block - 1) / block;
+    kernel_coupled_rc_pressure_boundary_subtris_ethier<<<gridSubTrisP, block>>>(
+        dm.nSubTris, mesh.nInternalFaces,
+        dm.d_subFace,
+        dm.d_subx, dm.d_suby, dm.d_subz,
+        dm.d_subsx, dm.d_subsy, dm.d_subsz,
+        dm.d_owner, dm.d_bPatch,
+        dm.d_ccx, dm.d_ccy, dm.d_ccz,
+        cpl.d_rAU,
+        par.rho, par.pCoeffScale,
+        dbcP.d_type,
+        subtriPressureBCTime, par.ethierA, par.ethierD,
+        cpl.lin.pat.d_diagPos,
+        Avals, cpl.lin.d_rhs);
+  } else {
+    kernel_coupled_rc_pressure_boundary_faces<<<gridBFaces, block>>>(
+        nBoundaryFaces, mesh.nInternalFaces,
+        dm.d_owner, dm.d_bPatch,
+        dm.d_ccx, dm.d_ccy, dm.d_ccz,
+        dm.d_xfx, dm.d_xfy, dm.d_xfz,
+        dm.d_nfx, dm.d_nfy, dm.d_nfz,
+        dm.d_Af, cpl.d_rAU,
+        par.rho, par.pCoeffScale,
+        dbcP.d_type, dbcP.d_faceValue,
+        cpl.lin.pat.d_diagPos,
+        Avals, cpl.lin.d_rhs);
+  }
   // Rhie-Chow pressure-gradient consistency term.
   // coupledRcGradImplicit=1 assembles grad(p).d into the pressure row
   // using the LSQ pressure-gradient stencil, with only out-of-pattern
@@ -6918,24 +8396,417 @@ static void assemble_coupled_darwish_system(
         cpl.lin.d_rhs);
     CUDA_CHECK_LAST();
 
-    kernel_coupled_rc_gradcorr_rhs_boundary_faces<<<gridBFaces, block>>>(
-        nBoundaryFaces, mesh.nInternalFaces,
-        dm.d_owner, dm.d_bPatch,
-        dm.d_ccx, dm.d_ccy, dm.d_ccz,
-        dm.d_xfx, dm.d_xfy, dm.d_xfz,
-        dm.d_nfx, dm.d_nfy, dm.d_nfz,
-        dm.d_Af, cpl.d_rAU,
-        dbcP.d_type,
-        d_pGradx, d_pGrady, d_pGradz,
-        par.rho, par.pCoeffScale, par.pNonOrthScale, par.rcMode,
-        cpl.lin.d_rhs);
+    if(useSubtriPressureBC){
+      const int gridSubTrisP = (dm.nSubTris + block - 1) / block;
+      kernel_coupled_rc_gradcorr_rhs_boundary_subtris_ethier<<<gridSubTrisP, block>>>(
+          dm.nSubTris, mesh.nInternalFaces,
+          dm.d_subFace,
+          dm.d_subx, dm.d_suby, dm.d_subz,
+          dm.d_subsx, dm.d_subsy, dm.d_subsz,
+          dm.d_owner, dm.d_bPatch,
+          dm.d_ccx, dm.d_ccy, dm.d_ccz,
+          cpl.d_rAU,
+          dbcP.d_type,
+          d_pGradx, d_pGrady, d_pGradz,
+          par.rho, par.pCoeffScale, par.pNonOrthScale, par.rcMode,
+          cpl.lin.d_rhs);
+    } else {
+      kernel_coupled_rc_gradcorr_rhs_boundary_faces<<<gridBFaces, block>>>(
+          nBoundaryFaces, mesh.nInternalFaces,
+          dm.d_owner, dm.d_bPatch,
+          dm.d_ccx, dm.d_ccy, dm.d_ccz,
+          dm.d_xfx, dm.d_xfy, dm.d_xfz,
+          dm.d_nfx, dm.d_nfy, dm.d_nfz,
+          dm.d_Af, cpl.d_rAU,
+          dbcP.d_type,
+          d_pGradx, d_pGrady, d_pGradz,
+          par.rho, par.pCoeffScale, par.pNonOrthScale, par.rcMode,
+          cpl.lin.d_rhs);
+    }
     CUDA_CHECK_LAST();
   }
 
   if(usePressureAnchor){
     kernel_coupled_pressure_anchor_fullrow<<<1,1>>>(refCell, cpl.lin.pat.d_rowOffsets, cpl.lin.pat.d_diagPos, Avals, cpl.lin.d_rhs);
   }
+
+  if(const char *envExactRes = std::getenv("ANABASIS_COUPLED_EXACT_PRESSURE_ROW_RESIDUAL")){
+    if(std::atoi(envExactRes) != 0){
+      static int exactPressureResidualPrinted = 0;
+      if(!exactPressureResidualPrinted){
+        double exactTime = par.transientDt;
+        if(const char *envT = std::getenv("ANABASIS_ETHIER_EXACT_RESIDUAL_TIME")){
+          exactTime = std::atof(envT);
+        }
+
+        double *d_xExact = nullptr;
+        double *d_pRes = nullptr;
+        CUDA_CALL(cudaMalloc((void**)&d_xExact, 4*mesh.nCells*sizeof(double)));
+        CUDA_CALL(cudaMalloc((void**)&d_pRes, mesh.nCells*sizeof(double)));
+
+        kernel_fill_ethier_exact_coupled_x<<<gridCells, block>>>(
+            mesh.nCells,
+            dm.d_ccx, dm.d_ccy, dm.d_ccz,
+            exactTime,
+            d_xExact);
+
+        kernel_exact_pressure_row_residual<<<gridCells, block>>>(
+            mesh.nCells,
+            cpl.lin.pat.d_rowOffsets,
+            cpl.lin.pat.d_cols,
+            Avals,
+            cpl.lin.d_rhs,
+            d_xExact,
+            d_pRes);
+        CUDA_CHECK_LAST();
+
+        std::vector<double> hRes(mesh.nCells, 0.0);
+        CUDA_CALL(cudaMemcpy(hRes.data(), d_pRes, mesh.nCells*sizeof(double), cudaMemcpyDeviceToHost));
+
+        double totalVol = 0.0;
+        for(int c=0;c<mesh.nCells;++c) totalVol += mesh.vol[c];
+
+        const double h = std::cbrt(totalVol / std::max(mesh.nCells,1));
+        const int nBins = 8;
+
+        std::vector<double> binE(nBins+1,0.0), binVol(nBins+1,0.0), binMax(nBins+1,0.0);
+        std::vector<int> binCount(nBins+1,0);
+
+        double allE = 0.0, allVol = 0.0, allMax = 0.0;
+        double allFluxRms = 0.0, allFluxMax = 0.0;
+
+        for(int c=0;c<mesh.nCells;++c){
+          if(usePressureAnchor && c == refCell) continue;
+
+          const double x = mesh.cc[c][0];
+          const double y = mesh.cc[c][1];
+          const double z = mesh.cc[c][2];
+
+          const double dist = std::min(std::min(std::min(x,1.0-x), std::min(y,1.0-y)),
+                                       std::min(z,1.0-z));
+
+          const double fluxRes = hRes[c];
+          const double divRes = fluxRes / std::max(mesh.vol[c], 1.0e-300);
+
+          const double e = mesh.vol[c] * divRes * divRes;
+
+          int b = (int)std::floor(dist / std::max(h,1.0e-300));
+          if(b < 0) b = 0;
+          if(b > nBins) b = nBins;
+
+          binE[b] += e;
+          binVol[b] += mesh.vol[c];
+          binMax[b] = std::max(binMax[b], std::fabs(divRes));
+          binCount[b]++;
+
+          allE += e;
+          allVol += mesh.vol[c];
+          allMax = std::max(allMax, std::fabs(divRes));
+          allFluxRms += fluxRes*fluxRes;
+          allFluxMax = std::max(allFluxMax, std::fabs(fluxRes));
+        }
+
+        int exactRank = 0;
+        MPI_Comm_rank(MPI_COMM_WORLD, &exactRank);
+        if(exactRank == 0){
+          std::printf("\n============================================================\n");
+          std::printf("EXACT_PRESSURE_ROW_RESIDUAL_AUDIT time=%.12e\n", exactTime);
+          std::printf("This prints A_p*x_exact - b_p for the coupled pressure/continuity rows.\n");
+          std::printf("all: divRMS=%.12e divMax=%.12e fluxRMS=%.12e fluxMax=%.12e\n",
+                      std::sqrt(allE/std::max(allVol,1.0e-300)),
+                      allMax,
+                      std::sqrt(allFluxRms/std::max(mesh.nCells,1)),
+                      allFluxMax);
+          std::printf("bin,cells,vol,energy_frac,divRMS,divMax\n");
+          for(int b=0;b<=nBins;++b){
+            if(binCount[b] == 0) continue;
+            const double frac = binE[b] / std::max(allE,1.0e-300);
+            const double rms = std::sqrt(binE[b] / std::max(binVol[b],1.0e-300));
+            if(b < nBins)
+              std::printf("shell_%dh_to_%dh,%d,%.12e,%.6f,%.12e,%.12e\n",
+                          b,b+1,binCount[b],binVol[b],frac,rms,binMax[b]);
+            else
+              std::printf("shell_%dh_plus,%d,%.12e,%.6f,%.12e,%.12e\n",
+                          b,binCount[b],binVol[b],frac,rms,binMax[b]);
+          }
+          std::printf("============================================================\n\n");
+        }
+
+        const int exactAuditExit =
+            (std::getenv("ANABASIS_COUPLED_EXACT_AUDIT_EXIT") &&
+             std::atoi(std::getenv("ANABASIS_COUPLED_EXACT_AUDIT_EXIT")) != 0);
+
+        CUDA_CALL(cudaFree(d_xExact));
+        CUDA_CALL(cudaFree(d_pRes));
+
+        if(exactAuditExit){
+          if(exactRank == 0){
+            std::printf("ANABASIS_COUPLED_EXACT_AUDIT_EXIT=1: exiting after exact pressure-row residual audit, before linear solve.\\n");
+            std::fflush(stdout);
+            std::fflush(stderr);
+          }
+          MPI_Barrier(MPI_COMM_WORLD);
+          MPI_Finalize();
+          std::exit(0);
+        }
+
+        exactPressureResidualPrinted = 1;
+      }
+    }
+  }
+
   CUDA_CHECK_LAST();
+}
+
+
+
+// Add correction from parent-face velocity flux to subtriangle velocity flux.
+//
+// This is intentionally a correction applied after:
+//   kernel_build_coupled_matrix_consistent_flux(...)
+//   add_coupled_velocity_skew_to_phi_if_enabled(...)
+//
+// Existing phi already contains:
+//   parent pressure/RC flux + parent velocity flux + parent velocity skew.
+//
+// This kernel adds:
+//   sum_q [ U_rec(x_q).S_q ] - [ U_rec(x_f).S_f ]
+//
+// by distributing the subtraction over subtriangles:
+//   sum_q [ (q_sub - q_parent) * S_q_component ]
+//
+// Therefore pressure/RC terms remain exactly as before; only continuity
+// velocity quadrature is upgraded to the same subtriangle geometry used in
+// the matrix assembly diagnostic.
+__global__ static void kernel_coupled_subtri_velocity_flux_correction_component(
+    int nSubTris, int nInternalFaces, int comp,
+    const int *subFace,
+    const double *subx, const double *suby, const double *subz,
+    const double *subsx, const double *subsy, const double *subsz,
+    const int *owner, const int *neigh, const int *bPatch,
+    const double *ccx, const double *ccy, const double *ccz,
+    const double *xfx, const double *xfy, const double *xfz,
+    const double *q,
+    const double *gradx, const double *grady, const double *gradz,
+    const int *bcType, const double *qFaceBC,
+    double rho, double faceSkewScale,
+    double *phi)
+{
+  const int it = blockIdx.x*blockDim.x + threadIdx.x;
+  if(it >= nSubTris) return;
+
+  const int f = subFace[it];
+
+  const double Sq = (comp == 0 ? subsx[it] : (comp == 1 ? subsy[it] : subsz[it]));
+
+  double qParent = 0.0;
+  double qSub = 0.0;
+
+  if(f < nInternalFaces){
+    const int P = owner[f];
+    const int N = neigh[f];
+
+    const double dx = ccx[N] - ccx[P];
+    const double dy = ccy[N] - ccy[P];
+    const double dz = ccz[N] - ccz[P];
+    const double denom = fmax(dx*dx + dy*dy + dz*dz, 1.0e-30);
+
+    // Parent-face interpolation point.
+    double lamF = ((xfx[f]-ccx[P])*dx + (xfy[f]-ccy[P])*dy + (xfz[f]-ccz[P])*dz) / denom;
+    lamF = fmin(1.0, fmax(0.0, lamF));
+
+    const double xlinFx = ccx[P] + lamF*dx;
+    const double xlinFy = ccy[P] + lamF*dy;
+    const double xlinFz = ccz[P] + lamF*dz;
+
+    const double gFx = (1.0-lamF)*gradx[P] + lamF*gradx[N];
+    const double gFy = (1.0-lamF)*grady[P] + lamF*grady[N];
+    const double gFz = (1.0-lamF)*gradz[P] + lamF*gradz[N];
+
+    qParent = (1.0-lamF)*q[P] + lamF*q[N]
+            + faceSkewScale*(gFx*(xfx[f]-xlinFx) + gFy*(xfy[f]-xlinFy) + gFz*(xfz[f]-xlinFz));
+
+    // Subtriangle quadrature point.
+    double lamQ = ((subx[it]-ccx[P])*dx + (suby[it]-ccy[P])*dy + (subz[it]-ccz[P])*dz) / denom;
+    lamQ = fmin(1.0, fmax(0.0, lamQ));
+
+    const double xlinQx = ccx[P] + lamQ*dx;
+    const double xlinQy = ccy[P] + lamQ*dy;
+    const double xlinQz = ccz[P] + lamQ*dz;
+
+    const double gQx = (1.0-lamQ)*gradx[P] + lamQ*gradx[N];
+    const double gQy = (1.0-lamQ)*grady[P] + lamQ*grady[N];
+    const double gQz = (1.0-lamQ)*gradz[P] + lamQ*gradz[N];
+
+    qSub = (1.0-lamQ)*q[P] + lamQ*q[N]
+         + faceSkewScale*(gQx*(subx[it]-xlinQx) + gQy*(suby[it]-xlinQy) + gQz*(subz[it]-xlinQz));
+
+  } else {
+    const int P = owner[f];
+    const int patch = bPatch[f] - 1;
+    if(patch < 0) return;
+
+    // For fixed velocity BCs, parent reconstruction used qFaceBC[f].
+    // Upgrade that to qFaceBC[f] + grad_q(P).(x_q - x_f).
+    // For non-fixed BCs, leave parent reconstruction unchanged for now.
+    if(bcType[patch] != 1) return;
+
+    qParent = qFaceBC[f];
+    qSub = qFaceBC[f]
+         + faceSkewScale*(gradx[P]*(subx[it]-xfx[f])
+                         + grady[P]*(suby[it]-xfy[f])
+                         + gradz[P]*(subz[it]-xfz[f]));
+  }
+
+  hypreAtomicAdd(&phi[f], rho * (qSub - qParent) * Sq);
+}
+
+static void add_coupled_subtri_velocity_flux_correction_if_enabled(
+    const DeviceMesh &dmesh,
+    const Mesh &mesh,
+    GPUMomentumAssembler &mom,
+    const DeviceGradientOperator &gop,
+    const DeviceBC &dbcU,
+    const DeviceBC &dbcV,
+    const DeviceBC &dbcW,
+    const double *d_u,
+    const double *d_v,
+    const double *d_w,
+    double rho,
+    double faceSkewScale,
+    double *d_phi)
+{
+  const char *env = std::getenv("ANABASIS_COUPLED_SUBTRI_FLUX_RECON");
+  if(!env || std::atoi(env) == 0) return;
+  if(dmesh.nSubTris <= 0) return;
+
+  static int printed = 0;
+  if(!printed){
+    int r = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &r);
+    if(r == 0){
+      std::printf("Coupled flux reconstruction uses subtriangle velocity correction.\n");
+    }
+    printed = 1;
+  }
+
+  const int block = 256;
+  const int gridSub = (dmesh.nSubTris + block - 1) / block;
+
+  compute_lsq_gradient_gpu(gop, dmesh, dbcU, d_u,
+                           mom.d_gradQx, mom.d_gradQy, mom.d_gradQz);
+  kernel_coupled_subtri_velocity_flux_correction_component<<<gridSub, block>>>(
+      dmesh.nSubTris, mesh.nInternalFaces, 0,
+      dmesh.d_subFace,
+      dmesh.d_subx, dmesh.d_suby, dmesh.d_subz,
+      dmesh.d_subsx, dmesh.d_subsy, dmesh.d_subsz,
+      dmesh.d_owner, dmesh.d_neigh, dmesh.d_bPatch,
+      dmesh.d_ccx, dmesh.d_ccy, dmesh.d_ccz,
+      dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
+      d_u,
+      mom.d_gradQx, mom.d_gradQy, mom.d_gradQz,
+      dbcU.d_type, dbcU.d_faceValue,
+      rho, faceSkewScale, d_phi);
+
+  compute_lsq_gradient_gpu(gop, dmesh, dbcV, d_v,
+                           mom.d_gradQx, mom.d_gradQy, mom.d_gradQz);
+  kernel_coupled_subtri_velocity_flux_correction_component<<<gridSub, block>>>(
+      dmesh.nSubTris, mesh.nInternalFaces, 1,
+      dmesh.d_subFace,
+      dmesh.d_subx, dmesh.d_suby, dmesh.d_subz,
+      dmesh.d_subsx, dmesh.d_subsy, dmesh.d_subsz,
+      dmesh.d_owner, dmesh.d_neigh, dmesh.d_bPatch,
+      dmesh.d_ccx, dmesh.d_ccy, dmesh.d_ccz,
+      dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
+      d_v,
+      mom.d_gradQx, mom.d_gradQy, mom.d_gradQz,
+      dbcV.d_type, dbcV.d_faceValue,
+      rho, faceSkewScale, d_phi);
+
+  compute_lsq_gradient_gpu(gop, dmesh, dbcW, d_w,
+                           mom.d_gradQx, mom.d_gradQy, mom.d_gradQz);
+  kernel_coupled_subtri_velocity_flux_correction_component<<<gridSub, block>>>(
+      dmesh.nSubTris, mesh.nInternalFaces, 2,
+      dmesh.d_subFace,
+      dmesh.d_subx, dmesh.d_suby, dmesh.d_subz,
+      dmesh.d_subsx, dmesh.d_subsy, dmesh.d_subsz,
+      dmesh.d_owner, dmesh.d_neigh, dmesh.d_bPatch,
+      dmesh.d_ccx, dmesh.d_ccy, dmesh.d_ccz,
+      dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
+      d_w,
+      mom.d_gradQx, mom.d_gradQy, mom.d_gradQz,
+      dbcW.d_type, dbcW.d_faceValue,
+      rho, faceSkewScale, d_phi);
+
+  CUDA_CHECK_LAST();
+}
+
+static void add_coupled_velocity_skew_to_phi_if_enabled(
+    const DeviceMesh &dmesh,
+    const Mesh &mesh,
+    GPUMomentumAssembler &mom,
+    const DeviceGradientOperator &gop,
+    const DeviceBC &dbcU,
+    const DeviceBC &dbcV,
+    const DeviceBC &dbcW,
+    const double *d_u,
+    const double *d_v,
+    const double *d_w,
+    double rho,
+    double faceSkewScale,
+    double *d_phi)
+{
+  if(faceSkewScale == 0.0) return;
+
+  const int block = 256;
+  const int gridFaces = (mesh.nInternalFaces + block - 1)/block;
+
+  compute_lsq_gradient_gpu(gop, dmesh, dbcU, d_u,
+                           mom.d_gradQx, mom.d_gradQy, mom.d_gradQz);
+  kernel_add_phi_velocity_skew_component<<<gridFaces, block>>>(
+      mesh.nInternalFaces, 0,
+      dmesh.d_owner, dmesh.d_neigh,
+      dmesh.d_ccx, dmesh.d_ccy, dmesh.d_ccz,
+      dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
+      dmesh.d_nfx, dmesh.d_nfy, dmesh.d_nfz,
+      dmesh.d_Af,
+      mom.d_gradQx, mom.d_gradQy, mom.d_gradQz,
+      rho, faceSkewScale, d_phi);
+
+  compute_lsq_gradient_gpu(gop, dmesh, dbcV, d_v,
+                           mom.d_gradQx, mom.d_gradQy, mom.d_gradQz);
+  kernel_add_phi_velocity_skew_component<<<gridFaces, block>>>(
+      mesh.nInternalFaces, 1,
+      dmesh.d_owner, dmesh.d_neigh,
+      dmesh.d_ccx, dmesh.d_ccy, dmesh.d_ccz,
+      dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
+      dmesh.d_nfx, dmesh.d_nfy, dmesh.d_nfz,
+      dmesh.d_Af,
+      mom.d_gradQx, mom.d_gradQy, mom.d_gradQz,
+      rho, faceSkewScale, d_phi);
+
+  compute_lsq_gradient_gpu(gop, dmesh, dbcW, d_w,
+                           mom.d_gradQx, mom.d_gradQy, mom.d_gradQz);
+  kernel_add_phi_velocity_skew_component<<<gridFaces, block>>>(
+      mesh.nInternalFaces, 2,
+      dmesh.d_owner, dmesh.d_neigh,
+      dmesh.d_ccx, dmesh.d_ccy, dmesh.d_ccz,
+      dmesh.d_xfx, dmesh.d_xfy, dmesh.d_xfz,
+      dmesh.d_nfx, dmesh.d_nfy, dmesh.d_nfz,
+      dmesh.d_Af,
+      mom.d_gradQx, mom.d_gradQy, mom.d_gradQz,
+      rho, faceSkewScale, d_phi);
+
+  CUDA_CHECK_LAST();
+
+  // SUBTRI_FLUX_HOOK_INSIDE_SKEW_FUNCTION
+  // Keep phi/massRes reconstruction consistent with the subtriangle
+  // continuity matrix path. The helper itself is guarded by:
+  //   ANABASIS_COUPLED_SUBTRI_FLUX_RECON
+  add_coupled_subtri_velocity_flux_correction_if_enabled(
+      dmesh, mesh, mom, gop, dbcU, dbcV, dbcW,
+      d_u, d_v, d_w,
+      rho, faceSkewScale, d_phi);
 }
 
 static void solve_coupled_linear_device(
@@ -7261,23 +9132,47 @@ CUDA_CALL(cudaFree(0));
   std::vector<pipebc::PressurePatchBCSpec> pressurePatchSpecs;
 
   // simple_gpu rule:
-  // all physical BCs must come from the runtime/generated BC config.
-  // This avoids silent fallback/default BCs on newly added patches.
-  if(par.bcConfigPath.empty()){
-    if(rank==0){
-      std::fprintf(stderr,
-          "coupled_gpu requires explicit runtime BCs.\n"
-          "Add velocity/pressure lines to the case file, or set bcConfig.\n");
-    }
-    MPI_Abort(MPI_COMM_WORLD, 1);
-  }
+  // all physical BCs must come from the runtime/generated BC config, except
+  // Ethier verification mode, which programmatically imposes exact U,p on
+  // every boundary patch.
+  if(par.ethierEnable){
+    const double ea = par.ethierA;
+    const double ed = par.ethierD;
+    for(const auto& patchName : mesh.patchNames){
+      velocityPatchSpecs.push_back(pipebc::make_fixed_vector_function_bc(
+          patchName,
+          [ea, ed](const std::array<double,3>& x, double t){
+            const auto q = ethier_exact_value(x[0], x[1], x[2], t, ea, ed);
+            return std::array<double,3>{{q.u, q.v, q.w}};
+          }));
 
-  if(!par.bcConfigPath.empty()){
+      if(par.ethierPressureDirichlet){
+        pressurePatchSpecs.push_back(pipebc::make_pressure_fixed_value_function_bc(
+            patchName,
+            [ea, ed](const std::array<double,3>& x, double t){
+              return ethier_exact_value(x[0], x[1], x[2], t, ea, ed).p;
+            }));
+      } else {
+        pressurePatchSpecs.push_back(pipebc::make_pressure_zero_gradient_bc(patchName));
+      }
+    }
+    if(rank == 0){
+      std::printf("Ethier verification mode: exact Dirichlet velocity on all patches; pressureDirichlet=%d a=%.16e d=%.16e\n",
+                  par.ethierPressureDirichlet, par.ethierA, par.ethierD);
+    }
+  }
+  else if(!par.bcConfigPath.empty()){
     auto runtimeBC = pipebc::load_runtime_bc_config(par.bcConfigPath);
     pipebc::validate_runtime_bc_config_against_patches(runtimeBC, mesh.patchNames);
     velocityPatchSpecs = std::move(runtimeBC.velocityPatchSpecs);
     pressurePatchSpecs = std::move(runtimeBC.pressurePatchSpecs);
   } else {
+    if(rank==0){
+      std::fprintf(stderr,
+          "coupled_gpu requires explicit runtime BCs.\n"
+          "Add velocity/pressure lines to the case file, set bcConfig, or set ethierEnable 1.\n");
+    }
+    MPI_Abort(MPI_COMM_WORLD, 1);
     velocityPatchSpecs.push_back(pipebc::make_wall_noslip_bc(mesh.patchNames[wallPatch]));
     if(cylinderPatch >= 0){
       velocityPatchSpecs.push_back(pipebc::make_wall_noslip_bc(mesh.patchNames[cylinderPatch]));
@@ -7503,20 +9398,13 @@ CUDA_CALL(cudaFree(0));
   const double R = 0.5*par.pipeDiameter;
   const double Umax = 2.0*par.Umean;
 
-  pipebc::apply_bc_specs_to_legacy_face_arrays(
-      legacyBCMesh,
-      patchGeometryTable,
-      velocityPatchSpecs,
-      pressurePatchSpecs,
-      0.0,
-      bcUType,
-      bcVType,
-      bcWType,
-      bcPType,
-      uFaceBC,
-      vFaceBC,
-      wFaceBC,
-      pFaceBC);
+  update_runtime_bc_face_values(
+      mesh, legacyBCMesh, patchGeometryTable,
+      velocityPatchSpecs, pressurePatchSpecs,
+      par.timeStart, par.ethierEnable ? par.ethierFluxCompatible : 0, rank,
+      bcUType, bcVType, bcWType, bcPType,
+      uFaceBC, vFaceBC, wFaceBC, pFaceBC,
+      nullptr, nullptr, nullptr, nullptr);
 
   {
     static bool wroteRuntimeVelocityBCPatch = false;
@@ -7571,12 +9459,82 @@ CUDA_CALL(cudaFree(0));
     v[c] = initV;
     w[c] = initW;
   }
+
+  if(par.ethierEnable){
+    ethier_fill_cell_fields(mesh, par.timeStart, par.ethierA, par.ethierD, u, v, w, p);
+    if(rank == 0){
+      std::printf("Ethier exact initial fields loaded at t=%.12e\n", par.timeStart);
+    }
+  }
   std::vector<double> uOld(mesh.nCells), vOld(mesh.nCells), wOld(mesh.nCells), pOld(mesh.nCells);
   std::vector<double> uStar(mesh.nCells), vStar(mesh.nCells), wStar(mesh.nCells), pCorr(mesh.nCells,0.0);
   std::vector<double> gradPcompX(mesh.nCells), gradPcompY(mesh.nCells), gradPcompZ(mesh.nCells);
   std::vector<std::array<double,3>> gradVec;
   std::vector<double> phiStar, phi, divStar, divCorr(mesh.nCells, 0.0);
   int refCell=0;
+
+  // ANABASIS_INTERIOR_PRESSURE_REF_PATCH:
+  // If pressure has no Dirichlet boundary, the coupled saddle system needs
+  // one pressure gauge.  Do not use cell 0 blindly: on polyhedral meshes it
+  // can be a tiny boundary/corner sliver.  Pick an interior cell closest to
+  // the mesh bounding-box center.  This removes one continuity row, so the
+  // reported mass norm must also exclude this reference cell.
+  if(usePressureAnchor){
+    std::vector<int> bFaceCount(mesh.nCells, 0);
+    for(int ff=mesh.nInternalFaces; ff<mesh.nFaces; ++ff){
+      const int c = mesh.owner[ff];
+      if(c >= 0 && c < mesh.nCells) ++bFaceCount[c];
+    }
+
+    double xmin=DBL_MAX, ymin=DBL_MAX, zmin=DBL_MAX;
+    double xmax=-DBL_MAX, ymax=-DBL_MAX, zmax=-DBL_MAX;
+
+    for(int c=0; c<mesh.nCells; ++c){
+      xmin = std::min(xmin, mesh.cc[c][0]);
+      ymin = std::min(ymin, mesh.cc[c][1]);
+      zmin = std::min(zmin, mesh.cc[c][2]);
+      xmax = std::max(xmax, mesh.cc[c][0]);
+      ymax = std::max(ymax, mesh.cc[c][1]);
+      zmax = std::max(zmax, mesh.cc[c][2]);
+    }
+
+    const double tx = 0.5*(xmin+xmax);
+    const double ty = 0.5*(ymin+ymax);
+    const double tz = 0.5*(zmin+zmax);
+
+    int bestInterior = -1;
+    int bestAny = 0;
+    double bestInteriorScore = DBL_MAX;
+    double bestAnyScore = DBL_MAX;
+
+    for(int c=0; c<mesh.nCells; ++c){
+      const double dx = mesh.cc[c][0] - tx;
+      const double dy = mesh.cc[c][1] - ty;
+      const double dz = mesh.cc[c][2] - tz;
+      const double score = dx*dx + dy*dy + dz*dz;
+
+      if(score < bestAnyScore){
+        bestAnyScore = score;
+        bestAny = c;
+      }
+
+      if(bFaceCount[c] == 0 && score < bestInteriorScore){
+        bestInteriorScore = score;
+        bestInterior = c;
+      }
+    }
+
+    refCell = (bestInterior >= 0) ? bestInterior : bestAny;
+
+    if(rank == 0){
+      std::printf(
+        "Pressure reference cell selected: %d cc=(%.12e %.12e %.12e) vol=%.12e bFaces=%d target=(%.12e %.12e %.12e)\n",
+        refCell,
+        mesh.cc[refCell][0], mesh.cc[refCell][1], mesh.cc[refCell][2],
+        mesh.vol[refCell], bFaceCount[refCell],
+        tx, ty, tz);
+    }
+  }
   double totalAssemble=0.0, totalSetup=0.0, totalSolve=0.0;
   double pressureSetup=0.0, pressureSolve=0.0;
 
@@ -7586,6 +9544,28 @@ CUDA_CALL(cudaFree(0));
   init_pressure_system(pressureSys, mesh, dmesh, par, refCell, usePressureAnchor, pressureSetup);
   GPUSimpleScratch ss;
   init_simple_scratch(ss, mesh);
+
+  // ANABASIS_MASS_NORM_EXCLUDE_REF_PATCH:
+  // The pressure reference row replaces one continuity equation.  Therefore
+  // the all-cell max continuity residual is not the correct Picard stopping
+  // norm when usePressureAnchor=true.  Use max over all cells except refCell.
+  auto continuity_mass_norm_for_stop = [&](const double* d_div) -> double {
+    if(!usePressureAnchor){
+      return maxabs_device(d_div, mesh.nCells, ss.d_reduce, ss.reduceSize);
+    }
+
+    std::vector<double> h_div(mesh.nCells, 0.0);
+    CUDA_CALL(cudaMemcpy(h_div.data(), d_div,
+                         mesh.nCells*sizeof(double),
+                         cudaMemcpyDeviceToHost));
+
+    double mx = 0.0;
+    for(int c=0; c<mesh.nCells; ++c){
+      if(c == refCell) continue;
+      mx = std::max(mx, std::fabs(h_div[c]));
+    }
+    return mx;
+  };
   DeviceGradientOperator gop;
   build_lsq_gradient_operator(mesh, gop, par.lsqWeightPower);
 
@@ -7797,10 +9777,32 @@ CUDA_CALL(cudaFree(0));
     CUDA_CALL(cudaMemcpy(d_vTimeOldOld, ss.d_v, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
     CUDA_CALL(cudaMemcpy(d_wTimeOldOld, ss.d_w, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
 
+    if(par.ethierEnable && par.ethierBDF2ExactHistory){
+      std::vector<double> uHist, vHist, wHist, pHist;
+      ethier_fill_cell_fields(mesh, par.timeStart - par.transientDt,
+                              par.ethierA, par.ethierD,
+                              uHist, vHist, wHist, pHist);
+      copy_vec_to_device(uHist, d_uTimeOldOld);
+      copy_vec_to_device(vHist, d_vTimeOldOld);
+      copy_vec_to_device(wHist, d_wTimeOldOld);
+      if(rank == 0){
+        std::printf("Ethier exact BDF2 history loaded at t=%.12e\n", par.timeStart - par.transientDt);
+      }
+    }
+
     const int nPhysicalSteps = (par.transientNSteps > 0 ? par.transientNSteps : maxStepsCoupled);
     const int maxPicard = std::max(1, par.maxPicard);
     const int minPicard = std::max(1, par.minPicard);
     const double picTol = (par.picardTol > 0.0 ? par.picardTol : par.tolVel);
+
+    double coupledFaceSkewScaleRuntime = 0.0;
+    if(const char* envSkew = std::getenv("ANABASIS_COUPLED_FACE_SKEW_CORR")){
+      coupledFaceSkewScaleRuntime = std::atof(envSkew);
+    }
+    if(rank == 0 && coupledFaceSkewScaleRuntime != 0.0){
+      std::printf("Coupled deferred face-skew correction enabled: scale=%.6e\n",
+                  coupledFaceSkewScaleRuntime);
+    }
 
     auto picard_mode_name = [](int mode)->const char* {
       if(mode == 1) return "mass-only/OF-like";
@@ -7827,15 +9829,40 @@ CUDA_CALL(cudaFree(0));
     for(int timeStep=1; timeStep<=nPhysicalSteps; ++timeStep){
       const double stepWall0 = MPI_Wtime();
       const double physicalTime = par.timeStart + timeStep * par.transientDt;
-      const int activeTimeScheme = (par.timeScheme == 1 && timeStep > 1) ? 1 : 0;
+      const int activeTimeScheme = (par.timeScheme == 1 &&
+          (timeStep > 1 || (par.ethierEnable && par.ethierBDF2ExactHistory))) ? 1 : 0;
 
-      update_device_time_sine_velocity_bc(timeSineBC, physicalTime, dbcU, dbcV, dbcW);
+      if(par.ethierEnable){
+        update_runtime_bc_face_values(
+            mesh, legacyBCMesh, patchGeometryTable,
+            velocityPatchSpecs, pressurePatchSpecs,
+            physicalTime, par.ethierFluxCompatible, rank,
+            bcUType, bcVType, bcWType, bcPType,
+            uFaceBC, vFaceBC, wFaceBC, pFaceBC,
+            &dbcU, &dbcV, &dbcW, &dbcP);
+      } else {
+        update_device_time_sine_velocity_bc(timeSineBC, physicalTime, dbcU, dbcV, dbcW);
+      }
 
       // Freeze physical old-time fields U^n for all Picard iterations.
       CUDA_CALL(cudaMemcpy(d_uTime, ss.d_u, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
       CUDA_CALL(cudaMemcpy(d_vTime, ss.d_v, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
       CUDA_CALL(cudaMemcpy(d_wTime, ss.d_w, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
       CUDA_CALL(cudaMemcpy(d_pTime, ss.d_p, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+
+      const int useEthierExactPGradRC =
+          (std::getenv("ANABASIS_ETHIER_EXACT_PGRAD_RC") &&
+           std::atoi(std::getenv("ANABASIS_ETHIER_EXACT_PGRAD_RC")) != 0);
+      if(rank == 0 && useEthierExactPGradRC){
+        std::printf("Ethier exact analytic pressure gradient override enabled for coupled RC/Gp gradient arrays.\n");
+      }
+
+      const int useEthierExactAssemblyState =
+          (std::getenv("ANABASIS_ETHIER_EXACT_ASSEMBLY_STATE") &&
+           std::atoi(std::getenv("ANABASIS_ETHIER_EXACT_ASSEMBLY_STATE")) != 0);
+      if(rank == 0 && useEthierExactAssemblyState){
+        std::printf("Ethier exact cell fields will be used as the coupled assembly Picard state.\n");
+      }
 
       bool picardConverged = false;
 
@@ -7848,9 +9875,21 @@ CUDA_CALL(cudaFree(0));
         CUDA_CALL(cudaMemcpy(ss.d_wOld, ss.d_w, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
         CUDA_CALL(cudaMemcpy(ss.d_pOld, ss.d_p, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
 
+        if(useEthierExactAssemblyState){
+          const double ethierAssemblyTime = timeStep * par.transientDt;
+          fill_ethier_exact_fields_cellwise_gpu(
+              dmesh, ethierAssemblyTime,
+              ss.d_uOld, ss.d_vOld, ss.d_wOld, ss.d_pOld);
+        }
+
         // Explicit RC gradient-consistency term uses latest Picard pressure.
         compute_pressure_gradient_gpu(par, gop, dmesh, dbcP, ss.d_pOld,
                                       ss.d_gradx, ss.d_grady, ss.d_gradz);
+        if(useEthierExactPGradRC){
+          const double ethierGradTime = timeStep * par.transientDt;
+          fill_ethier_exact_pressure_gradient_gpu(
+              dmesh, ethierGradTime, ss.d_gradx, ss.d_grady, ss.d_gradz);
+        }
 
         // After the first Picard solve, ss.d_phi contains the latest
         // matrix-consistent Rhie-Chow flux. Use it for momentum convection
@@ -7878,7 +9917,7 @@ CUDA_CALL(cudaFree(0));
             activeTimeScheme,
             ss.d_phi, usePhiConvForMomentum,
             ss.d_gradx, ss.d_grady, ss.d_gradz,
-            coupledUsePressureAnchor, refCell);
+            coupledUsePressureAnchor, refCell, physicalTime);
         CUDA_CALL(cudaDeviceSynchronize());
         coupledAssemble += MPI_Wtime() - ta0;
 
@@ -7925,6 +9964,16 @@ CUDA_CALL(cudaFree(0));
             // then solve only the compact pressure-correction equation for its residual.
             compute_pressure_gradient_gpu(par, gop, dmesh, dbcP, ss.d_p,
                                           ss.d_gradx, ss.d_grady, ss.d_gradz);
+          if(useEthierExactPGradRC){
+            const double ethierGradTime = timeStep * par.transientDt;
+            fill_ethier_exact_pressure_gradient_gpu(
+                dmesh, ethierGradTime, ss.d_gradx, ss.d_grady, ss.d_gradz);
+          }
+          if(useEthierExactPGradRC){
+            const double ethierGradTime = timeStep * par.transientDt;
+            fill_ethier_exact_pressure_gradient_gpu(
+                dmesh, ethierGradTime, ss.d_gradx, ss.d_grady, ss.d_gradz);
+          }
 
             kernel_build_coupled_matrix_consistent_flux<<<(mesh.nFaces + block - 1)/block, block>>>(
                 mesh.nFaces, mesh.nInternalFaces,
@@ -7944,6 +9993,10 @@ CUDA_CALL(cudaFree(0));
                 par.rho, par.pCoeffScale, par.pNonOrthScale,
                 par.rcMode, par.hbyaBcMode, ss.d_phi);
             CUDA_CHECK_LAST();
+            add_coupled_velocity_skew_to_phi_if_enabled(
+                dmesh, mesh, mom, gop, dbcU, dbcV, dbcW,
+                ss.d_u, ss.d_v, ss.d_w,
+                par.rho, coupledFaceSkewScaleRuntime, ss.d_phi);
 
             continuity_residual_gpu(dmesh, ss.d_phi, ss.d_divCorr);
             kernel_build_pressure_rhs_minus_div<<<(mesh.nCells + block - 1)/block, block>>>(
@@ -8000,6 +10053,11 @@ CUDA_CALL(cudaFree(0));
           // diagnostics and final matrix-consistent flux reconstruction.
           compute_pressure_gradient_gpu(par, gop, dmesh, dbcP, ss.d_p,
                                         ss.d_gradx, ss.d_grady, ss.d_gradz);
+          if(useEthierExactPGradRC){
+            const double ethierGradTime = timeStep * par.transientDt;
+            fill_ethier_exact_pressure_gradient_gpu(
+                dmesh, ethierGradTime, ss.d_gradx, ss.d_grady, ss.d_gradz);
+          }
         }
 
         const double tf0 = MPI_Wtime();
@@ -8024,6 +10082,10 @@ CUDA_CALL(cudaFree(0));
             par.rho, par.pCoeffScale, par.pNonOrthScale,
             par.rcMode, par.hbyaBcMode, ss.d_phi);
         CUDA_CHECK_LAST();
+        add_coupled_velocity_skew_to_phi_if_enabled(
+            dmesh, mesh, mom, gop, dbcU, dbcV, dbcW,
+            ss.d_u, ss.d_v, ss.d_w,
+            par.rho, coupledFaceSkewScaleRuntime, ss.d_phi);
 
         continuity_residual_gpu(dmesh, ss.d_phi, ss.d_divCorr);
         CUDA_CALL(cudaDeviceSynchronize());
@@ -8051,12 +10113,76 @@ CUDA_CALL(cudaFree(0));
             par.rho, par.pCoeffScale, par.pNonOrthScale,
             par.rcMode, par.hbyaBcMode, ss.d_phi);
         CUDA_CHECK_LAST();
+        add_coupled_velocity_skew_to_phi_if_enabled(
+            dmesh, mesh, mom, gop, dbcU, dbcV, dbcW,
+            ss.d_u, ss.d_v, ss.d_w,
+            par.rho, coupledFaceSkewScaleRuntime, ss.d_phi);
 
         continuity_residual_gpu(dmesh, ss.d_phi, ss.d_divCorr);
         CUDA_CALL(cudaDeviceSynchronize());
         fluxTime += MPI_Wtime() - tf0;
 
-        massRes = maxabs_device(ss.d_divCorr, mesh.nCells, ss.d_reduce, ss.reduceSize);
+        massRes = continuity_mass_norm_for_stop(ss.d_divCorr);
+
+        if(const char* envMassAudit = std::getenv("ANABASIS_MASS_AUDIT")){
+          static int massAuditCount = 0;
+          const int massAuditLimit = std::max(1, std::atoi(envMassAudit));
+          if(massAuditCount < massAuditLimit){
+            ++massAuditCount;
+
+            std::vector<double> h_div(mesh.nCells, 0.0);
+            CUDA_CALL(cudaMemcpy(h_div.data(), ss.d_divCorr,
+                                 mesh.nCells*sizeof(double),
+                                 cudaMemcpyDeviceToHost));
+
+            std::vector<int> bFaceCount(mesh.nCells, 0);
+            for(int ff=mesh.nInternalFaces; ff<mesh.nFaces; ++ff){
+              const int c = mesh.owner[ff];
+              if(c >= 0 && c < mesh.nCells) bFaceCount[c]++;
+            }
+
+            double maxAll = -1.0, maxExRef = -1.0;
+            int maxAllCell = -1, maxExRefCell = -1;
+            double sumDiv = 0.0, sumAbsDiv = 0.0;
+
+            for(int c=0; c<mesh.nCells; ++c){
+              const double v = h_div[c];
+              const double av = std::fabs(v);
+              sumDiv += v;
+              sumAbsDiv += av;
+
+              if(av > maxAll){
+                maxAll = av;
+                maxAllCell = c;
+              }
+              if((!usePressureAnchor || c != refCell) && av > maxExRef){
+                maxExRef = av;
+                maxExRefCell = c;
+              }
+            }
+
+            auto printCell = [&](const char* tag, int c){
+              if(c < 0 || c >= mesh.nCells){
+                std::printf("MASS_AUDIT %s cell=-1\n", tag);
+                return;
+              }
+              std::printf(
+                "MASS_AUDIT %s cell=%d div=% .12e abs=% .12e vol=% .12e cc=(%.12e %.12e %.12e) bFaces=%d\n",
+                tag, c, h_div[c], std::fabs(h_div[c]), mesh.vol[c],
+                mesh.cc[c][0], mesh.cc[c][1], mesh.cc[c][2], bFaceCount[c]);
+            };
+
+            std::printf(
+              "MASS_AUDIT step=%d pic=%d useAnchor=%d refCell=%d massRes=%.12e maxExRef=%.12e sumDiv=% .12e sumAbsDiv=%.12e\n",
+              timeStep, pic, usePressureAnchor ? 1 : 0, refCell,
+              massRes, maxExRef, sumDiv, sumAbsDiv);
+
+            printCell("maxAll", maxAllCell);
+            printCell("maxExRef", maxExRefCell);
+            if(usePressureAnchor) printCell("ref", refCell);
+          }
+        }
+
         duRel = relchg_device(ss.d_u, ss.d_uOld, mesh.nCells, ss.d_reduce, ss.d_reduce2, ss.reduceSize);
         dvRel = relchg_device(ss.d_v, ss.d_vOld, mesh.nCells, ss.d_reduce, ss.d_reduce2, ss.reduceSize);
         dwRel = relchg_device(ss.d_w, ss.d_wOld, mesh.nCells, ss.d_reduce, ss.d_reduce2, ss.reduceSize);
@@ -8067,8 +10193,9 @@ CUDA_CALL(cudaFree(0));
         stepConverged = timeStep;
 
         const double fieldRelMax = std::max(std::max(duRel,dvRel), std::max(dwRel,dpRel));
+        const bool timePrintGate = (par.printEvery > 0 && (timeStep % par.printEvery) == 0);
         const bool doPrint =
-            (rank == 0) &&
+            (rank == 0) && par.monitor && timePrintGate &&
             (pic == 1 ||
              pic % std::max(1, par.picardPrintEvery) == 0 ||
              massRes < par.tolMass ||
@@ -8122,7 +10249,7 @@ CUDA_CALL(cudaFree(0));
 
         if(picardStop){
           picardConverged = true;
-          if(par.forceEnable && par.forceEvery > 0 && (timeStep == 1 || (timeStep % par.forceEvery) == 0)){
+          if(par.forceEnable && par.forceEvery > 0 && (timeStep % par.forceEvery) == 0){
             copy_device_to_vec(ss.d_u, u);
             copy_device_to_vec(ss.d_v, v);
             copy_device_to_vec(ss.d_w, w);
@@ -8139,7 +10266,7 @@ CUDA_CALL(cudaFree(0));
                           timeStep, physicalTime, sampleForce.CDrag, sampleForce.CLift, sampleForce.CSpan, pic);
             }
           }
-          if(rank == 0){
+          if(rank == 0 && (par.printEvery > 0 && (timeStep % par.printEvery) == 0)){
             std::printf("Time step %d converged/stopped at Picard %d: t=%.6e massRes=%.6e fieldRelMax=%.6e stopMode=%s stepWall=%.3f\n",
                         timeStep, pic, physicalTime, massRes, fieldRelMax,
                         picard_mode_name(par.picardConvergenceMode),
@@ -8155,6 +10282,37 @@ CUDA_CALL(cudaFree(0));
                     timeStep, maxPicard, physicalTime, massRes, fieldRelMax,
                     picard_mode_name(par.picardConvergenceMode),
                     MPI_Wtime() - stepWall0);
+      }
+
+      if(par.write_vtu && par.writeEvery > 0 && (timeStep % par.writeEvery) == 0){
+        copy_device_to_vec(ss.d_u, u);
+        copy_device_to_vec(ss.d_v, v);
+        copy_device_to_vec(ss.d_w, w);
+        copy_device_to_vec(ss.d_p, p);
+        copy_device_to_vec(ss.d_divCorr, divCorr);
+
+        std::vector<std::array<double,3>> UvecStep(mesh.nCells);
+        std::vector<double> umagStep(mesh.nCells);
+        for(int c=0; c<mesh.nCells; ++c){
+          UvecStep[c] = {u[c], v[c], w[c]};
+          umagStep[c] = std::sqrt(u[c]*u[c] + v[c]*v[c] + w[c]*w[c]);
+        }
+
+        std::ostringstream oss;
+        oss << par.outPrefix
+            << "_coupled_tstep"
+            << std::setw(6) << std::setfill('0') << timeStep
+            << ".vtu";
+
+        write_vtu_polyhedron_cell_data(
+            oss.str(), mesh,
+            {"p", "umag", "cell_volume", "divCoupled"},
+            {p, umagStep, mesh.vol, divCorr},
+            "U", &UvecStep);
+
+        if(rank == 0){
+          std::printf("Wrote transient VTU: %s\n", oss.str().c_str());
+        }
       }
 
       CUDA_CALL(cudaMemcpy(d_uTimeOldOld, d_uTime, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
@@ -8189,6 +10347,19 @@ CUDA_CALL(cudaFree(0));
       pmax = std::max(pmax, std::fabs(p[c]));
     }
 
+    double ethierUAbsL2 = 0.0, ethierURelL2 = 0.0;
+    double ethierPAbsL2 = 0.0, ethierPRelL2 = 0.0, ethierPMeanOffset = 0.0;
+    const double ethierFinalTime = par.timeStart + nPhysicalSteps * par.transientDt;
+    if(par.ethierEnable){
+      ethier_report_error(mesh, u, v, w, p, ethierFinalTime, par.ethierA, par.ethierD,
+                          ethierUAbsL2, ethierURelL2,
+                          ethierPAbsL2, ethierPRelL2, ethierPMeanOffset);
+      if(rank == 0){
+        std::printf("Ethier exact error at t=%.12e: U_abs_L2=%.12e U_rel_L2=%.12e p_abs_L2_meanfree=%.12e p_rel_L2_meanfree=%.12e p_mean_offset=%.12e\n",
+                    ethierFinalTime, ethierUAbsL2, ethierURelL2, ethierPAbsL2, ethierPRelL2, ethierPMeanOffset);
+      }
+    }
+
     if(par.write_vtu){
       const std::string vtuFile = par.outPrefix + "_coupled_final.vtu";
       write_vtu_polyhedron_cell_data(vtuFile, mesh,
@@ -8214,6 +10385,15 @@ CUDA_CALL(cudaFree(0));
     sout << "fluxTime " << fluxTime << "\n";
     sout << "solveLoopWall " << solveLoopWall << "\n";
     sout << "totalWall " << (MPI_Wtime() - runStartCoupled) << "\n";
+    if(par.ethierEnable){
+      sout << "ethierEnable " << par.ethierEnable << "\n";
+      sout << "ethierFinalTime " << ethierFinalTime << "\n";
+      sout << "ethierUAbsL2 " << ethierUAbsL2 << "\n";
+      sout << "ethierURelL2 " << ethierURelL2 << "\n";
+      sout << "ethierPAbsL2MeanFree " << ethierPAbsL2 << "\n";
+      sout << "ethierPRelL2MeanFree " << ethierPRelL2 << "\n";
+      sout << "ethierPMeanOffset " << ethierPMeanOffset << "\n";
+    }
     sout.close();
 
     if(rank == 0){
@@ -8230,6 +10410,10 @@ CUDA_CALL(cudaFree(0));
       std::printf("coupled solve    = %.6e s\n", coupledSolve);
       std::printf("flux/residual    = %.6e s\n", fluxTime);
       std::printf("solve loop wall  = %.6e s\n", solveLoopWall);
+      if(par.ethierEnable){
+        std::printf("Ethier U rel L2  = %.12e\n", ethierURelL2);
+        std::printf("Ethier p rel L2  = %.12e  (mean-free)\n", ethierPRelL2);
+      }
       std::printf("summary file     = %s\n", (par.outPrefix + "_coupled_summary.txt").c_str());
       std::printf("------------------------------------------------------------\n");
     }
@@ -8604,7 +10788,7 @@ CUDA_CALL(cudaFree(0));
       continuity_residual_gpu(dmesh, ss.d_phi, ss.d_divCorr);
       profile_record(prof[PH_CONT_IN_P_LOOP], pm_contp);
     }
-    massRes = maxabs_device(ss.d_divCorr, mesh.nCells, ss.d_reduce, ss.reduceSize);
+    massRes = continuity_mass_norm_for_stop(ss.d_divCorr);
     {
       const int block = 256;
       if(par.pMode == 1){
