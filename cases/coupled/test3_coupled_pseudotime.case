@@ -1,0 +1,116 @@
+# Industrial test3 coupled pseudo-time case
+# Mesh:
+#   patch_0_0 = wall
+#   patch_2_0 = inlet
+#   patch_3_0 = outlet
+#
+# Physical setup:
+#   mu = 1e5
+#   inlet normal velocity = 1e-3 inward
+#   outlet pressure = 0
+
+polyMeshDir /tmp/meshCase/constant/polyMesh
+outPrefix runs/test3_coupled/case
+
+device 0
+writeVtu 1
+writeEvery 200
+monitor 1
+profileSteps 0
+
+rho 1
+mu 1e5
+Umean 1e-3
+pipeD 1.0
+pipeL 1.0
+
+wallPatch patch_0_0
+inletPatch patch_2_0
+outletPatch patch_3_0
+
+# Pseudo-time / coupled transient controls
+pseudoTime 1
+pseudoDt 1e-4
+transientDt 1e-4
+transientNSteps 1000
+timeScheme BDF2
+
+# Picard stopping inside each pseudo-time step:
+# strict mode = massRes < tolMass AND fieldRelMax < picardTol
+picardConvergenceMode  mass
+maxPicard 20
+minPicard 10	
+picardTol 1e-3
+picardPrintEvery 1
+
+uRelax 0.7
+pRelax 0.3
+
+# Overall residual targets
+tolMass 1e-3
+tolVel 1e-3
+corrTol 1e-12
+
+nsteps 1000
+printEvery 1
+
+# Coupled linear solver
+coupledKrylov g
+velRestart 40
+
+pUseAmg 1
+pMaxit 500
+pTol 1e-10
+pRelTol 1e-6	
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgRelaxType 7
+pAmgKeepTranspose 1
+pAmgRebuildEvery 1
+pAmgPmax 4
+
+# SIMPLE-like pressure/RC controls in coupled app
+geomMethod robust
+lsqStencil compact
+lsqWeightPower 1
+
+pMode absolute
+pSolveMode ofAbsolute
+rcMode oflike
+pGradScheme lsq
+rAUMode raw
+pCoeffScale 1
+pDeltaMode of
+pDeltaMinCos 0.05
+
+# Your current requested nonorth settings
+momNonOrthScale 1
+pNonOrthScale 1
+nVelNonOrthCorr 0
+nNonOrthCorr 0
+nPressureCorr 0
+
+# Coupled-specific post pressure correction disabled for baseline
+coupledRcGradImplicit 0
+coupledPressureNonOrthCorr 0
+coupledCompactPressureSolve 0
+coupledPressureCorrectVelocity 0
+coupledPressureCorrRelax 0.25
+coupledPressureCorrRelTol -1
+coupledPressureCorrMaxit 300
+
+momentumConvectionScheme central
+initMode uniform
+
+forceEnable 0
+badCellAuditEvery 0
+
+# Industrial test3 BCs
+velocity patch_0_0 wall_noslip
+velocity patch_2_0 fixed_normal_speed -1e-3 average_patch_normal
+velocity patch_3_0 zero_gradient
+
+pressure patch_0_0 zero_gradient
+pressure patch_2_0 zero_gradient
+pressure patch_3_0 fixed_value 0.0

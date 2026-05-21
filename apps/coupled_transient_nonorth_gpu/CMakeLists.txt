@@ -1,5 +1,7 @@
 option(ANABASIS_USE_HYPRE_INTERNAL_SPGEMM "Force hypre internal device SpGEMM instead of vendor/cuSPARSE SpGEMM" OFF)
 
+find_package(CUDAToolkit REQUIRED)
+
 add_executable(coupled_transient_nonorth_gpu
   src/main.cu
   src/bc_specs.cu
@@ -22,6 +24,21 @@ target_link_libraries(coupled_transient_nonorth_gpu
     libscalar
     ${MPI_CXX_LIBRARIES}
 )
+
+# Static CUDA HYPRE dependency closure.
+# Required when HYPRE_LIBRARY points to libHYPRE.a.
+# Without these, link fails with unresolved cusparse/cublas/curand/cusolver symbols.
+if(ANABASIS_HYPRE_STATIC_CUDA_DEPS)
+  target_link_libraries(coupled_transient_nonorth_gpu
+    PRIVATE
+      CUDA::cusparse
+      CUDA::cublas
+      CUDA::cublasLt
+      CUDA::curand
+      CUDA::cusolver
+      dl
+  )
+endif()
 
 if(MPI_CXX_COMPILE_OPTIONS)
   target_compile_options(coupled_transient_nonorth_gpu PRIVATE ${MPI_CXX_COMPILE_OPTIONS})

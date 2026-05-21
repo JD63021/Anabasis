@@ -1,0 +1,101 @@
+# Generated safer polycube MMS case: variant=pnonorth_momsource
+# All exact MMS BCs are applied to all patches; wall/inlet/outlet names are only audit placeholders.
+# mesh patches: patch_6_0, patch_2_0, patch_4_0, patch_3_0, patch_5_0, patch_1_0
+
+# Frozen robust SIMPLE MMS unit cube verification case
+# Purpose: debug current robust/absolute/oflike path, not tune options.
+polyMeshDir /tmp/meshCase/constant/polyMesh
+outPrefix runs/test3/case
+
+device 0
+writeVtu 1
+writeEvery 200
+monitor 1
+profileSteps 0
+rho 1
+mu 1e5
+Umean 1e-3
+pipeD 1.0
+pipeL 1.0
+wallPatch patch_0_0
+inletPatch patch_2_0
+outletPatch patch_3_0
+nsteps 2000
+printEvery 10
+corrTol 1e-12
+tolMass 1e-3
+tolVel 1e-3
+uRelax 0.7
+pRelax 0.3
+geomMethod robust
+lsqStencil compact
+lsqWeightPower 1
+pMode absolute
+pSolveMode ofAbsolute
+rcMode oflike
+pGradScheme lsq
+rAUMode raw
+pCoeffScale 1
+pDeltaMode of
+pDeltaMinCos 0.05
+
+# blockMesh: no non-orthogonal correction needed
+momNonOrthScale 0
+pNonOrthScale 0
+nVelNonOrthCorr 0
+nNonOrthCorr 0
+nPressureCorr 0
+momentumConvectionScheme central
+initMode uniform
+velSolver bicgstab
+velMaxit 100
+velTol 1e-10
+velRelTol 0.0
+pUseAmg 500
+pMaxit 4000
+pTol 1e-10
+pRelTol 0.01
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgRelaxType 7
+pAmgKeepTranspose 1
+pAmgRebuildEvery 500
+simpleFaceSkewCorr 0
+simpleSubtriContinuity 0
+simpleSubtriFluxRecon 0
+simpleMmsEnable 0
+simpleMmsInitExact 0
+simpleMmsPressureDirichlet 1
+simpleMmsVelocityScale 0.1
+simpleMmsPressureScale 1.0
+
+# staged debug only for first few steps; full final error still printed
+simpleMmsDebugEvery 0
+simpleMmsDebugMaxStep 0
+forceEnable 0
+badCellAuditEvery 0
+
+# final exact-pressure equation audit
+simpleMmsAuditPressureEqn 0
+simpleMmsForceExactPhiStar 0
+simpleMmsForceDiscreteExactPhiStar 0
+simpleMmsFixedVelocityBoundaryPressureEqn 0
+
+# production-relevant fix: algebraically consistent pressure-lift phiStar
+simpleConsistentPhiStar 0
+simpleMmsForceExactIntegratedUFlux 0
+simpleMmsTracePressureEqn 0
+simpleMmsUseJumpLiftPhiStar 0
+simpleMmsSourceQuad8 0
+pAmgPmax 4
+
+# Industrial test3 BCs
+velocity patch_0_0 wall_noslip
+velocity patch_2_0 fixed_normal_speed -1e-3 average_patch_normal
+velocity patch_3_0 zero_gradient
+
+pressure patch_0_0 zero_gradient
+pressure patch_2_0 zero_gradient
+pressure patch_3_0 fixed_value 0.0
+simplePressureSubtri 1
