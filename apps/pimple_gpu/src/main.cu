@@ -4099,11 +4099,11 @@ static void assemble_momentum_rhs_only_on_gpu_device_grad(
   CUDA_CHECK_LAST();
 }
 
-static void extract_rAU_from_momentum_matrix(const Mesh &mesh, const DeviceMesh &dm, GPUMomentumAssembler &mom, const Params &par, std::vector<double> &rAU_host){
+static void extract_rAU_from_momentum_matrix(const Mesh &mesh, const DeviceMesh &dm, GPUMomentumAssembler &mom, const Params &par, double uRelaxMatrixThis, std::vector<double> &rAU_host){
   int block=256;
   int gridCells=(mesh.nCells + block - 1)/block;
   HYPRE_Complex *Avals = matrix_values_ptr(mom.lin);
-  const double diagScale = (par.rAUMode == 0 && par.uRelax < 0.999999) ? par.uRelax : 1.0;
+  const double diagScale = (par.rAUMode == 0 && uRelaxMatrixThis < 0.999999) ? uRelaxMatrixThis : 1.0;
   kernel_extract_vol_over_diag<<<gridCells, block>>>(mesh.nCells, mom.lin.pat.d_diagPos, Avals, dm.d_vol, mom.d_rAU, diagScale, par.rAUScale);
   CUDA_CHECK_LAST();
   rAU_host.clear(); // device-resident rAU is used by pressure and Rhie-Chow; host copy is not needed in optimized path.
@@ -6274,7 +6274,7 @@ CUDA_CALL(cudaFree(0));
             dbcQ, dbcU, dbcV, dbcW,
             par.momNonOrthScale, par.momentumConvectionScheme);
         relax_momentum_system_on_gpu(mesh, mom, d_qOut, uRelaxThis);
-        if(extractRAU) extract_rAU_from_momentum_matrix(mesh, dmesh, mom, par, rAU);
+        if(extractRAU) extract_rAU_from_momentum_matrix(mesh, dmesh, mom, par, uRelaxThis, rAU);
       } else {
         assemble_momentum_rhs_only_on_gpu_device_grad(
             dmesh, mesh, mom, par.rho, mu, par.transientMomentum ? par.dt : -1.0, activeTimeScheme,
@@ -6343,7 +6343,7 @@ CUDA_CALL(cudaFree(0));
           dbcQ, dbcU, dbcV, dbcW,
           par.momNonOrthScale, par.momentumConvectionScheme);
       relax_momentum_system_on_gpu(mesh, mom, d_qInitial, uRelaxThis);
-      if(extractRAU) extract_rAU_from_momentum_matrix(mesh, dmesh, mom, par, rAU);
+      if(extractRAU) extract_rAU_from_momentum_matrix(mesh, dmesh, mom, par, uRelaxThis, rAU);
     } else {
       assemble_momentum_rhs_only_on_gpu_device_grad(
           dmesh, mesh, mom, par.rho, mu, par.transientMomentum ? par.dt : -1.0, activeTimeScheme,
