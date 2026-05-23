@@ -91,6 +91,15 @@ struct Params {
   int pAmgRebuildEvery=1; // rebuild AMG hierarchy on outer iter 1 and then every N outer iterations
   int pAmgSetupScope=0;    // 0 = setup once per outer iteration, 1 = setup before every pressure solve
 
+  // COUPLED_ABSTOL_PATCH + system-AMG knobs.
+  // Default preserves old scalar/unknown-based BoomerAMG behavior.
+  // For cell-wise [Ux,Uy,Uz,p], use coupledAmgNumFunctions=4 and test nodal=2 or 4.
+  int coupledAmgNumFunctions=1;
+  int coupledAmgNodal=0;
+  int coupledAmgNodalLevels=0;
+  int coupledAmgKeepSameSign=0;
+  int coupledAmgNodalDiag=0;
+
   // Momentum linear solver selector:
   //   0 = HYPRE BiCGSTAB
   //   2 = GPU multi-color Gauss-Seidel defect smoother
@@ -577,6 +586,16 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
     {"pAmgTruncFactor", "-p-amg-trunc-factor"},
     {"pAmgKeepTranspose", "-p-amg-keep-transpose"},
     {"pAmgRebuildEvery", "-p-amg-rebuild-every"},
+    {"coupledAmgNumFunctions", "-coupled-amg-num-functions"},
+    {"coupled-amg-num-functions", "-coupled-amg-num-functions"},
+    {"coupledAmgNodal", "-coupled-amg-nodal"},
+    {"coupled-amg-nodal", "-coupled-amg-nodal"},
+    {"coupledAmgNodalLevels", "-coupled-amg-nodal-levels"},
+    {"coupled-amg-nodal-levels", "-coupled-amg-nodal-levels"},
+    {"coupledAmgKeepSameSign", "-coupled-amg-keep-same-sign"},
+    {"coupled-amg-keep-same-sign", "-coupled-amg-keep-same-sign"},
+    {"coupledAmgNodalDiag", "-coupled-amg-nodal-diag"},
+    {"coupled-amg-nodal-diag", "-coupled-amg-nodal-diag"},
     {"pseudoTime", "-pseudo-time"},
     {"pseudoDt", "-pseudo-dt"},
     {"transientDt", "-transient-dt"},
@@ -1123,6 +1142,11 @@ static void parse_args(int argc, char** argv, Params &par){
     else if(!std::strcmp(argv[i],"-p-amg-pmax")){need(argv[i]); par.pAmgPmax=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-amg-trunc-factor")){need(argv[i]); par.pAmgTruncFactor=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-amg-keep-transpose")){need(argv[i]); par.pAmgKeepTranspose=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-coupled-amg-num-functions")){need(argv[i]); par.coupledAmgNumFunctions=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-coupled-amg-nodal")){need(argv[i]); par.coupledAmgNodal=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-coupled-amg-nodal-levels")){need(argv[i]); par.coupledAmgNodalLevels=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-coupled-amg-keep-same-sign")){need(argv[i]); par.coupledAmgKeepSameSign=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-coupled-amg-nodal-diag")){need(argv[i]); par.coupledAmgNodalDiag=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-profile-steps")){need(argv[i]); par.profileSteps=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-amg-rebuild-every")){need(argv[i]); par.pAmgRebuildEvery=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-amg-setup-scope")){
@@ -1388,10 +1412,104 @@ static Mesh read_openfoam_polymesh(const std::string &polyMeshDir, int geomMetho
   std::vector<int> neigh0 = read_foam_labels(polyMeshDir+"/neighbour");
 
   mesh.nFaces=(int)mesh.faces.size();
-  mesh.nInternalFaces=(int)neigh0.size();
+
+  if((int)owner0.size() != mesh.nFaces){
+    throw std::runtime_error(
+      "polyMesh owner count does not match faces count: owner=" +
+      std::to_string(owner0.size()) + " faces=" + std::to_string(mesh.nFaces));
+  }
+
+  // Standard OpenFOAM polyMesh:
+  //     neighbour has exactly nInternalFaces entries.
+  //
+  // Some cfMesh-generated / converted polyMesh directories instead write
+  //     neighbour with one entry per face,
+  //     and use -1 for boundary faces.
+  //
+  // In OpenFOAM boundary, the first boundary patch startFace is the true
+  // nInternalFaces. Use that as authoritative when boundary patches exist.
+  int nInternalFromBoundary = -1;
+  int maxPatchEnd = 0;
+  if(!patches.empty()){
+    nInternalFromBoundary = mesh.nFaces;
+    for(const auto &bp : patches){
+      if(bp.startFace < 0 || bp.nFaces < 0 ||
+         bp.startFace > mesh.nFaces ||
+         bp.startFace + bp.nFaces > mesh.nFaces){
+        throw std::runtime_error(
+          "Invalid boundary patch range for patch " + bp.name +
+          ": startFace=" + std::to_string(bp.startFace) +
+          " nFaces=" + std::to_string(bp.nFaces) +
+          " nFacesTotal=" + std::to_string(mesh.nFaces));
+      }
+      nInternalFromBoundary = std::min(nInternalFromBoundary, bp.startFace);
+      maxPatchEnd = std::max(maxPatchEnd, bp.startFace + bp.nFaces);
+    }
+
+    if(maxPatchEnd != mesh.nFaces){
+      throw std::runtime_error(
+        "Boundary patch ranges do not end at nFaces: maxPatchEnd=" +
+        std::to_string(maxPatchEnd) +
+        " nFaces=" + std::to_string(mesh.nFaces));
+    }
+  }
+
+  int trueNInternalFaces = (int)neigh0.size();
+
+  if(nInternalFromBoundary >= 0){
+    trueNInternalFaces = nInternalFromBoundary;
+
+    if((int)neigh0.size() == trueNInternalFaces){
+      // Normal OpenFOAM layout.
+    } else if((int)neigh0.size() == mesh.nFaces){
+      // cfMesh-style full neighbour list. Internal entries must be real cells;
+      // boundary entries must be negative, normally -1.
+      for(int f=0; f<trueNInternalFaces; ++f){
+        if(neigh0[f] < 0){
+          throw std::runtime_error(
+            "Negative neighbour inside internal-face range at face " +
+            std::to_string(f));
+        }
+      }
+
+      for(int f=trueNInternalFaces; f<mesh.nFaces; ++f){
+        if(neigh0[f] >= 0){
+          throw std::runtime_error(
+            "Non-negative neighbour on boundary-face range at face " +
+            std::to_string(f) +
+            ". Cannot decide cfMesh full-neighbour layout safely.");
+        }
+      }
+
+      std::printf(
+        "Detected cfMesh-style full neighbour list: neighbour entries=%zu, "
+        "using nInternalFaces=%d from boundary startFace\n",
+        neigh0.size(), trueNInternalFaces);
+    } else {
+      throw std::runtime_error(
+        "neighbour count is neither nInternalFaces nor nFaces: neighbour=" +
+        std::to_string(neigh0.size()) +
+        " boundary-derived nInternalFaces=" +
+        std::to_string(trueNInternalFaces) +
+        " nFaces=" + std::to_string(mesh.nFaces));
+    }
+  } else {
+    if((int)neigh0.size() > mesh.nFaces){
+      throw std::runtime_error(
+        "neighbour count exceeds faces count: neighbour=" +
+        std::to_string(neigh0.size()) +
+        " nFaces=" + std::to_string(mesh.nFaces));
+    }
+  }
+
+  mesh.nInternalFaces = trueNInternalFaces;
+
   mesh.nCells=0;
   for(int v:owner0) mesh.nCells=std::max(mesh.nCells,v+1);
-  for(int v:neigh0) mesh.nCells=std::max(mesh.nCells,v+1);
+  for(int i=0;i<mesh.nInternalFaces;++i){
+    mesh.nCells=std::max(mesh.nCells,neigh0[i]+1);
+  }
+
   mesh.owner.resize(mesh.nFaces);
   mesh.neigh.assign(mesh.nInternalFaces,0);
   for(int i=0;i<mesh.nFaces;++i) mesh.owner[i]=owner0[i];
@@ -7645,6 +7763,7 @@ static void init_coupled_system(GPUCoupledAssembler &cpl, const Mesh &mesh, cons
     HYPRE_CALL(HYPRE_ParCSRBiCGSTABCreate(MPI_COMM_WORLD, &cpl.lin.solver));
     cpl.lin.solverKind = 0;
     HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetTol(cpl.lin.solver, par.pRelTol));
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetAbsoluteTol(cpl.lin.solver, std::max(0.0, par.pTol)));
     HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetMaxIter(cpl.lin.solver, par.pMaxit));
     HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetPrintLevel(cpl.lin.solver, 0));
     HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetLogging(cpl.lin.solver, 1));
@@ -7652,6 +7771,7 @@ static void init_coupled_system(GPUCoupledAssembler &cpl, const Mesh &mesh, cons
     HYPRE_CALL(HYPRE_ParCSRGMRESCreate(MPI_COMM_WORLD, &cpl.lin.solver));
     cpl.lin.solverKind = 3;
     HYPRE_CALL(HYPRE_ParCSRGMRESSetTol(cpl.lin.solver, par.pRelTol));
+    HYPRE_CALL(HYPRE_ParCSRGMRESSetAbsoluteTol(cpl.lin.solver, std::max(0.0, par.pTol)));
     HYPRE_CALL(HYPRE_ParCSRGMRESSetMaxIter(cpl.lin.solver, par.pMaxit));
     HYPRE_CALL(HYPRE_ParCSRGMRESSetKDim(cpl.lin.solver, std::max(10, par.velRestart)));
     HYPRE_CALL(HYPRE_ParCSRGMRESSetPrintLevel(cpl.lin.solver, 0));
@@ -7660,6 +7780,7 @@ static void init_coupled_system(GPUCoupledAssembler &cpl, const Mesh &mesh, cons
     HYPRE_CALL(HYPRE_ParCSRFlexGMRESCreate(MPI_COMM_WORLD, &cpl.lin.solver));
     cpl.lin.solverKind = 2;
     HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetTol(cpl.lin.solver, par.pRelTol));
+    HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetAbsoluteTol(cpl.lin.solver, std::max(0.0, par.pTol)));
     HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetMaxIter(cpl.lin.solver, par.pMaxit));
     HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetKDim(cpl.lin.solver, std::max(10, par.velRestart)));
     HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetPrintLevel(cpl.lin.solver, 0));
@@ -7679,6 +7800,23 @@ static void init_coupled_system(GPUCoupledAssembler &cpl, const Mesh &mesh, cons
     HYPRE_CALL(HYPRE_BoomerAMGSetPMaxElmts(cpl.lin.prec, par.pAmgPmax));
     HYPRE_CALL(HYPRE_BoomerAMGSetTruncFactor(cpl.lin.prec, par.pAmgTruncFactor));
     HYPRE_CALL(HYPRE_BoomerAMGSetKeepTranspose(cpl.lin.prec, par.pAmgKeepTranspose));
+
+    if(par.coupledAmgNumFunctions > 1){
+      HYPRE_CALL(HYPRE_BoomerAMGSetNumFunctions(cpl.lin.prec, par.coupledAmgNumFunctions));
+
+      // Keep nodal BoomerAMG strictly opt-in.
+      // On CUDA device-memory HYPRE builds, the nodal/system path may enter
+      // CPU/unsupported code paths unless unified memory support is available.
+      // numFunctions=4,nodal=0 is the safe "tell AMG about variables but do not
+      // request nodal coarsening" experiment.
+      if(par.coupledAmgNodal > 0){
+        HYPRE_CALL(HYPRE_BoomerAMGSetNodal(cpl.lin.prec, par.coupledAmgNodal));
+        HYPRE_CALL(HYPRE_BoomerAMGSetNodalLevels(cpl.lin.prec, par.coupledAmgNodalLevels));
+        HYPRE_CALL(HYPRE_BoomerAMGSetKeepSameSign(cpl.lin.prec, par.coupledAmgKeepSameSign));
+        HYPRE_CALL(HYPRE_BoomerAMGSetNodalDiag(cpl.lin.prec, par.coupledAmgNodalDiag));
+      }
+    }
+
     HYPRE_CALL(HYPRE_BoomerAMGSetRAP2(cpl.lin.prec, 0));
     if(par.pAmgAggLevels > 0){
       HYPRE_CALL(HYPRE_BoomerAMGSetAggNumLevels(cpl.lin.prec, par.pAmgAggLevels));
@@ -8826,14 +8964,17 @@ static void solve_coupled_linear_device(
   const int kdim = std::max(10, par.velRestart);
   if(cpl.lin.solverKind == 2){
     HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetTol(cpl.lin.solver, par.pRelTol));
+    HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetAbsoluteTol(cpl.lin.solver, std::max(0.0, par.pTol)));
     HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetMaxIter(cpl.lin.solver, par.pMaxit));
     HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetKDim(cpl.lin.solver, kdim));
   } else if(cpl.lin.solverKind == 3){
     HYPRE_CALL(HYPRE_ParCSRGMRESSetTol(cpl.lin.solver, par.pRelTol));
+    HYPRE_CALL(HYPRE_ParCSRGMRESSetAbsoluteTol(cpl.lin.solver, std::max(0.0, par.pTol)));
     HYPRE_CALL(HYPRE_ParCSRGMRESSetMaxIter(cpl.lin.solver, par.pMaxit));
     HYPRE_CALL(HYPRE_ParCSRGMRESSetKDim(cpl.lin.solver, kdim));
   } else {
     HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetTol(cpl.lin.solver, par.pRelTol));
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetAbsoluteTol(cpl.lin.solver, std::max(0.0, par.pTol)));
     HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetMaxIter(cpl.lin.solver, par.pMaxit));
   }
 
@@ -9710,6 +9851,10 @@ CUDA_CALL(cudaFree(0));
       std::printf("AMG            : coarsen=%d interp=%d relax=%d aggLevels=%d pmax=%d trunc=%.3g\n",
                   par.pAmgCoarsenType, par.pAmgInterpType, par.pAmgRelaxType,
                   par.pAmgAggLevels, par.pAmgPmax, par.pAmgTruncFactor);
+      std::printf("Coupled AMG sys: numFunctions=%d nodal=%d nodalLevels=%d keepSameSign=%d nodalDiag=%d\n",
+                  par.coupledAmgNumFunctions, par.coupledAmgNodal,
+                  par.coupledAmgNodalLevels, par.coupledAmgKeepSameSign,
+                  par.coupledAmgNodalDiag);
       std::printf("Pseudo-time    : enabled=%d pseudoDt=%.6e  momentum mass=rho*V/dt\n",
                   par.pseudoTime, par.pseudoDt);
       std::printf("Time scheme    : %s (BDF2 bootstraps first step with BDF1)\n",
