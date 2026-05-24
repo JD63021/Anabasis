@@ -1,0 +1,113 @@
+# Coupled pseudo-time cylinder Re=20
+# H = 0.41, D = 0.1, rho = 1, mu = 0.001
+# Mean inlet Ubar = 0.2, so Re = rho*Ubar*D/mu = 20
+# Parabolic-box Umax/Um = 0.45 because Ubar = (4/9)*Um = 0.2
+
+polyMeshDir /tmp/meshCase/constant/polyMesh
+outPrefix /home/jd/anabasis_v0_coupled_ethier/runs/coupled_cylinder_re20_pseudotime/reference
+device 0
+
+rho 1.0
+mu 0.001
+Umean 0.45
+pipeD 0.1
+pipeL 2.5
+
+# In this coupled build, dt/transientDt is what enters the pseudo-time mass term.
+# Set both dt and pseudoDt to the same value for clarity.
+pseudoTime 1
+pseudoDt 1
+dt 1
+timeScheme BDF1
+
+nsteps 1000
+printEvery 1
+writeVtu 1
+writeEvery 100
+
+pvdEnable 1
+pvdEvery 100
+pvdPath /home/jd/anabasis_v0_coupled_ethier/runs/coupled_cylinder_re20_pseudotime/reference.pvd
+
+pMode absolute
+pSolveMode ofAbsolute
+rcMode oflike
+pGradScheme lsq
+rAUMode raw
+pDeltaMode of
+
+uRelax 1.0
+pRelax 1.0
+
+# Pseudo-time stepping: one or few Picard sweeps per pseudo step.
+maxPicard 20
+minPicard 1
+picardTol 1e-8
+picardConvergenceMode oflike
+
+tolMass 1e-8
+tolVel 1e-8
+corrTol 1e-10
+
+nonlinearResidualEnable 1
+nonlinearResidualEvery 1
+nonlinearResidualStop 0
+nonlinearResidualRelTol 1e-6
+nonlinearResidualAbsTol 1e-6
+
+coupledKrylov bicgstab
+coupledGmresStartupSteps 5
+velRestart 80
+
+pUseAmg 1
+pMaxit 300
+pTol 1e-12
+pRelTol 0
+
+coupledAmgNumFunctions 4
+coupledAmgNodal 0
+pAmgCoarsenType 8
+pAmgInterpType 15
+pAmgAggLevels 0
+pAmgRelaxType 18
+pAmgPmax 4
+pAmgTruncFactor 0.2
+pAmgKeepTranspose 1
+pAmgRebuildEvery 100
+
+# Make these explicit so the log is not ambiguous.
+nVelNonOrthCorr 0
+nNonOrthCorr 0
+nPressureCorr 0
+coupledPressureNonOrthCorr 0
+
+# Keep the coupled non-orthogonal terms active in the operator/RHS.
+momNonOrthScale 1
+pNonOrthScale 1
+
+velocity patch_0_0 wall_noslip
+velocity patch_1_0 parabolic_box_inlet 0.41 0.45 y z average_patch_normal
+velocity patch_2_0 zero_gradient
+velocity patch_3_0 wall_noslip
+
+pressure patch_0_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0.0
+pressure patch_3_0 zero_gradient
+
+forceEnable 1
+forcePatch patch_3_0
+forceEvery 10
+forceLogPath /home/jd/anabasis_v0_coupled_ethier/runs/coupled_cylinder_re20_pseudotime/reference_force_timeseries.csv
+forceLogAppend 0
+forceNormalSign -1
+
+# Re=20 coefficient reference: Uref = mean inlet velocity = 0.2
+forceUref 0.2
+forceAreaRef 0.041
+forceDragDir 1,0,0
+forceLiftDir 0,0,1
+forceSpanDir 0,1,0
+coupledCompactPressureSolve 0
+coupledPressureCorrectVelocity 0
+coupledPressureCorrRelax 1.0
