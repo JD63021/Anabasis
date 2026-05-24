@@ -58,23 +58,14 @@ set_target_properties(coupled_transient_nonorth_gpu PROPERTIES
   CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
 )
 
-# STATIC_HYPRE_CUDA_VENDOR_TAIL_LINK_FOR_COUPLED
-# The local HYPRE CUDA build is linked as a static libHYPRE.a.  Its CUDA
-# backend still references cuSPARSE/cuBLAS/cuSOLVER/cuRAND symbols, so the
-# app must carry these vendor libraries explicitly at the end of the link line.
-target_link_libraries(coupled_transient_nonorth_gpu PRIVATE
-  /usr/local/cuda-12.2/lib64/libcusparse.so
-  /usr/local/cuda-12.2/lib64/libcublas.so
-  /usr/local/cuda-12.2/lib64/libcusolver.so
-  /usr/local/cuda-12.2/lib64/libcurand.so
-  /usr/local/cuda-12.2/lib64/libcudart.so
-)
 
-# STATIC_HYPRE_CUDA_VENDOR_TAIL_LINK_FOR_COUPLED_FORCE_ORDER
-# GNU ld resolves static libraries left-to-right.  The CUDA HYPRE archive
-# must appear before cuSPARSE/cuBLAS/cuSOLVER/cuRAND, otherwise symbols like
-# cusparseSpMV, cublasDdot_v2, cusolverDnDgetrf, curandCreateGenerator remain
-# unresolved at final link.
+# STATIC_HYPRE_CUDA_VENDOR_TAIL_LINK_FOR_COUPLED
+#
+# Static lib order matters.  The local CUDA HYPRE build is static:
+#   /opt/hypre-3.1.0-cuda-real/lib/libHYPRE.a
+#
+# HYPRE objects reference cuSPARSE/cuBLAS/cuSOLVER/cuRAND symbols, so repeat
+# libHYPRE.a late and place CUDA vendor libs after it.
 target_link_libraries(coupled_transient_nonorth_gpu PRIVATE
   /opt/hypre-3.1.0-cuda-real/lib/libHYPRE.a
   /usr/local/cuda-12.2/lib64/libcusparse.so
@@ -83,4 +74,3 @@ target_link_libraries(coupled_transient_nonorth_gpu PRIVATE
   /usr/local/cuda-12.2/lib64/libcurand.so
   /usr/local/cuda-12.2/lib64/libcudart.so
 )
-
