@@ -9,6 +9,7 @@
 #include <map>
 #include <set>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <iostream>
 #include <iomanip>
@@ -87,6 +88,14 @@ struct Params {
   //   2 = HYPRE ParCSR FlexGMRES
   //   3 = HYPRE ParCSR GMRES
   int coupledKrylov=2;
+
+  // Optional startup linear-solver continuation:
+  //   coupledGmresStartupSteps 0  -> use coupledKrylov from step 1
+  //   coupledGmresStartupSteps N  -> use GMRES for steps 1..N, then coupledKrylov
+  //
+  // This is useful when early pseudo-time steps are more stable with GMRES,
+  // but later steps should use cheaper BiCGSTAB.
+  int coupledGmresStartupSteps=0;
   int profileSteps=0;
   int pAmgRebuildEvery=1; // rebuild AMG hierarchy on outer iter 1 and then every N outer iterations
   int pAmgSetupScope=0;    // 0 = setup once per outer iteration, 1 = setup before every pressure solve
@@ -147,6 +156,22 @@ struct Params {
   int picardPrintEvery = 1;
   double transientDt = 1.0e-2;
   double timeStart = 0.0;
+
+  // Optional startup dt ramp.
+  // dt remains the target/final timestep.  For the first dtRampSteps,
+  // the active timestep is linearly ramped from
+  // dtRampStartFactor*dt to dt.
+  //
+  // Example:
+  //   dt 1e-3
+  //   dtRampEnable 1
+  //   dtRampSteps 10
+  //   dtRampStartFactor 0.1
+  //
+  // gives step 1 = 1e-4, step 10 = 1e-3, step 11+ = 1e-3.
+  int dtRampEnable = 0;
+  int dtRampSteps = 0;
+  double dtRampStartFactor = 0.1;
   // Transient time scheme for the coupled momentum mass term:
   //   0 = Euler/BDF1
   //   1 = BDF2/backward, bootstrapped by BDF1 on the first physical step.
@@ -240,6 +265,31 @@ struct Params {
   int ethierPressureDirichlet = 1;
   int ethierFluxCompatible = 1;
   int ethierBDF2ExactHistory = 1;
+
+  // Optional PVD collection output.
+  // At every pvdEvery checkpoint, scan VTUs matching outPrefix and overwrite one PVD.
+  int pvdEnable = 0;
+  int pvdEvery = 100;
+  std::string pvdPath = "";
+
+  // Binary coupled checkpoint/restart.
+  // checkpointPath empty -> outPrefix + "_restart.chk"
+  // restartPath empty    -> checkpointPath, or outPrefix + "_restart.chk"
+  int checkpointEnable = 0;
+  int checkpointEvery = 200;
+  std::string checkpointPath = "";
+  int restartEnable = 0;
+  std::string restartPath = "";
+  int restartResetHistory = 1;
+
+  // Optional fully reassembled nonlinear coupled residual monitor.
+  // Reassembles A(U,p), b(U,p), then evaluates r = A(U,p)*x(U,p) - b(U,p).
+  // This is a nonlinear defect monitor, not merely the Krylov residual.
+  int nonlinearResidualEnable = 0;
+  int nonlinearResidualEvery = 1;
+  int nonlinearResidualStop = 0;
+  double nonlinearResidualRelTol = -1.0;
+  double nonlinearResidualAbsTol = -1.0;
 };
 
 // add3/sub3/mul3/dot3/cross3/norm3 are provided by libpoisson/common.h via mesh.h.
@@ -546,6 +596,28 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
     {"printEvery", "-print-every"},
     {"writeVtu", "-write-vtu"},
     {"writeEvery", "-write-every"},
+    {"pvdEnable", "-pvd-enable"},
+    {"pvdEvery", "-pvd-every"},
+    {"pvdPath", "-pvd-path"},
+    {"nonlinearResidualEnable", "-nonlinear-residual-enable"},
+    {"nonlinearResidualEvery", "-nonlinear-residual-every"},
+    {"nonlinearResidualStop", "-nonlinear-residual-stop"},
+    {"nonlinearResidualRelTol", "-nonlinear-residual-reltol"},
+    {"nonlinearResidualAbsTol", "-nonlinear-residual-abstol"},
+    {"nlResidualEnable", "-nonlinear-residual-enable"},
+    {"nlResidualEvery", "-nonlinear-residual-every"},
+    {"nlResidualStop", "-nonlinear-residual-stop"},
+    {"nlResidualRelTol", "-nonlinear-residual-reltol"},
+    {"nlResidualAbsTol", "-nonlinear-residual-abstol"},
+    {"checkpointEnable", "-checkpoint-enable"},
+    {"checkpointEvery", "-checkpoint-every"},
+    {"checkpointPath", "-checkpoint-path"},
+    {"restartEnable", "-restart-enable"},
+    {"continuation", "-restart-enable"},
+    {"restartPath", "-restart-path"},
+    {"restartResetHistory", "-restart-reset-history"},
+    {"writePvd", "-pvd-enable"},
+    {"writePVD", "-pvd-enable"},
     {"monitor", "-monitor"},
 
     {"velRestart", "-vel-restart"},
@@ -574,6 +646,9 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
     {"pRelTol", "-p-reltol"},
     {"coupledKrylov", "-coupled-krylov"},
     {"coupledSolver", "-coupled-krylov"},
+    {"coupledGmresStartupSteps", "-coupled-gmres-startup-steps"},
+    {"gmresStartupSteps", "-coupled-gmres-startup-steps"},
+    {"gmresSteps", "-coupled-gmres-startup-steps"},
     {"pAmgSetupScope", "-p-amg-setup-scope"},
     {"pAmgMaxit", "-p-amg-maxit"},
     {"pAmgNumSweeps", "-p-amg-num-sweeps"},
@@ -602,6 +677,13 @@ static std::vector<std::string> expand_case_config_args(int argc, char** argv){
     {"dt", "-transient-dt"},
     {"timeStep", "-transient-dt"},
     {"transientNSteps", "-transient-nsteps"},
+    {"dtRampEnable", "-dt-ramp-enable"},
+    {"dtRampSteps", "-dt-ramp-steps"},
+    {"dtRampStartFactor", "-dt-ramp-start-factor"},
+    {"dt-ramp-enable", "-dt-ramp-enable"},
+    {"dt-ramp-steps", "-dt-ramp-steps"},
+    {"dt-ramp-start-factor", "-dt-ramp-start-factor"},
+    {"nsteps", "-transient-nsteps"},
     {"nTimeSteps", "-transient-nsteps"},
     {"maxPicard", "-max-picard"},
     {"minPicard", "-min-picard"},
@@ -1078,6 +1160,20 @@ static void parse_args(int argc, char** argv, Params &par){
     else if(!std::strcmp(argv[i],"-nsteps")){need(argv[i]); par.nsteps=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-print-every")){need(argv[i]); par.printEvery=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-write-every")){need(argv[i]); par.writeEvery=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-pvd-enable")){need(argv[i]); par.pvdEnable=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-pvd-every")){need(argv[i]); par.pvdEvery=std::max(1,std::atoi(argv[++i]));}
+    else if(!std::strcmp(argv[i],"-pvd-path")){need(argv[i]); par.pvdPath=argv[++i];}
+    else if(!std::strcmp(argv[i],"-nonlinear-residual-enable")){need(argv[i]); par.nonlinearResidualEnable=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-nonlinear-residual-every")){need(argv[i]); par.nonlinearResidualEvery=std::max(1,std::atoi(argv[++i]));}
+    else if(!std::strcmp(argv[i],"-nonlinear-residual-stop")){need(argv[i]); par.nonlinearResidualStop=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-nonlinear-residual-reltol")){need(argv[i]); par.nonlinearResidualRelTol=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-nonlinear-residual-abstol")){need(argv[i]); par.nonlinearResidualAbsTol=std::atof(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-checkpoint-enable")){need(argv[i]); par.checkpointEnable=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-checkpoint-every")){need(argv[i]); par.checkpointEvery=std::max(1,std::atoi(argv[++i]));}
+    else if(!std::strcmp(argv[i],"-checkpoint-path")){need(argv[i]); par.checkpointPath=argv[++i];}
+    else if(!std::strcmp(argv[i],"-restart-enable")){need(argv[i]); par.restartEnable=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-restart-path")){need(argv[i]); par.restartPath=argv[++i];}
+    else if(!std::strcmp(argv[i],"-restart-reset-history")){need(argv[i]); par.restartResetHistory=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-tolMass")){need(argv[i]); par.tolMass=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-tolVel")){need(argv[i]); par.tolVel=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-use-amg")){need(argv[i]); par.p_use_amg=std::atoi(argv[++i]);}
@@ -1093,13 +1189,35 @@ static void parse_args(int argc, char** argv, Params &par){
       else if(v=="gmres" || v=="1" || v=="3") par.coupledKrylov = 3;
       else { std::fprintf(stderr,"Unknown -coupled-krylov '%s'. Use fgmres, gmres, or bicgstab.\n", v.c_str()); MPI_Abort(MPI_COMM_WORLD,1); }
     }
+    else if(!std::strcmp(argv[i],"-coupled-gmres-startup-steps")){
+      need(argv[i]);
+      par.coupledGmresStartupSteps = std::max(0, std::atoi(argv[++i]));
+    }
     else if(!std::strcmp(argv[i],"-p-amg-maxit")){need(argv[i]); par.pAmgMaxit=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-amg-num-sweeps")){need(argv[i]); par.pAmgNumSweeps=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-p-amg-relax-type")){need(argv[i]); par.pAmgRelaxType=std::atoi(argv[++i]);}
     else if(!std::strcmp(argv[i],"-pseudo-time")){need(argv[i]); par.pseudoTime=std::atoi(argv[++i]);}
-    else if(!std::strcmp(argv[i],"-pseudo-dt")){need(argv[i]); par.pseudoDt=std::atof(argv[++i]);}
-    else if(!std::strcmp(argv[i],"-transient-dt")){need(argv[i]); par.transientDt=std::atof(argv[++i]);}
-    else if(!std::strcmp(argv[i],"-transient-nsteps")){need(argv[i]); par.transientNSteps=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-pseudo-dt")){
+      need(argv[i]);
+      const double dtVal = std::atof(argv[++i]);
+      par.pseudoDt = dtVal;
+      par.transientDt = dtVal;
+    }
+    else if(!std::strcmp(argv[i],"-transient-dt")){
+      need(argv[i]);
+      const double dtVal = std::atof(argv[++i]);
+      par.transientDt = dtVal;
+      par.pseudoDt = dtVal;
+    }
+    else if(!std::strcmp(argv[i],"-transient-nsteps")){
+      need(argv[i]);
+      const int nVal = std::atoi(argv[++i]);
+      par.transientNSteps = nVal;
+      par.nsteps = nVal;
+    }
+    else if(!std::strcmp(argv[i],"-dt-ramp-enable")){need(argv[i]); par.dtRampEnable=std::atoi(argv[++i]);}
+    else if(!std::strcmp(argv[i],"-dt-ramp-steps")){need(argv[i]); par.dtRampSteps=std::max(0,std::atoi(argv[++i]));}
+    else if(!std::strcmp(argv[i],"-dt-ramp-start-factor")){need(argv[i]); par.dtRampStartFactor=std::atof(argv[++i]);}
     else if(!std::strcmp(argv[i],"-time-scheme")){
       need(argv[i]);
       std::string v = argv[++i];
@@ -2871,6 +2989,198 @@ static void destroy_simple_scratch(GPUSimpleScratch &ss){
   device_free(ss.d_pCorrDelta); device_free(ss.d_reduce); device_free(ss.d_reduce2);
   ss = GPUSimpleScratch{};
 }
+
+
+static std::string coupled_checkpoint_default_path(const Params &par)
+{
+  if(!par.checkpointPath.empty()) return par.checkpointPath;
+  return par.outPrefix + "_restart.chk";
+}
+
+static std::string coupled_restart_default_path(const Params &par)
+{
+  if(!par.restartPath.empty()) return par.restartPath;
+  if(!par.checkpointPath.empty()) return par.checkpointPath;
+  return par.outPrefix + "_restart.chk";
+}
+
+static void write_raw_vector(std::ofstream &out, const std::vector<double> &v)
+{
+  if(!v.empty()){
+    out.write(reinterpret_cast<const char*>(v.data()),
+              static_cast<std::streamsize>(v.size() * sizeof(double)));
+  }
+}
+
+static bool read_raw_vector(std::ifstream &in, std::vector<double> &v)
+{
+  if(!v.empty()){
+    in.read(reinterpret_cast<char*>(v.data()),
+            static_cast<std::streamsize>(v.size() * sizeof(double)));
+    return bool(in);
+  }
+  return true;
+}
+
+static bool write_coupled_binary_checkpoint(
+    const Params &par,
+    const Mesh &mesh,
+    const GPUSimpleScratch &ss,
+    const double *d_uTimeOldOld,
+    const double *d_vTimeOldOld,
+    const double *d_wTimeOldOld,
+    int step,
+    double physicalTime)
+{
+  if(!par.checkpointEnable) return true;
+
+  const std::string path = coupled_checkpoint_default_path(par);
+
+  std::vector<double> u(mesh.nCells), v(mesh.nCells), w(mesh.nCells), p(mesh.nCells);
+  std::vector<double> uPrev(mesh.nCells), vPrev(mesh.nCells), wPrev(mesh.nCells);
+
+  copy_device_to_vec(ss.d_u, u);
+  copy_device_to_vec(ss.d_v, v);
+  copy_device_to_vec(ss.d_w, w);
+  copy_device_to_vec(ss.d_p, p);
+
+  copy_device_to_vec(d_uTimeOldOld, uPrev);
+  copy_device_to_vec(d_vTimeOldOld, vPrev);
+  copy_device_to_vec(d_wTimeOldOld, wPrev);
+
+  std::ofstream out(path, std::ios::binary);
+  if(!out){
+    std::fprintf(stderr, "WARNING: could not open checkpoint for writing: %s\n", path.c_str());
+    return false;
+  }
+
+  char magic[32] = {};
+  std::snprintf(magic, sizeof(magic), "ANABASIS_CPL_CKPT_V1");
+
+  int version = 1;
+  int nCells = mesh.nCells;
+  int hasHistory = 1;
+  double targetDt = par.transientDt;
+
+  out.write(magic, sizeof(magic));
+  out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+  out.write(reinterpret_cast<const char*>(&nCells), sizeof(nCells));
+  out.write(reinterpret_cast<const char*>(&step), sizeof(step));
+  out.write(reinterpret_cast<const char*>(&hasHistory), sizeof(hasHistory));
+  out.write(reinterpret_cast<const char*>(&physicalTime), sizeof(physicalTime));
+  out.write(reinterpret_cast<const char*>(&targetDt), sizeof(targetDt));
+
+  write_raw_vector(out, u);
+  write_raw_vector(out, v);
+  write_raw_vector(out, w);
+  write_raw_vector(out, p);
+  write_raw_vector(out, uPrev);
+  write_raw_vector(out, vPrev);
+  write_raw_vector(out, wPrev);
+
+  if(!out){
+    std::fprintf(stderr, "WARNING: failed while writing checkpoint: %s\n", path.c_str());
+    return false;
+  }
+
+  std::printf("Wrote checkpoint : %s  step=%d  time=%.12e  nCells=%d\n",
+              path.c_str(), step, physicalTime, nCells);
+
+  return true;
+}
+
+static bool read_coupled_binary_checkpoint(
+    const Params &par,
+    const Mesh &mesh,
+    GPUSimpleScratch &ss,
+    double *d_uTimeOldOld,
+    double *d_vTimeOldOld,
+    double *d_wTimeOldOld,
+    int &loadedStep,
+    double &loadedTime)
+{
+  const std::string path = coupled_restart_default_path(par);
+
+  std::ifstream in(path, std::ios::binary);
+  if(!in){
+    std::fprintf(stderr, "ERROR: restartEnable=1 but checkpoint could not be opened: %s\n", path.c_str());
+    return false;
+  }
+
+  char magic[32] = {};
+  int version = 0;
+  int nCells = 0;
+  int step = 0;
+  int hasHistory = 0;
+  double physicalTime = 0.0;
+  double targetDt = 0.0;
+
+  in.read(magic, sizeof(magic));
+  in.read(reinterpret_cast<char*>(&version), sizeof(version));
+  in.read(reinterpret_cast<char*>(&nCells), sizeof(nCells));
+  in.read(reinterpret_cast<char*>(&step), sizeof(step));
+  in.read(reinterpret_cast<char*>(&hasHistory), sizeof(hasHistory));
+  in.read(reinterpret_cast<char*>(&physicalTime), sizeof(physicalTime));
+  in.read(reinterpret_cast<char*>(&targetDt), sizeof(targetDt));
+
+  const std::string magicString(magic, magic + sizeof(magic));
+  if(magicString.find("ANABASIS_CPL_CKPT_V1") != 0 || version != 1){
+    std::fprintf(stderr, "ERROR: invalid coupled checkpoint header in %s\n", path.c_str());
+    return false;
+  }
+
+  if(nCells != mesh.nCells){
+    std::fprintf(stderr,
+                 "ERROR: checkpoint nCells=%d but current mesh nCells=%d. Refusing restart.\n",
+                 nCells, mesh.nCells);
+    return false;
+  }
+
+  std::vector<double> u(mesh.nCells), v(mesh.nCells), w(mesh.nCells), p(mesh.nCells);
+  std::vector<double> uPrev(mesh.nCells), vPrev(mesh.nCells), wPrev(mesh.nCells);
+
+  if(!read_raw_vector(in, u) ||
+     !read_raw_vector(in, v) ||
+     !read_raw_vector(in, w) ||
+     !read_raw_vector(in, p) ||
+     !read_raw_vector(in, uPrev) ||
+     !read_raw_vector(in, vPrev) ||
+     !read_raw_vector(in, wPrev)){
+    std::fprintf(stderr, "ERROR: failed while reading checkpoint payload: %s\n", path.c_str());
+    return false;
+  }
+
+  copy_vec_to_device(u, ss.d_u);
+  copy_vec_to_device(v, ss.d_v);
+  copy_vec_to_device(w, ss.d_w);
+  copy_vec_to_device(p, ss.d_p);
+
+  CUDA_CALL(cudaMemcpy(ss.d_uOld, ss.d_u, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+  CUDA_CALL(cudaMemcpy(ss.d_vOld, ss.d_v, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+  CUDA_CALL(cudaMemcpy(ss.d_wOld, ss.d_w, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+  CUDA_CALL(cudaMemcpy(ss.d_pOld, ss.d_p, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+
+  if(par.restartResetHistory == 0 && hasHistory){
+    copy_vec_to_device(uPrev, d_uTimeOldOld);
+    copy_vec_to_device(vPrev, d_vTimeOldOld);
+    copy_vec_to_device(wPrev, d_wTimeOldOld);
+  } else {
+    // Robust restart default: reset BDF2 history so the resumed first step
+    // bootstraps cleanly.  GMRES startup and dt ramp also restart from local step 1.
+    CUDA_CALL(cudaMemcpy(d_uTimeOldOld, ss.d_u, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+    CUDA_CALL(cudaMemcpy(d_vTimeOldOld, ss.d_v, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+    CUDA_CALL(cudaMemcpy(d_wTimeOldOld, ss.d_w, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+  }
+
+  loadedStep = step;
+  loadedTime = physicalTime;
+
+  std::printf("Read checkpoint  : %s  step=%d  time=%.12e  nCells=%d resetHistory=%d\n",
+              path.c_str(), loadedStep, loadedTime, nCells, par.restartResetHistory);
+
+  return true;
+}
+
 
 static void upload_gradient_to_device(const std::vector<std::array<double,3>> &grad,
                                       std::vector<double> &bufX, std::vector<double> &bufY, std::vector<double> &bufZ,
@@ -6068,6 +6378,7 @@ struct GPUCoupledAssembler {
   CoupledFaceSlots slots;
   double *d_rAU=nullptr;
   double *d_xDouble=nullptr;
+  double *d_resNonlinear=nullptr;
 };
 
 static void upload_coupled_slots(CoupledFaceSlots &s){
@@ -7742,6 +8053,270 @@ static void set_coupled_krylov_precond(
   }
 }
 
+
+static void destroy_coupled_krylov_solver_only(GPULinearSystem &lin)
+{
+  if(!lin.solver) return;
+
+  if(lin.solverKind == 2){
+    HYPRE_CALL(HYPRE_ParCSRFlexGMRESDestroy(lin.solver));
+  } else if(lin.solverKind == 3){
+    HYPRE_CALL(HYPRE_ParCSRGMRESDestroy(lin.solver));
+  } else if(lin.isPCG || lin.solverKind == 1){
+    HYPRE_CALL(HYPRE_ParCSRPCGDestroy(lin.solver));
+  } else {
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABDestroy(lin.solver));
+  }
+
+  lin.solver = nullptr;
+  lin.is_setup = false;
+}
+
+static void create_coupled_krylov_solver_only(GPULinearSystem &lin, const Params &par, int kind)
+{
+  if(kind != 0 && kind != 2 && kind != 3) kind = 2;
+
+  lin.isPCG = false;
+  lin.solverKind = kind;
+
+  const int kdim = std::max(10, par.velRestart);
+
+  if(kind == 0){
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABCreate(MPI_COMM_WORLD, &lin.solver));
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetTol(lin.solver, par.pRelTol));
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetAbsoluteTol(lin.solver, std::max(0.0, par.pTol)));
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetMaxIter(lin.solver, par.pMaxit));
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetPrintLevel(lin.solver, 0));
+    HYPRE_CALL(HYPRE_ParCSRBiCGSTABSetLogging(lin.solver, 1));
+  } else if(kind == 3){
+    HYPRE_CALL(HYPRE_ParCSRGMRESCreate(MPI_COMM_WORLD, &lin.solver));
+    HYPRE_CALL(HYPRE_ParCSRGMRESSetTol(lin.solver, par.pRelTol));
+    HYPRE_CALL(HYPRE_ParCSRGMRESSetAbsoluteTol(lin.solver, std::max(0.0, par.pTol)));
+    HYPRE_CALL(HYPRE_ParCSRGMRESSetMaxIter(lin.solver, par.pMaxit));
+    HYPRE_CALL(HYPRE_ParCSRGMRESSetKDim(lin.solver, kdim));
+    HYPRE_CALL(HYPRE_ParCSRGMRESSetPrintLevel(lin.solver, 0));
+    HYPRE_CALL(HYPRE_ParCSRGMRESSetLogging(lin.solver, 1));
+  } else {
+    HYPRE_CALL(HYPRE_ParCSRFlexGMRESCreate(MPI_COMM_WORLD, &lin.solver));
+    HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetTol(lin.solver, par.pRelTol));
+    HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetAbsoluteTol(lin.solver, std::max(0.0, par.pTol)));
+    HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetMaxIter(lin.solver, par.pMaxit));
+    HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetKDim(lin.solver, kdim));
+    HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetPrintLevel(lin.solver, 0));
+    HYPRE_CALL(HYPRE_ParCSRFlexGMRESSetLogging(lin.solver, 1));
+  }
+
+  if(par.p_use_amg && lin.prec){
+    set_coupled_krylov_precond(
+        lin,
+        (HYPRE_PtrToParSolverFcn)HYPRE_BoomerAMGSolve,
+        (HYPRE_PtrToParSolverFcn)HYPRE_BoomerAMGSetup,
+        lin.prec);
+  } else {
+    set_coupled_krylov_precond(
+        lin,
+        (HYPRE_PtrToParSolverFcn)HYPRE_ParCSRDiagScale,
+        (HYPRE_PtrToParSolverFcn)HYPRE_ParCSRDiagScaleSetup,
+        nullptr);
+  }
+
+  lin.is_setup = false;
+}
+
+static void switch_coupled_krylov_if_needed(GPUCoupledAssembler &cpl, const Params &par)
+{
+  int requestedKind = par.coupledKrylov;
+  if(requestedKind != 0 && requestedKind != 2 && requestedKind != 3){
+    requestedKind = 2;
+  }
+
+  if(cpl.lin.solver && cpl.lin.solverKind == requestedKind){
+    return;
+  }
+
+  const int rankPrint = [](){ int r=0; MPI_Comm_rank(MPI_COMM_WORLD, &r); return r; }();
+  if(rankPrint == 0){
+    std::printf("Switching coupled Krylov solver to %s\n",
+                coupled_krylov_name(requestedKind));
+  }
+
+  destroy_coupled_krylov_solver_only(cpl.lin);
+  create_coupled_krylov_solver_only(cpl.lin, par, requestedKind);
+}
+
+
+
+static double coupled_active_dt_for_step(const Params &par, int timeStep)
+{
+  const double targetDt = par.transientDt;
+
+  if(!par.dtRampEnable || par.dtRampSteps <= 1){
+    return targetDt;
+  }
+
+  if(timeStep >= par.dtRampSteps){
+    return targetDt;
+  }
+
+  double f0 = par.dtRampStartFactor;
+  if(f0 <= 0.0) f0 = 1.0e-6;
+  if(f0 > 1.0)  f0 = 1.0;
+
+  const double a = double(timeStep - 1) / double(par.dtRampSteps - 1);
+  const double f = f0 + (1.0 - f0) * a;
+
+  return targetDt * f;
+}
+
+
+static int extract_last_integer_from_vtu_name(const std::string &name)
+{
+  if(name.size() < 5) return -1;
+
+  std::size_t end = name.rfind(".vtu");
+  if(end == std::string::npos) return -1;
+
+  std::size_t i = end;
+  while(i > 0 && !std::isdigit(static_cast<unsigned char>(name[i-1]))) --i;
+  if(i == 0) return -1;
+
+  std::size_t j = i;
+  while(j > 0 && std::isdigit(static_cast<unsigned char>(name[j-1]))) --j;
+
+  if(j == i) return -1;
+
+  try {
+    return std::stoi(name.substr(j, i-j));
+  } catch(...) {
+    return -1;
+  }
+}
+
+static std::string xml_escape_path(const std::string &s)
+{
+  std::string out;
+  out.reserve(s.size());
+  for(char c : s){
+    if(c == '&') out += "&amp;";
+    else if(c == '<') out += "&lt;";
+    else if(c == '>') out += "&gt;";
+    else if(c == '"') out += "&quot;";
+    else out += c;
+  }
+  return out;
+}
+
+static void write_pvd_for_outprefix(const Params &par, int currentStep)
+{
+  if(!par.pvdEnable) return;
+
+  const int every = std::max(1, par.pvdEvery);
+  if(currentStep <= 0) return;
+  if(currentStep % every != 0) return;
+
+  namespace fs = std::filesystem;
+
+  fs::path prefixPath(par.outPrefix);
+  fs::path outDir = prefixPath.parent_path();
+  if(outDir.empty()) outDir = fs::current_path();
+
+  const std::string base = prefixPath.filename().string();
+  if(base.empty()) return;
+
+  fs::path pvdPath = par.pvdPath.empty()
+      ? fs::path(par.outPrefix + ".pvd")
+      : fs::path(par.pvdPath);
+
+  fs::path pvdDir = pvdPath.parent_path();
+  if(pvdDir.empty()) pvdDir = fs::current_path();
+
+  std::vector<std::pair<int, fs::path>> vtus;
+
+  try {
+    if(!fs::exists(outDir)) return;
+
+    for(const auto &entry : fs::directory_iterator(outDir)){
+      if(!entry.is_regular_file()) continue;
+
+      const fs::path f = entry.path();
+      if(f.extension() != ".vtu") continue;
+
+      const std::string name = f.filename().string();
+
+      // Only collect files that belong to this outPrefix.
+      if(name.rfind(base, 0) != 0) continue;
+
+      const int step = extract_last_integer_from_vtu_name(name);
+      if(step < 0) continue;
+      if(step > currentStep) continue;
+
+      vtus.emplace_back(step, f);
+    }
+  } catch(const std::exception &e) {
+    std::fprintf(stderr, "WARNING: PVD scan failed for %s: %s\n",
+                 outDir.string().c_str(), e.what());
+    return;
+  }
+
+  if(vtus.empty()){
+    std::fprintf(stderr, "WARNING: PVD requested at step %d, but no VTUs matching prefix '%s' were found in %s\n",
+                 currentStep, base.c_str(), outDir.string().c_str());
+    return;
+  }
+
+  std::sort(vtus.begin(), vtus.end(),
+            [](const auto &a, const auto &b){
+              if(a.first != b.first) return a.first < b.first;
+              return a.second.string() < b.second.string();
+            });
+
+  std::vector<std::pair<int, fs::path>> unique;
+  for(const auto &x : vtus){
+    if(!unique.empty() && unique.back().first == x.first){
+      unique.back() = x;
+    } else {
+      unique.push_back(x);
+    }
+  }
+
+  std::ofstream pvd(pvdPath);
+  if(!pvd){
+    std::fprintf(stderr, "WARNING: could not open PVD file for writing: %s\n",
+                 pvdPath.string().c_str());
+    return;
+  }
+
+  pvd << "<?xml version=\"1.0\"?>\n";
+  pvd << "<VTKFile type=\"Collection\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
+  pvd << "  <Collection>\n";
+
+  for(const auto &x : unique){
+    const int step = x.first;
+    const fs::path &vtuPath = x.second;
+
+    std::string rel;
+    try {
+      rel = fs::relative(vtuPath, pvdDir).generic_string();
+    } catch(...) {
+      rel = vtuPath.generic_string();
+    }
+
+    const double t = par.timeStart + double(step) * par.transientDt;
+
+    pvd << "    <DataSet timestep=\"" << std::setprecision(17) << t
+        << "\" group=\"\" part=\"0\" file=\""
+        << xml_escape_path(rel) << "\"/>\n";
+  }
+
+  pvd << "  </Collection>\n";
+  pvd << "</VTKFile>\n";
+  pvd.close();
+
+  std::printf("Wrote PVD        : %s  datasets=%zu  upToStep=%d\n",
+              pvdPath.string().c_str(), unique.size(), currentStep);
+}
+
+
 static void init_coupled_system(GPUCoupledAssembler &cpl, const Mesh &mesh, const Params &par){
   auto build = build_coupled_pattern_full4(mesh);
   cpl.slots = std::move(build.slots);
@@ -7749,6 +8324,7 @@ static void init_coupled_system(GPUCoupledAssembler &cpl, const Mesh &mesh, cons
   upload_coupled_slots(cpl.slots);
   device_alloc(cpl.d_rAU, mesh.nCells);
   device_alloc(cpl.d_xDouble, 4*mesh.nCells);
+  device_alloc(cpl.d_resNonlinear, 4*mesh.nCells);
 
   const int block = 256;
   const int gridVals = (cpl.lin.pat.nnz + block - 1)/block;
@@ -7844,6 +8420,7 @@ static void destroy_coupled_system(GPUCoupledAssembler &cpl){
   destroy_coupled_slots(cpl.slots);
   device_free(cpl.d_rAU);
   device_free(cpl.d_xDouble);
+  device_free(cpl.d_resNonlinear);
   destroy_linear_storage(cpl.lin);
   cpl = GPUCoupledAssembler{};
 }
@@ -8698,6 +9275,158 @@ static void assemble_coupled_darwish_system(
 
 
 
+
+struct CoupledNonlinearResidualReport {
+  double absInf = 0.0;
+  double relInf = 0.0;
+  double rhsInf = 0.0;
+  double momAbsInf = 0.0;
+  double contAbsInf = 0.0;
+  bool computed = false;
+  bool ok = true;
+};
+
+__global__ static void kernel_coupled_full_row_residual_nonlinear(
+    int nRows,
+    const int *rowOffsets,
+    const HYPRE_BigInt *cols,
+    const HYPRE_Complex *vals,
+    const HYPRE_Complex *rhs,
+    const double *x,
+    double *res,
+    int skipRow)
+{
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if(row >= nRows) return;
+
+  if(row == skipRow){
+    res[row] = 0.0;
+    return;
+  }
+
+  double r = 0.0;
+  for(int k=rowOffsets[row]; k<rowOffsets[row+1]; ++k){
+    const int col = (int)cols[k];
+    r += ((double)vals[k]) * x[col];
+  }
+
+  r -= (double)rhs[row];
+  res[row] = r;
+}
+
+static CoupledNonlinearResidualReport compute_coupled_nonlinear_residual_monitor(
+    const DeviceMesh &dmesh,
+    const Mesh &mesh,
+    GPUCoupledAssembler &cpl,
+    GPUMomentumAssembler &mom,
+    const DeviceGradientOperator &gop,
+    const Params &parIn,
+    double mu,
+    const DeviceBC &dbcU,
+    const DeviceBC &dbcV,
+    const DeviceBC &dbcW,
+    const DeviceBC &dbcP,
+    GPUSimpleScratch &ss,
+    const double *d_uTime,
+    const double *d_vTime,
+    const double *d_wTime,
+    const double *d_uTimeOldOld,
+    const double *d_vTimeOldOld,
+    const double *d_wTimeOldOld,
+    int activeTimeScheme,
+    bool usePressureAnchor,
+    int refCell,
+    double physicalTime,
+    int useEthierExactPGradRC)
+{
+  CoupledNonlinearResidualReport rep;
+
+  // Recompute current pressure gradient and reassemble with the current field
+  // used both as coefficients and as the tested unknown.
+  compute_pressure_gradient_gpu(parIn, gop, dmesh, dbcP, ss.d_p,
+                                ss.d_gradx, ss.d_grady, ss.d_gradz);
+
+  if(useEthierExactPGradRC){
+    fill_ethier_exact_pressure_gradient_gpu(
+        dmesh, physicalTime, ss.d_gradx, ss.d_grady, ss.d_gradz);
+  }
+
+  Params parRes = parIn;
+
+  // Important: under-relaxation is a nonlinear-iteration device, not part of
+  // the physical residual.  For this diagnostic, evaluate the unrelaxed equation.
+  parRes.uRelax = 1.0;
+  parRes.pRelax = 1.0;
+
+  const int block = 256;
+
+  // Use the latest matrix-consistent flux as the frozen convective flux.
+  // ss.d_phi was rebuilt just before this monitor from current U,p.
+  assemble_coupled_darwish_system(
+      dmesh, mesh, cpl, mom, gop, parRes, mu,
+      dbcU, dbcV, dbcW, dbcP,
+      ss.d_u, ss.d_v, ss.d_w,
+      ss.d_p,
+      d_uTime, d_vTime, d_wTime,
+      d_uTimeOldOld, d_vTimeOldOld, d_wTimeOldOld,
+      activeTimeScheme,
+      ss.d_phi, 1,
+      ss.d_gradx, ss.d_grady, ss.d_gradz,
+      usePressureAnchor, refCell, physicalTime);
+
+  kernel_pack_coupled_x<<<(mesh.nCells + block - 1)/block, block>>>(
+      mesh.nCells, ss.d_u, ss.d_v, ss.d_w, ss.d_p, cpl.d_xDouble);
+  CUDA_CHECK_LAST();
+
+  const int skipRow = usePressureAnchor ? (4*refCell + 3) : -1;
+
+  kernel_coupled_full_row_residual_nonlinear<<<(cpl.lin.n + block - 1)/block, block>>>(
+      cpl.lin.n,
+      cpl.lin.pat.d_rowOffsets,
+      cpl.lin.pat.d_cols,
+      matrix_values_ptr(cpl.lin),
+      cpl.lin.d_rhs,
+      cpl.d_xDouble,
+      cpl.d_resNonlinear,
+      skipRow);
+  CUDA_CHECK_LAST();
+  CUDA_CALL(cudaDeviceSynchronize());
+
+  std::vector<double> hres(cpl.lin.n, 0.0);
+  std::vector<HYPRE_Complex> hrhs(cpl.lin.n, 0.0);
+
+  copy_device_to_vec(cpl.d_resNonlinear, hres);
+  copy_device_to_vec(cpl.lin.d_rhs, hrhs);
+
+  for(int row=0; row<cpl.lin.n; ++row){
+    if(row == skipRow) continue;
+
+    const double ar = std::fabs(hres[row]);
+    const double ab = std::fabs((double)hrhs[row]);
+
+    rep.absInf = std::max(rep.absInf, ar);
+    rep.rhsInf = std::max(rep.rhsInf, ab);
+
+    const int rv = row % 4;
+    if(rv == 3) rep.contAbsInf = std::max(rep.contAbsInf, ar);
+    else        rep.momAbsInf  = std::max(rep.momAbsInf, ar);
+  }
+
+  rep.relInf = rep.absInf / std::max(rep.rhsInf, 1.0e-300);
+  rep.computed = true;
+
+  rep.ok = true;
+  if(parIn.nonlinearResidualAbsTol > 0.0){
+    rep.ok = rep.ok && (rep.absInf < parIn.nonlinearResidualAbsTol);
+  }
+  if(parIn.nonlinearResidualRelTol > 0.0){
+    rep.ok = rep.ok && (rep.relInf < parIn.nonlinearResidualRelTol);
+  }
+
+  return rep;
+}
+
+
 // Add correction from parent-face velocity flux to subtriangle velocity flux.
 //
 // This is intentionally a correction applied after:
@@ -8958,6 +9687,8 @@ static void solve_coupled_linear_device(
     double &tsolve,
     bool doSetup)
 {
+  switch_coupled_krylov_if_needed(cpl, par);
+
   copy_matrix_values_into_hypre(cpl.lin);
   copy_device_rhs_and_device_x0_into_hypre(cpl.lin, d_x0);
 
@@ -9935,6 +10666,26 @@ CUDA_CALL(cudaFree(0));
       }
     }
 
+
+    int restartLoadedStep = 0;
+    double restartLoadedTime = par.timeStart;
+    if(par.restartEnable){
+      if(!read_coupled_binary_checkpoint(
+             par, mesh, ss,
+             d_uTimeOldOld, d_vTimeOldOld, d_wTimeOldOld,
+             restartLoadedStep, restartLoadedTime)){
+        MPI_Abort(MPI_COMM_WORLD, 1);
+      }
+
+      // Continue physical time from checkpoint, but keep local timeStep starting
+      // at 1 so GMRES startup and dt ramp are reapplied after restart.
+      par.timeStart = restartLoadedTime;
+
+      if(rank == 0){
+        std::printf("Restart mode    : local step counter reset to 1; robust startup controls will reapply.\n");
+      }
+    }
+
     const int nPhysicalSteps = (par.transientNSteps > 0 ? par.transientNSteps : maxStepsCoupled);
     const int maxPicard = std::max(1, par.maxPicard);
     const int minPicard = std::max(1, par.minPicard);
@@ -9959,6 +10710,15 @@ CUDA_CALL(cudaFree(0));
       std::printf("Transient Picard: nSteps=%d dt=%.6e timeScheme=%s maxPicard=%d minPicard=%d picTol=%.3e postPressureNonOrthCorr=%d picardStop=%s\n",
                   nPhysicalSteps, par.transientDt, par.timeScheme == 1 ? "BDF2" : "BDF1", maxPicard, minPicard, picTol,
                   par.coupledPressureNonOrthCorr, picard_mode_name(par.picardConvergenceMode));
+      if(par.dtRampEnable){
+        std::printf("Startup dt ramp: enabled=1 steps=%d startFactor=%.6g targetDt=%.6e\n",
+                    par.dtRampSteps, par.dtRampStartFactor, par.transientDt);
+      }
+      if(par.coupledGmresStartupSteps > 0){
+        std::printf("Coupled Krylov startup: GMRES for first %d time steps, then %s\n",
+                    par.coupledGmresStartupSteps,
+                    coupled_krylov_name(par.coupledKrylov));
+      }
       std::printf("------------------------------------------------------------\n");
       std::printf("%5s %5s %12s %12s %12s %12s %12s %8s %8s %12s %10s\n",
                   "step", "pic", "massRes", "massLag", "duRel", "dvRel", "dwRel", "linIt", "pIt", "linRel", "wall[s]");
@@ -9973,7 +10733,20 @@ CUDA_CALL(cudaFree(0));
 
     for(int timeStep=1; timeStep<=nPhysicalSteps; ++timeStep){
       const double stepWall0 = MPI_Wtime();
+
+      const double activeDt = coupled_active_dt_for_step(par, timeStep);
+      Params parTime = par;
+      parTime.transientDt = activeDt;
+      parTime.pseudoDt = activeDt;
+
       const double physicalTime = par.timeStart + timeStep * par.transientDt;
+
+      if(rank == 0 && par.monitor && par.dtRampEnable &&
+         (timeStep == 1 || timeStep == par.dtRampSteps || timeStep == par.dtRampSteps + 1)){
+        std::printf("dt ramp: step=%d activeDt=%.12e targetDt=%.12e rampSteps=%d startFactor=%.6g\n",
+                    timeStep, activeDt, par.transientDt,
+                    par.dtRampSteps, par.dtRampStartFactor);
+      }
       const int activeTimeScheme = (par.timeScheme == 1 &&
           (timeStep > 1 || (par.ethierEnable && par.ethierBDF2ExactHistory))) ? 1 : 0;
 
@@ -10041,7 +10814,7 @@ CUDA_CALL(cudaFree(0));
         // so momentum, continuity, and residual all see the same frozen flux.
         const int usePhiConvForMomentum = ((timeStep > 1 || pic > 1) ? 1 : 0);
 
-        Params parCoupled = par;
+        Params parCoupled = parTime;
         if(par.coupledPressureNonOrthCorr > 0 && par.coupledCompactPressureSolve){
           // Experimental compact split: this intentionally removes the validated
           // explicit Rhie-Chow grad(p).d term from the coupled RHS.  It is OFF by
@@ -10075,7 +10848,13 @@ CUDA_CALL(cudaFree(0));
         const int linCounter = (timeStep-1)*maxPicard + (pic-1);
         const bool doCoupledSetup = (!cpl.lin.is_setup) || (linCounter % rebuildEvery == 0);
 
-        solve_coupled_linear_device(cpl, par, cpl.d_xDouble, cpl.d_xDouble,
+        Params parLinear = parTime;
+        if(par.coupledGmresStartupSteps > 0 &&
+           timeStep <= par.coupledGmresStartupSteps){
+          parLinear.coupledKrylov = 3; // GMRES
+        }
+
+        solve_coupled_linear_device(cpl, parLinear, cpl.d_xDouble, cpl.d_xDouble,
                  lastItsP, lastRelP, coupledSetup, coupledSolve,
                  doCoupledSetup);
 
@@ -10338,6 +11117,34 @@ CUDA_CALL(cudaFree(0));
         stepConverged = timeStep;
 
         const double fieldRelMax = std::max(std::max(duRel,dvRel), std::max(dwRel,dpRel));
+        CoupledNonlinearResidualReport nlRes;
+        const bool needNonlinearResidual =
+            par.nonlinearResidualEnable &&
+            (par.nonlinearResidualStop ||
+             pic == 1 ||
+             pic == maxPicard ||
+             (pic % std::max(1, par.nonlinearResidualEvery) == 0));
+
+        if(needNonlinearResidual){
+          nlRes = compute_coupled_nonlinear_residual_monitor(
+              dmesh, mesh, cpl, mom, gop, parTime, mu,
+              dbcU, dbcV, dbcW, dbcP,
+              ss,
+              d_uTime, d_vTime, d_wTime,
+              d_uTimeOldOld, d_vTimeOldOld, d_wTimeOldOld,
+              activeTimeScheme,
+              coupledUsePressureAnchor, refCell, physicalTime,
+              useEthierExactPGradRC);
+
+          if(rank == 0 && par.monitor){
+            std::printf("      NLRES step=%d pic=%d absInf=%.6e relInf=%.6e rhsInf=%.6e momAbs=%.6e contAbs=%.6e ok=%d\n",
+                        timeStep, pic,
+                        nlRes.absInf, nlRes.relInf, nlRes.rhsInf,
+                        nlRes.momAbsInf, nlRes.contAbsInf,
+                        nlRes.ok ? 1 : 0);
+          }
+        }
+
         const bool timePrintGate = (par.printEvery > 0 && (timeStep % par.printEvery) == 0);
         const bool doPrint =
             (rank == 0) && par.monitor && timePrintGate &&
@@ -10392,6 +11199,10 @@ CUDA_CALL(cudaFree(0));
           picardStop = (pic >= minPicard && massRes < par.tolMass && fieldRelMax < picTol);
         }
 
+        if(par.nonlinearResidualStop){
+          picardStop = picardStop && nlRes.computed && nlRes.ok;
+        }
+
         if(picardStop){
           picardConverged = true;
           if(par.forceEnable && par.forceEvery > 0 && (timeStep % par.forceEvery) == 0){
@@ -10416,6 +11227,8 @@ CUDA_CALL(cudaFree(0));
                         timeStep, pic, physicalTime, massRes, fieldRelMax,
                         picard_mode_name(par.picardConvergenceMode),
                         MPI_Wtime() - stepWall0);
+
+        write_pvd_for_outprefix(par, timeStep);
           }
           break;
         }
@@ -10463,6 +11276,14 @@ CUDA_CALL(cudaFree(0));
       CUDA_CALL(cudaMemcpy(d_uTimeOldOld, d_uTime, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
       CUDA_CALL(cudaMemcpy(d_vTimeOldOld, d_vTime, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
       CUDA_CALL(cudaMemcpy(d_wTimeOldOld, d_wTime, mesh.nCells*sizeof(double), cudaMemcpyDeviceToDevice));
+
+      if(rank == 0 && par.checkpointEnable && par.checkpointEvery > 0 &&
+         (timeStep % par.checkpointEvery) == 0){
+        write_coupled_binary_checkpoint(
+            par, mesh, ss,
+            d_uTimeOldOld, d_vTimeOldOld, d_wTimeOldOld,
+            timeStep, physicalTime);
+      }
     }
 
     CUDA_CALL(cudaFree(d_uTime));
