@@ -61,12 +61,11 @@ set_target_properties(coupled_transient_nonorth_gpu PROPERTIES
 
 # STATIC_HYPRE_CUDA_VENDOR_TAIL_LINK_FOR_COUPLED
 #
-# The CUDA HYPRE build used locally is static:
+# Static lib order matters.  The local CUDA HYPRE build is static:
 #   /opt/hypre-3.1.0-cuda-real/lib/libHYPRE.a
 #
-# Static lib order matters.  HYPRE objects reference cuSPARSE/cuBLAS/cuSOLVER/
-# cuRAND symbols, so repeat libHYPRE.a late and place CUDA vendor libs after it.
-# This mirrors the fix needed for static GPU-HYPRE app targets.
+# HYPRE objects reference cuSPARSE/cuBLAS/cuSOLVER/cuRAND symbols, so repeat
+# libHYPRE.a late and place CUDA vendor libs after it.
 target_link_libraries(coupled_transient_nonorth_gpu PRIVATE
   /opt/hypre-3.1.0-cuda-real/lib/libHYPRE.a
   /usr/local/cuda-12.2/lib64/libcusparse.so
