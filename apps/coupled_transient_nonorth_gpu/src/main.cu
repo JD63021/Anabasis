@@ -7383,7 +7383,6 @@ __global__ static void kernel_coupled_rc_gradcorr_rhs_internal_faces(
 {
   const int f = blockIdx.x*blockDim.x + threadIdx.x;
   if(f >= nInternalFaces) return;
-  if(rcMode != 0) return;
 
   const int P = owner[f];
   const int N = neigh[f];
@@ -7452,7 +7451,6 @@ __global__ static void kernel_coupled_rc_gradcorr_rhs_boundary_faces(
 {
   const int ib = blockIdx.x*blockDim.x + threadIdx.x;
   if(ib >= nBoundaryFaces) return;
-  if(rcMode != 0) return;
 
   const int f = faceStart + ib;
   const int patch = bPatch[f] - 1;
@@ -7580,12 +7578,11 @@ __global__ static void kernel_coupled_rc_gradcorr_implicit_internal_faces(
     const int *bPatch, const int *bcPType, const double *pFaceBC,
     const double *pOld,
     const int *rowOffsets, const HYPRE_BigInt *cols,
-    double rho, double pCoeffScale, int rcMode,
+    double rho, double pCoeffScale, double pNonOrthScale, int rcMode,
     HYPRE_Complex *vals, HYPRE_Complex *rhs)
 {
   const int f = blockIdx.x*blockDim.x + threadIdx.x;
   if(f >= nInternalFaces) return;
-  if(rcMode != 0) return;
 
   const int P = owner[f];
   const int N = neigh[f];
@@ -7599,7 +7596,9 @@ __global__ static void kernel_coupled_rc_gradcorr_implicit_internal_faces(
   lam = fmin(1.0, fmax(0.0, lam));
 
   const double rAUf = (1.0-lam)*rAU[P] + lam*rAU[N];
-  const double coeff = pCoeffScale * rho * Af[f] * rAUf *
+  if(pNonOrthScale == 0.0) return;
+
+  const double coeff = pNonOrthScale * pCoeffScale * rho * Af[f] * rAUf *
       pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
 
   // Owner row divergence has +face flux. Neighbour row has -face flux.
@@ -7631,12 +7630,11 @@ __global__ static void kernel_coupled_rc_gradcorr_implicit_boundary_faces(
     const int *bcPType, const double *pFaceBC,
     const double *pOld,
     const int *rowOffsets, const HYPRE_BigInt *cols,
-    double rho, double pCoeffScale, int rcMode,
+    double rho, double pCoeffScale, double pNonOrthScale, int rcMode,
     HYPRE_Complex *vals, HYPRE_Complex *rhs)
 {
   const int ib = blockIdx.x*blockDim.x + threadIdx.x;
   if(ib >= nBoundaryFaces) return;
-  if(rcMode != 0) return;
 
   const int f = faceStart + ib;
   const int patch = bPatch[f] - 1;
@@ -7647,7 +7645,9 @@ __global__ static void kernel_coupled_rc_gradcorr_implicit_boundary_faces(
   const double dy = xfy[f] - ccy[P];
   const double dz = xfz[f] - ccz[P];
 
-  const double coeff = (pCoeffScale * g_coupledRcBoundaryScale) * rho * Af[f] * rAU[P] *
+  if(pNonOrthScale == 0.0) return;
+
+  const double coeff = (pNonOrthScale * pCoeffScale * g_coupledRcBoundaryScale) * rho * Af[f] * rAU[P] *
       pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
 
   coupled_add_lsq_gradcorr_cell_to_pressure_row(P, +1.0, P, 1.0, coeff, dx, dy, dz,
@@ -7795,10 +7795,10 @@ __global__ static void kernel_build_coupled_matrix_consistent_flux(
           pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
 
       // The coupled continuity matrix always contains the pressure-difference
-      // term. rcMode only controls the extra explicit non-orthogonal/LSQ
-      // grad(p).d consistency correction.
+      // term. pNonOrthScale independently controls the explicit pressure
+      // non-orthogonal / LSQ grad(p) correction. Do not gate this by rcMode.
       double gradCorr = 0.0;
-      if(rcMode == 0 && pNonOrthScale != 0.0){
+      if(pNonOrthScale != 0.0){
         // The implicit pressure jump is along the P-N segment.
         // For the Darwish/Rhie-Chow null-block cancellation, optionally
         // use the line-midpoint gradient 0.5*(gradP+gradN), not the
@@ -7843,7 +7843,7 @@ __global__ static void kernel_build_coupled_matrix_consistent_flux(
           pressure_delta_coeff_runtime(dx, dy, dz, nfx[f], nfy[f], nfz[f]);
 
       double gradCorr = 0.0;
-      if(rcMode == 0 && pNonOrthScale != 0.0){
+      if(pNonOrthScale != 0.0){
         gradCorr = pNonOrthScale*(gradx[P]*dx + grady[P]*dy + gradz[P]*dz);
 
         if(g_coupledRcFullNonOrth){
@@ -7989,7 +7989,6 @@ __global__ static void kernel_coupled_rc_gradcorr_rhs_boundary_subtris_ethier(
 {
   const int q = blockIdx.x*blockDim.x + threadIdx.x;
   if(q >= nSubTris) return;
-  if(rcMode != 0) return;
 
   const int f = subFace[q];
   if(f < faceStart) return;
@@ -9079,7 +9078,7 @@ static void assemble_coupled_darwish_system(
         dm.d_bPatch, dbcP.d_type, dbcP.d_faceValue,
         d_pOld,
         cpl.lin.pat.d_rowOffsets, cpl.lin.pat.d_cols,
-        par.rho, par.pCoeffScale, par.rcMode,
+        par.rho, par.pCoeffScale, par.pNonOrthScale, par.rcMode,
         Avals, cpl.lin.d_rhs);
     CUDA_CHECK_LAST();
 
@@ -9095,7 +9094,7 @@ static void assemble_coupled_darwish_system(
         dbcP.d_type, dbcP.d_faceValue,
         d_pOld,
         cpl.lin.pat.d_rowOffsets, cpl.lin.pat.d_cols,
-        par.rho, par.pCoeffScale, par.rcMode,
+        par.rho, par.pCoeffScale, par.pNonOrthScale, par.rcMode,
         Avals, cpl.lin.d_rhs);
     CUDA_CHECK_LAST();
   } else {
@@ -9848,7 +9847,8 @@ CUDA_CALL(cudaFree(0));
     std::printf("pSolveMode     : %s\n", par.pSolveMode == 1 ? "ofAbsolute" : "correction-compatible");
     std::printf("pGradScheme    : %s\n", par.pGradScheme == 1 ? "Gauss linear" : "LSQ");
     std::printf("pCoeffScale    : %.8g\n", par.pCoeffScale);
-    std::printf("rcMode         : %s\n", par.rcMode == 0 ? "old-explicit" : "oflike-no-explicit");
+    std::printf("rcMode         : %s\n", par.rcMode == 0 ? "old" : "oflike");
+    std::printf("coupled pNonOrth: independent of rcMode; scale applies in RHS and final flux\n");
     std::printf("rAUMode        : %s\n", par.rAUMode == 0 ? "raw V/aP_raw" : "relaxed V/aP_relaxed");
     std::printf("pDeltaMode     : %s\n",
         par.pDeltaMode == 0 ? "legacy/v1 signed 1/(n.d)" :
