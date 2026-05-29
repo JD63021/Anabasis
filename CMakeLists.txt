@@ -14,3 +14,6 @@ add_subdirectory(apps/simple_gpu)
 add_subdirectory(apps/pimple_gpu)
 add_subdirectory(apps/coupled_transient_nonorth_gpu)
 add_subdirectory(apps/simple_gpu_subtri)
+
+# Single-precision full SIMPLE GPU app
+add_subdirectory(apps/simple_gpu_fullsp)
