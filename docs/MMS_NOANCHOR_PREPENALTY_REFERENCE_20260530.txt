@@ -1,0 +1,115 @@
+ANABASIS MMS NO-POINT-ANCHOR PRESSURE REGULARIZATION REFERENCE
+================================================================
+
+Date: 2026-05-30
+
+Main conclusion
+---------------
+The original single-precision MMS app was not fundamentally wrong in the finite-volume discretization, Rhie-Chow construction, LSQ gradients, subtri flux reconstruction, or non-orthogonal handling.
+
+The MMS pressure convergence issue came from the local pressure reference-cell anchor used for all-Neumann/manufactured pressure equations.
+
+For MMS/all-Neumann pressure:
+  Bad:
+    local point pressure anchor/reference cell
+
+  Good:
+    disable point anchor
+    add distributed pre-AMG pressure penalty to the pressure matrix
+    add matching beta*p_exact term to RHS in MMS mode
+
+For physical cylinder/outlet benchmark cases:
+  If pressure outlet is fixed_value 0, the pressure nullspace is already physically removed.
+  Use simpleMmsPressurePenaltyCoeff 0.
+  Do not use the penalty for production force validation.
+
+Verified SP blockMesh MMS settings
+----------------------------------
+pMode                         pcorr
+pSolveMode                    ofAbsolute
+rcMode                        old
+pGradScheme                   lsq
+rAUMode                       relaxed
+pCoeffScale                   1
+pDeltaMode                    of
+pDeltaMinCos                  0.05
+
+momNonOrthScale               1
+pNonOrthScale                 1
+nVelNonOrthCorr               0
+nNonOrthCorr                  0
+nPressureCorr                 0
+
+simpleFaceSkewCorr            1
+simpleSubtriContinuity        1
+simpleSubtriFluxRecon         1
+
+simpleMmsEnable               1
+simpleMmsInitExact            1
+simpleMmsPressureDirichlet    1
+simpleMmsFixedVelocityBoundaryPressureEqn 1
+simpleMmsStokesOnly           1
+simpleMmsPressurePenaltyCoeff 1e-6
+
+tolMass                       1e-6
+tolVel                        1e-6
+velTol                        1e-7
+pTol                          1e-7
+
+Observed SP blockMesh convergence over 16->96:
+  Velocity order approximately 2.18
+  Pressure order approximately 1.97
+
+Verified SP polyhedral MMS settings
+-----------------------------------
+Use the same settings as above, especially:
+
+pMode                         pcorr
+pSolveMode                    ofAbsolute
+rcMode                        old
+pGradScheme                   lsq
+rAUMode                       relaxed
+pDeltaMode                    of
+
+momNonOrthScale               1
+pNonOrthScale                 1
+nVelNonOrthCorr               0
+nNonOrthCorr                  0
+nPressureCorr                 0
+
+simpleFaceSkewCorr            1
+simpleSubtriContinuity        1
+simpleSubtriFluxRecon         1
+
+For polyhedral convergence, compute mesh size using:
+  h_eff = (bbox_volume / nCells)^(1/3)
+
+Do not use folder name alone for polyhedral order calculations.
+
+Observed SP polyhedral convergence over 16cube->81cube using h_eff:
+  Velocity order approximately 2.52
+  Pressure order approximately 2.00
+
+Cylinder benchmark note
+-----------------------
+Cylinder mesh:
+  /home/jd/Desktop/meshes/cylinder/9mesh/constant/polyMesh
+
+Patches:
+  patch_1_0 = inlet
+  patch_0_0 = channel walls
+  patch_2_0 = outlet
+  patch_3_0 = cylinder wall / force patch
+
+For physical Re=20 cylinder force validation use:
+  pressure patch_2_0 fixed_value 0
+  simpleMmsEnable 0
+  simpleMmsPressurePenaltyCoeff 0
+
+Expected force sanity:
+  CD_vector around 6.13
+  lift around O(1e-2)
+
+Important warning:
+  The pressure penalty is an MMS/nullspace diagnostic tool.
+  It should not be used for production force validation with pressure-zero outlet.
