@@ -1125,20 +1125,109 @@ static std::vector<std::vector<int>> read_foam_faces(const std::string &filename
 }
 static std::vector<int> read_foam_labels(const std::string &filename){ std::string inside=extract_main_list(strip_comments(read_file_to_string(filename))); std::stringstream ss(inside); std::vector<int> vals; int v; while(ss>>v) vals.push_back(v); return vals; }
 static std::vector<PatchInfo> read_foam_boundary(const std::string &filename){
-  std::string inside=extract_main_list(strip_comments(read_file_to_string(filename))); std::vector<PatchInfo> patches; std::size_t pos=0;
+  std::string inside=extract_main_list(strip_comments(read_file_to_string(filename)));
+  std::vector<PatchInfo> patches;
+  std::size_t pos=0;
+
+  auto skip_ws = [&](){
+    while(pos<inside.size() && std::isspace((unsigned char)inside[pos])) ++pos;
+  };
+
+  auto read_patch_name = [&]()->std::string{
+    skip_ws();
+    if(pos>=inside.size()) return std::string();
+
+    if(inside[pos]=='"'){
+      std::size_t a = ++pos;
+      while(pos<inside.size() && inside[pos]!='"') ++pos;
+      std::string name = inside.substr(a, pos-a);
+      if(pos<inside.size() && inside[pos]=='"') ++pos;
+      return name;
+    }
+
+    std::size_t a = pos;
+    while(pos<inside.size()){
+      unsigned char ch = (unsigned char)inside[pos];
+      if(std::isspace(ch) || inside[pos]=='{' || inside[pos]==';' || inside[pos]=='(' || inside[pos]==')') break;
+      ++pos;
+    }
+    return inside.substr(a, pos-a);
+  };
+
+  auto find_int_in_body = [](const std::string &body, const std::string &key)->int{
+    std::size_t k = body.find(key);
+    if(k==std::string::npos) return 0;
+    k += key.size();
+    while(k<body.size() && !std::isdigit((unsigned char)body[k]) && body[k]!='-') ++k;
+    std::size_t e = k;
+    while(e<body.size() && (std::isdigit((unsigned char)body[e]) || body[e]=='-')) ++e;
+    if(k>=body.size() || e<=k) return 0;
+    return std::atoi(body.substr(k,e-k).c_str());
+  };
+
+  auto find_word_in_body = [](const std::string &body, const std::string &key)->std::string{
+    std::size_t k = body.find(key);
+    if(k==std::string::npos) return "";
+    k += key.size();
+    while(k<body.size() && std::isspace((unsigned char)body[k])) ++k;
+    if(k<body.size() && body[k]=='"'){
+      std::size_t a = ++k;
+      while(k<body.size() && body[k]!='"') ++k;
+      return body.substr(a,k-a);
+    }
+    std::size_t e = k;
+    while(e<body.size()){
+      unsigned char ch = (unsigned char)body[e];
+      if(std::isspace(ch) || body[e]==';' || body[e]=='{' || body[e]=='}' || body[e]=='(' || body[e]==')') break;
+      ++e;
+    }
+    return body.substr(k,e-k);
+  };
+
   while(pos<inside.size()){
-    while(pos<inside.size()&&std::isspace((unsigned char)inside[pos])) ++pos; if(pos>=inside.size()) break;
-    if(!(std::isalpha((unsigned char)inside[pos])||inside[pos]=='_')){ ++pos; continue; }
-    std::size_t a=pos; while(pos<inside.size()&&(std::isalnum((unsigned char)inside[pos])||inside[pos]=='_')) ++pos; std::string name=inside.substr(a,pos-a);
-    while(pos<inside.size()&&std::isspace((unsigned char)inside[pos])) ++pos; if(pos>=inside.size()||inside[pos]!='{') continue;
-    int depth=1; std::size_t bodyStart=++pos; while(pos<inside.size()&&depth>0){ if(inside[pos]=='{') ++depth; else if(inside[pos]=='}') --depth; ++pos; }
-    std::string body=inside.substr(bodyStart,pos-bodyStart-1); PatchInfo p; p.name=name;
-    auto find_int=[&](const std::string &key)->int{ std::size_t k=body.find(key); if(k==std::string::npos) return 0; k+=key.size(); while(k<body.size()&&!std::isdigit((unsigned char)body[k])&&body[k]!='-') ++k; std::size_t e=k; while(e<body.size()&&(std::isdigit((unsigned char)body[e])||body[e]=='-')) ++e; return std::atoi(body.substr(k,e-k).c_str()); };
-    auto find_word=[&](const std::string &key)->std::string{ std::size_t k=body.find(key); if(k==std::string::npos) return ""; k+=key.size(); while(k<body.size()&&std::isspace((unsigned char)body[k])) ++k; std::size_t e=k; while(e<body.size()&&(std::isalnum((unsigned char)body[e])||body[e]=='_')) ++e; return body.substr(k,e-k); };
-    p.nFaces=find_int("nFaces"); p.startFace=find_int("startFace"); p.type=find_word("type"); patches.push_back(p);
+    skip_ws();
+    if(pos>=inside.size()) break;
+
+    std::string name = read_patch_name();
+    if(name.empty()){
+      ++pos;
+      continue;
+    }
+
+    skip_ws();
+    if(pos>=inside.size() || inside[pos]!='{'){
+      continue;
+    }
+
+    int depth=1;
+    std::size_t bodyStart=++pos;
+    while(pos<inside.size() && depth>0){
+      if(inside[pos]=='{') ++depth;
+      else if(inside[pos]=='}') --depth;
+      ++pos;
+    }
+    if(depth!=0){
+      throw std::runtime_error("Malformed boundary dictionary while reading patch " + name);
+    }
+
+    std::string body=inside.substr(bodyStart,pos-bodyStart-1);
+
+    PatchInfo p;
+    p.name=name;
+    p.nFaces=find_int_in_body(body,"nFaces");
+    p.startFace=find_int_in_body(body,"startFace");
+    p.type=find_word_in_body(body,"type");
+
+    patches.push_back(p);
   }
+
+  if(patches.empty()){
+    throw std::runtime_error("No boundary patches parsed from " + filename);
+  }
+
   return patches;
 }
+
 struct FaceGeomCalc {
   std::array<double,3> centre{0.0,0.0,0.0};
   std::array<double,3> areaVec{0.0,0.0,0.0};
@@ -1213,11 +1302,57 @@ static Mesh read_openfoam_polymesh(const std::string &polyMeshDir, int geomMetho
   std::vector<int> owner0 = read_foam_labels(polyMeshDir+"/owner");
   std::vector<int> neigh0 = read_foam_labels(polyMeshDir+"/neighbour");
 
+  if(owner0.size() != mesh.faces.size()){
+    std::ostringstream oss;
+    oss << "polyMesh read error: owner size (" << owner0.size()
+        << ") does not match faces size (" << mesh.faces.size()
+        << ") in " << polyMeshDir
+        << ". If this is a binary OpenFOAM mesh, run foamFormatConvert first.";
+    throw std::runtime_error(oss.str());
+  }
+
   mesh.nFaces=(int)mesh.faces.size();
-  mesh.nInternalFaces=(int)neigh0.size();
+
+  int firstBoundaryStartFace = mesh.nFaces;
+  for(const auto &bp : patches){
+    if(bp.nFaces > 0){
+      if(bp.startFace < 0){
+        std::ostringstream oss;
+        oss << "polyMesh boundary range error for patch '" << bp.name
+            << "': negative startFace=" << bp.startFace;
+        throw std::runtime_error(oss.str());
+      }
+      firstBoundaryStartFace = std::min(firstBoundaryStartFace, bp.startFace);
+    }
+  }
+
+  if(firstBoundaryStartFace < 0 || firstBoundaryStartFace > mesh.nFaces){
+    std::ostringstream oss;
+    oss << "polyMesh read error: first boundary startFace=" << firstBoundaryStartFace
+        << " outside face range [0," << mesh.nFaces << "] in " << polyMeshDir;
+    throw std::runtime_error(oss.str());
+  }
+
+  if(neigh0.size() < (std::size_t)firstBoundaryStartFace){
+    std::ostringstream oss;
+    oss << "polyMesh read error: neighbour size (" << neigh0.size()
+        << ") is smaller than first boundary startFace (" << firstBoundaryStartFace
+        << ") in " << polyMeshDir;
+    throw std::runtime_error(oss.str());
+  }
+
+  if(neigh0.size() != (std::size_t)firstBoundaryStartFace){
+    std::cerr << "WARNING: polyMesh neighbour count differs from boundary startFace in " << polyMeshDir
+              << "; neighbour.size()=" << neigh0.size()
+              << "; firstBoundaryStartFace=" << firstBoundaryStartFace
+              << "; using boundary startFace as nInternalFaces and ignoring boundary neighbour entries."
+              << std::endl;
+  }
+
+  mesh.nInternalFaces=firstBoundaryStartFace;
   mesh.nCells=0;
   for(int v:owner0) mesh.nCells=std::max(mesh.nCells,v+1);
-  for(int v:neigh0) mesh.nCells=std::max(mesh.nCells,v+1);
+  for(int i=0;i<mesh.nInternalFaces;++i) mesh.nCells=std::max(mesh.nCells,neigh0[i]+1);
   mesh.owner.resize(mesh.nFaces);
   mesh.neigh.assign(mesh.nInternalFaces,0);
   for(int i=0;i<mesh.nFaces;++i) mesh.owner[i]=owner0[i];
@@ -1227,13 +1362,78 @@ static Mesh read_openfoam_polymesh(const std::string &polyMeshDir, int geomMetho
   mesh.patchNames.resize(patches.size());
   for(std::size_t k=0;k<patches.size();++k){
     mesh.patchNames[k]=patches[k].name;
-    for(int f=patches[k].startFace; f<patches[k].startFace+patches[k].nFaces; ++f) mesh.bPatch[f]=(int)k+1;
+
+    const long long sf = (long long)patches[k].startFace;
+    const long long nf = (long long)patches[k].nFaces;
+    const long long ef = sf + nf;
+
+    if(nf < 0 || sf < 0 || ef < sf || ef > (long long)mesh.nFaces){
+      std::ostringstream oss;
+      oss << "polyMesh boundary range error for patch '" << patches[k].name
+          << "': startFace=" << patches[k].startFace
+          << " nFaces=" << patches[k].nFaces
+          << " but total faces=" << mesh.nFaces;
+      throw std::runtime_error(oss.str());
+    }
+
+    if(nf > 0 && sf < (long long)mesh.nInternalFaces){
+      std::ostringstream oss;
+      oss << "polyMesh boundary range error for patch '" << patches[k].name
+          << "': startFace=" << patches[k].startFace
+          << " is inside internal-face range [0," << mesh.nInternalFaces << ")";
+      throw std::runtime_error(oss.str());
+    }
+
+    for(int f=patches[k].startFace; f<patches[k].startFace+patches[k].nFaces; ++f){
+      if(mesh.bPatch[f] != 0){
+        std::ostringstream oss;
+        oss << "polyMesh boundary overlap at face " << f
+            << " while assigning patch '" << patches[k].name << "'";
+        throw std::runtime_error(oss.str());
+      }
+      mesh.bPatch[f]=(int)k+1;
+    }
+  }
+
+  int taggedBoundaryFaces = 0;
+  for(int f=mesh.nInternalFaces; f<mesh.nFaces; ++f){
+    if(mesh.bPatch[f] != 0) ++taggedBoundaryFaces;
+  }
+  const int expectedBoundaryFaces = mesh.nFaces - mesh.nInternalFaces;
+  if(taggedBoundaryFaces != expectedBoundaryFaces){
+    std::ostringstream oss;
+    oss << "polyMesh boundary coverage error: tagged boundary faces="
+        << taggedBoundaryFaces << " expected=" << expectedBoundaryFaces
+        << " in " << polyMeshDir;
+    throw std::runtime_error(oss.str());
   }
 
   mesh.cellFaces.assign(mesh.nCells,{});
   mesh.cellOrient.assign(mesh.nCells,{});
-  for(int f=0;f<mesh.nFaces;++f){ int P=mesh.owner[f]; mesh.cellFaces[P].push_back(f); mesh.cellOrient[P].push_back(+1); }
-  for(int f=0;f<mesh.nInternalFaces;++f){ int N=mesh.neigh[f]; mesh.cellFaces[N].push_back(f); mesh.cellOrient[N].push_back(-1); }
+
+  for(int f=0; f<mesh.nFaces; ++f){
+    const int P = mesh.owner[f];
+    if(P < 0 || P >= mesh.nCells){
+      std::ostringstream oss;
+      oss << "polyMesh owner index out of range at face " << f
+          << ": owner=" << P << " nCells=" << mesh.nCells;
+      throw std::runtime_error(oss.str());
+    }
+    mesh.cellFaces[P].push_back(f);
+    mesh.cellOrient[P].push_back(+1);
+  }
+
+  for(int f=0; f<mesh.nInternalFaces; ++f){
+    const int N = mesh.neigh[f];
+    if(N < 0 || N >= mesh.nCells){
+      std::ostringstream oss;
+      oss << "polyMesh neighbour index out of range at face " << f
+          << ": neighbour=" << N << " nCells=" << mesh.nCells;
+      throw std::runtime_error(oss.str());
+    }
+    mesh.cellFaces[N].push_back(f);
+    mesh.cellOrient[N].push_back(-1);
+  }
 
   // Face geometry first; robust mode uses area-weighted triangulated face centres.
   mesh.xf.assign(mesh.nFaces,{0,0,0});
@@ -6394,22 +6594,130 @@ CUDA_CALL(cudaFree(0));
     if(mesh.patchNames[k]==par.outletPatchName) outletPatch=(int)k;
   }
   if(wallPatch<0 || inletPatch<0 || outletPatch<0){
-    if(par.simpleMmsEnable || par.sineMmsEnable){
-      if(mesh.patchNames.empty()){
-        if(rank==0) std::fprintf(stderr,"MMS run has no boundary patches.\n");
+    auto dump_patch_lookup_failure = [&](){
+      if(rank!=0) return;
+      std::fprintf(stderr,
+          "Could not find wall/inlet/outlet patch by legacy names.\n"
+          "  requested wallPatch  = '%s'\n"
+          "  requested inletPatch = '%s'\n"
+          "  requested outletPatch= '%s'\n"
+          "  bcConfigPath         = '%s'\n"
+          "  available mesh patches:\n",
+          par.wallPatchName.c_str(),
+          par.inletPatchName.c_str(),
+          par.outletPatchName.c_str(),
+          par.bcConfigPath.c_str());
+      for(std::size_t kk=0; kk<mesh.patchNames.size(); ++kk){
+        std::fprintf(stderr, "    [%zu] '%s'\n", kk, mesh.patchNames[kk].c_str());
+      }
+    };
+
+    auto try_infer_legacy_patches_from_bc_config = [&](){
+      if(par.bcConfigPath.empty()) return;
+
+      std::map<std::string,std::string> velocityKind;
+      std::map<std::string,std::string> pressureKind;
+
+      std::istringstream bcIn(read_file_to_string(par.bcConfigPath));
+      std::string rawLine;
+      while(std::getline(bcIn, rawLine)){
+        const std::string line = trim_case_line(rawLine);
+        if(line.empty()) continue;
+        const auto tok = tokenize_case_line(line);
+        if(tok.size() < 3) continue;
+
+        if(tok[0] == "velocity"){
+          velocityKind[tok[1]] = tok[2];
+        } else if(tok[0] == "pressure"){
+          pressureKind[tok[1]] = tok[2];
+        }
+      }
+
+      auto find_patch = [&](const std::string& name)->int{
+        return find_patch_index_local(mesh, name);
+      };
+
+      if(wallPatch < 0){
+        for(const auto& kv : velocityKind){
+          if(kv.second == "wall_noslip"){
+            const int idx = find_patch(kv.first);
+            if(idx >= 0){
+              wallPatch = idx;
+              break;
+            }
+          }
+        }
+      }
+
+      if(outletPatch < 0){
+        for(const auto& kv : pressureKind){
+          if(kv.second == "fixed_value"){
+            const int idx = find_patch(kv.first);
+            if(idx >= 0){
+              outletPatch = idx;
+              break;
+            }
+          }
+        }
+      }
+
+      if(outletPatch < 0){
+        for(const auto& kv : velocityKind){
+          if(kv.second == "zero_gradient"){
+            const int idx = find_patch(kv.first);
+            if(idx >= 0){
+              outletPatch = idx;
+              break;
+            }
+          }
+        }
+      }
+
+      if(inletPatch < 0){
+        for(const auto& kv : velocityKind){
+          if(kv.second != "wall_noslip" && kv.second != "zero_gradient"){
+            const int idx = find_patch(kv.first);
+            if(idx >= 0){
+              inletPatch = idx;
+              break;
+            }
+          }
+        }
+      }
+
+      if(rank==0 && (wallPatch>=0 || inletPatch>=0 || outletPatch>=0)){
+        std::printf("Runtime-BC legacy patch inference:\n");
+        std::printf("  wallPatch index  = %d%s\n", wallPatch,
+                    wallPatch>=0 ? (" name=" + mesh.patchNames[wallPatch]).c_str() : "");
+        std::printf("  inletPatch index = %d%s\n", inletPatch,
+                    inletPatch>=0 ? (" name=" + mesh.patchNames[inletPatch]).c_str() : "");
+        std::printf("  outletPatch index= %d%s\n", outletPatch,
+                    outletPatch>=0 ? (" name=" + mesh.patchNames[outletPatch]).c_str() : "");
+      }
+    };
+
+    if(!par.bcConfigPath.empty() && !par.simpleMmsEnable && !par.sineMmsEnable){
+      try_infer_legacy_patches_from_bc_config();
+    }
+
+    if(wallPatch<0 || inletPatch<0 || outletPatch<0){
+      if(par.simpleMmsEnable || par.sineMmsEnable){
+        if(mesh.patchNames.empty()){
+          if(rank==0) std::fprintf(stderr,"MMS run has no boundary patches.\n");
+          MPI_Abort(MPI_COMM_WORLD,1);
+        }
+        const int fallbackPatch = 0;
+        if(wallPatch < 0) wallPatch = fallbackPatch;
+        if(inletPatch < 0) inletPatch = fallbackPatch;
+        if(outletPatch < 0) outletPatch = fallbackPatch;
+        if(rank==0){
+          std::printf("MMS patch placeholder mode: missing wall/inlet/outlet names mapped to patch '%s' for legacy bookkeeping only.\n",
+                      mesh.patchNames[fallbackPatch].c_str());
+        }
+      } else {
+        dump_patch_lookup_failure();
         MPI_Abort(MPI_COMM_WORLD,1);
       }
-      const int fallbackPatch = 0;
-      if(wallPatch < 0) wallPatch = fallbackPatch;
-      if(inletPatch < 0) inletPatch = fallbackPatch;
-      if(outletPatch < 0) outletPatch = fallbackPatch;
-      if(rank==0){
-        std::printf("MMS patch placeholder mode: missing wall/inlet/outlet names mapped to patch '%s' for legacy bookkeeping only.\n",
-                    mesh.patchNames[fallbackPatch].c_str());
-      }
-    } else {
-      if(rank==0) std::fprintf(stderr,"Could not find wall/inlet/outlet patch.\n");
-      MPI_Abort(MPI_COMM_WORLD,1);
     }
   }
   double mu = par.muExplicit ? par.mu : (par.rho*par.Umean*par.pipeDiameter/par.Re);

@@ -1,0 +1,83 @@
+polyMeshDir /home/jd/Desktop/meshes/cylinder/9mesh/constant/polyMesh
+outPrefix /home/jd/anabasis_v0/runs/regression_checks/sp_cylinder_re20
+
+rho 1.0
+mu 0.001
+uMean 0.45
+pipeD 0.1
+pipeL 2.2
+
+wallPatch patch_0_0
+inletPatch patch_1_0
+outletPatch patch_2_0
+
+nsteps 1000
+printEvery 25
+monitor 0
+
+corrTol 1e-5
+tolMass 1e-5
+tolVel 1e-5
+
+uRelax 0.7
+pRelax 0.3
+
+pMode pcorr
+pSolveMode ofAbsolute
+rcMode old
+pGradScheme lsq
+rAUMode relaxed
+pCoeffScale 1
+pDeltaMode of
+pDeltaMinCos 0.05
+
+momNonOrthScale 1
+pNonOrthScale 1
+nVelNonOrthCorr 0
+nNonOrthCorr 0
+nPressureCorr 0
+
+momentumConvectionScheme central
+
+simpleMmsEnable 0
+simpleMmsPressurePenaltyCoeff 0
+
+simpleFaceSkewCorr 1
+simpleSubtriContinuity 1
+simpleSubtriFluxRecon 1
+
+velSolver bicgstab
+velMaxit 300
+velTol 1e-5
+velRelTol 0
+
+pUseAmg 1
+pMaxit 2000
+pTol 1e-5
+pRelTol 0
+
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgRelaxType 7
+pAmgKeepTranspose 1
+pAmgRebuildEvery 1000
+
+forceEnable 1
+forcePatch patch_3_0
+forceNormalSign -1
+forceUref 0.2
+forceAreaRef 0.041
+forceDragDir 1,0,0
+forceLiftDir 0,1,0
+forceSpanDir 0,0,1
+
+velocity patch_0_0 wall_noslip
+velocity patch_3_0 wall_noslip
+velocity patch_1_0 parabolic_box_inlet 0.41 0.45 y z average_patch_normal
+velocity patch_2_0 zero_gradient
+
+pressure patch_0_0 zero_gradient
+pressure patch_3_0 zero_gradient
+pressure patch_1_0 zero_gradient
+pressure patch_2_0 fixed_value 0
