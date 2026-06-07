@@ -1,0 +1,61 @@
+polyMeshDir /home/jd/Desktop/meshes/unitcube/polyhedral/32cube/constant/polyMesh
+outPrefix /home/jd/anabasis_v0/runs/simple_fullsp_mms_reference/polyhedral_32cube_sp_noanchor_prepenalty
+
+nsteps 1000
+printEvery 25
+monitor 0
+
+corrTol 1e-5
+tolMass 1e-5
+tolVel 1e-5
+
+uRelax 0.7
+pRelax 0.3
+
+pMode pcorr
+pSolveMode ofAbsolute
+rcMode old
+pGradScheme lsq
+rAUMode relaxed
+pCoeffScale 1
+pDeltaMode of
+pDeltaMinCos 0.05
+
+momNonOrthScale 1
+pNonOrthScale 1
+nVelNonOrthCorr 0
+nNonOrthCorr 0
+nPressureCorr 0
+
+momentumConvectionScheme none
+
+simpleMmsEnable 1
+simpleMmsInitExact 1
+simpleMmsPressureDirichlet 1
+simpleMmsVelocityScale 0.1
+simpleMmsPressureScale 1.0
+simpleMmsFixedVelocityBoundaryPressureEqn 1
+simpleMmsSourceQuad8 0
+simpleMmsStokesOnly 1
+simpleMmsPressurePenaltyCoeff 1e-6
+
+simpleFaceSkewCorr 1
+simpleSubtriContinuity 1
+simpleSubtriFluxRecon 1
+
+velSolver bicgstab
+velMaxit 300
+velTol 1e-5
+velRelTol 0
+
+pUseAmg 1
+pMaxit 2000
+pTol 1e-5
+pRelTol 0
+
+pAmgCoarsenType 8
+pAmgInterpType 6
+pAmgAggLevels 1
+pAmgRelaxType 7
+pAmgKeepTranspose 1
+pAmgRebuildEvery 1000
