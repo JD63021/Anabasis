@@ -51,3 +51,4 @@ add_subdirectory(apps/simple_gpu_fullsp_mms_dp_diag_noanchor_penalty)
 # Diagnostic MMS app with center pressure reference
 add_subdirectory(apps/simple_gpu_fullsp_mms_dp_diag_centerref)
 add_subdirectory(apps/coupled_transient_nonorth_gpu_fullsp)
+add_subdirectory(apps/dg2_dg1_pmass_simple_diag)
