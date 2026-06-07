@@ -15,6 +15,7 @@ add_subdirectory(apps/pimple_gpu)
 add_subdirectory(apps/coupled_transient_nonorth_gpu)
 add_subdirectory(apps/simple_gpu_subtri)
 
+
 # Old steady SIMPLE MMS reference app restored from backup
 add_subdirectory(apps/simple_gpu_subtri_mms_ref)
 
@@ -52,3 +53,4 @@ add_subdirectory(apps/simple_gpu_fullsp_mms_dp_diag_noanchor_penalty)
 add_subdirectory(apps/simple_gpu_fullsp_mms_dp_diag_centerref)
 add_subdirectory(apps/coupled_transient_nonorth_gpu_fullsp)
 add_subdirectory(apps/dg2_dg1_pmass_simple_diag)
+
